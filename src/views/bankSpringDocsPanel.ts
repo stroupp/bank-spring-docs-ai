@@ -1,0 +1,695 @@
+import * as vscode from "vscode";
+import { QwenSettingsService } from "../ai/qwenSettingsService";
+import { AnalyzeRepositoryUrlCommand } from "../commands/analyzeRepositoryUrlCommand";
+import { getDefaultBranch } from "../git/branchResolver";
+
+type QwenUiSettings = {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+  timeoutSeconds: number;
+  useApiKey: boolean;
+  semanticCacheEnabled?: boolean;
+  semanticMaxFilesPerRun?: number;
+  semanticMaxCharactersPerFile?: number;
+  apiKey?: string;
+};
+
+type PanelMessage =
+  | { type: "ready" }
+  | { type: "selectWorkspace" }
+  | { type: "analyze"; repoUrl: string; branch: string }
+  | { type: "command"; command: string }
+  | { type: "saveQwenSettings"; settings: QwenUiSettings }
+  | { type: "testQwenConnection"; settings: QwenUiSettings };
+
+export class BankSpringDocsPanel {
+  static currentPanel: BankSpringDocsPanel | undefined;
+
+  private constructor(
+    private readonly panel: vscode.WebviewPanel,
+    private readonly context: vscode.ExtensionContext,
+    private readonly analyzeCommand: AnalyzeRepositoryUrlCommand
+  ) {
+    this.panel.onDidDispose(() => {
+      BankSpringDocsPanel.currentPanel = undefined;
+    });
+
+    this.panel.webview.onDidReceiveMessage((message: PanelMessage) => this.handleMessage(message));
+  }
+
+  static open(context: vscode.ExtensionContext, analyzeCommand: AnalyzeRepositoryUrlCommand): void {
+    if (BankSpringDocsPanel.currentPanel) {
+      BankSpringDocsPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel("bankSpringDocs.dashboardPanel", "Bank Spring Docs AI", vscode.ViewColumn.One, {
+      enableScripts: true,
+      localResourceRoots: [context.extensionUri],
+      retainContextWhenHidden: true
+    });
+
+    const instance = new BankSpringDocsPanel(panel, context, analyzeCommand);
+    BankSpringDocsPanel.currentPanel = instance;
+    panel.webview.html = instance.getHtml();
+  }
+
+  private async handleMessage(message: PanelMessage): Promise<void> {
+    if (message.type === "ready") {
+      this.postSettings();
+      return;
+    }
+
+    if (message.type === "selectWorkspace") {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        title: "Bank Spring Docs çalışma klasörü seç"
+      });
+      const folder = selected?.[0]?.fsPath;
+      if (folder) {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update("workspaceFolder", folder, vscode.ConfigurationTarget.Global);
+        this.postSettings();
+      }
+      return;
+    }
+
+    if (message.type === "command") {
+      await vscode.commands.executeCommand(message.command);
+      return;
+    }
+
+    if (message.type === "saveQwenSettings") {
+      await vscode.commands.executeCommand("bankSpringDocs.saveQwenSettings", message.settings);
+      this.postSettings();
+      return;
+    }
+
+    if (message.type === "testQwenConnection") {
+      await vscode.commands.executeCommand("bankSpringDocs.testQwenConnection", message.settings);
+      this.postSettings();
+      return;
+    }
+
+    const repoUrl = message.repoUrl.trim();
+    const branch = message.branch.trim() || getDefaultBranch();
+    if (!repoUrl) {
+      this.panel.webview.postMessage({ type: "error", message: "Bitbucket repository URL alanı zorunludur." });
+      return;
+    }
+
+    try {
+      this.panel.webview.postMessage({ type: "busy", message: "Repository hazırlanıyor ve yerel analiz başlatılıyor..." });
+      const result = await this.analyzeCommand.analyzeRepository(repoUrl, branch);
+      this.panel.webview.postMessage({
+        type: "done",
+        message: `Analiz tamamlandı. ${result.indexedFiles} dosya indekslendi.`,
+        aiDocsPath: result.aiDocsPath
+      });
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      this.panel.webview.postMessage({ type: "error", message: messageText });
+    }
+  }
+
+  private postSettings(): void {
+    const config = vscode.workspace.getConfiguration("bankSpringDocs");
+    this.panel.webview.postMessage({
+      type: "settings",
+      defaultBranch: getDefaultBranch(),
+      workspaceFolder: config.get<string>("workspaceFolder", ""),
+      qwen: new QwenSettingsService(this.context).getSettings(),
+      semantic: {
+        cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
+        maxFilesPerRun: config.get<number>("semantic.maxFilesPerRun", 50),
+        maxCharactersPerFile: config.get<number>("semantic.maxCharactersPerFile", 20000)
+      }
+    });
+  }
+
+  private getHtml(): string {
+    const nonce = createNonce();
+    return `<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bank Spring Docs AI</title>
+  <style>
+    body {
+      margin: 0;
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+    }
+
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      gap: 18px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+
+    h1, h2, h3 {
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 26px;
+      font-weight: 750;
+    }
+
+    h2 {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    h3 {
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .muted {
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.45;
+    }
+
+    .headerActions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(340px, 0.9fr) minmax(420px, 1.3fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel, .scenario {
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      background: var(--vscode-sideBar-background);
+    }
+
+    .panel {
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .scenarioGrid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .scenario {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .scenarioHeader {
+      display: grid;
+      gap: 4px;
+      min-height: 58px;
+    }
+
+    .buttonGrid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      font-weight: 650;
+    }
+
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 4px;
+      padding: 8px 10px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      font-family: var(--vscode-font-family);
+    }
+
+    input:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+
+    input[type="checkbox"] {
+      width: auto;
+      min-height: auto;
+    }
+
+    .checkLabel {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 34px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      padding: 8px 11px;
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+      font-family: var(--vscode-font-family);
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    button.secondary {
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+    }
+
+    button.secondary:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+
+    button.ghost {
+      color: var(--vscode-foreground);
+      background: transparent;
+      border-color: var(--vscode-panel-border);
+    }
+
+    .folderRow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+
+    .status {
+      min-height: 72px;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+      line-height: 1.45;
+      word-break: break-word;
+    }
+
+    .status strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .modalBackdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      background: rgba(0, 0, 0, 0.45);
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .modalBackdrop.open {
+      display: flex;
+    }
+
+    .modal {
+      width: min(720px, 100%);
+      max-height: min(760px, 92vh);
+      overflow: auto;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      background: var(--vscode-editor-background);
+      box-shadow: 0 16px 44px rgba(0, 0, 0, 0.35);
+    }
+
+    .modalHeader, .modalFooter {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+
+    .modalFooter {
+      border-top: 1px solid var(--vscode-panel-border);
+      border-bottom: 0;
+      justify-content: flex-end;
+    }
+
+    .modalBody {
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .formGrid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .wide {
+      grid-column: 1 / -1;
+    }
+
+    @media (max-width: 860px) {
+      .layout, .scenarioGrid, .formGrid {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        display: grid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>Bank Spring Docs AI</h1>
+        <div class="muted">Java Spring Boot repository'lerini yerelde analiz eder, semantik olarak zenginleştirir ve kompakt Copilot context paketleri üretir.</div>
+        <div class="muted">Varsayılan branch: <strong id="defaultBranch">release/liv</strong></div>
+      </div>
+      <div class="headerActions">
+        <button class="ghost" id="openQwenSettingsButton" type="button">Qwen Ayarları</button>
+        <button class="ghost" data-command="bankSpringDocs.openGeneratedDocs" type="button">Çıktı Klasörü</button>
+      </div>
+    </header>
+
+    <section class="layout">
+      <div class="panel">
+        <h2>Repository Analizi</h2>
+        <label>
+          Bitbucket Repository URL
+          <input id="repoUrl" type="text" placeholder="ssh://git@bitbucket.bank.local/project/repo.git">
+        </label>
+        <label>
+          Branch
+          <input id="branch" type="text" placeholder="Boş bırakılırsa release/liv kullanılır">
+        </label>
+        <div class="folderRow">
+          <label>
+            Çalışma Klasörü
+            <input id="workspaceFolder" type="text" readonly placeholder="Seçilmezse VS Code global storage kullanılır">
+          </label>
+          <button id="selectWorkspaceButton" type="button">Seç</button>
+        </div>
+        <button id="analyzeButton">Repository Analiz Et</button>
+        <div class="status" id="status">
+          <strong>Hazır</strong>
+          Önce repository analizi çalıştır. Sonra yerel doküman, Qwen zenginleştirme veya Copilot senaryolarını seçebilirsin.
+        </div>
+      </div>
+
+      <div class="scenarioGrid">
+        <section class="scenario">
+          <div class="scenarioHeader">
+            <h2>1. Yerel Dokümantasyon</h2>
+            <div class="muted">Copilot veya Qwen gerekmeden indekslerden Markdown üretir.</div>
+          </div>
+          <div class="buttonGrid">
+            <button data-command="bankSpringDocs.generateAllLocalDocs">Tüm Yerel Dokümanları Oluştur</button>
+            <button class="secondary" data-command="bankSpringDocs.generateRepositoryOverview">Repository Özeti</button>
+            <button class="secondary" data-command="bankSpringDocs.generateApiDocumentation">API Dokümantasyonu</button>
+            <button class="secondary" data-command="bankSpringDocs.generateAnalysisQualityReport">Analiz Kalite Raporu</button>
+          </div>
+        </section>
+
+        <section class="scenario">
+          <div class="scenarioHeader">
+            <h2>2. Qwen Semantik Zenginleştirme</h2>
+            <div class="muted">Yerel veya yapılandırılmış Qwen endpoint'iyle sınıf, endpoint ve bağımlılık açıklamaları üretir.</div>
+          </div>
+          <div class="buttonGrid">
+            <button data-command="bankSpringDocs.generateQwenSemanticAnalysis">Qwen ile Semantik Analiz Oluştur</button>
+            <button class="secondary" data-command="bankSpringDocs.generateEnrichedRepoMap">Zenginleştirilmiş Repo Haritası</button>
+            <button class="secondary" id="quickTestQwenButton" type="button">Qwen Bağlantısını Test Et</button>
+          </div>
+        </section>
+
+        <section class="scenario">
+          <div class="scenarioHeader">
+            <h2>3. Copilot Dokümantasyonu</h2>
+            <div class="muted">Tam repo değil, sadece kompakt ve maskelenmiş context paketleri Copilot'a gönderilir.</div>
+          </div>
+          <div class="buttonGrid">
+            <button data-command="bankSpringDocs.generateAllCopilotDocs">Tüm Copilot Dokümanlarını Oluştur</button>
+            <button class="secondary" data-command="bankSpringDocs.generateCopilotSpringArchitecture">Copilot Spring Mimari</button>
+            <button class="secondary" data-command="bankSpringDocs.generateCopilotApiDocumentation">Copilot API Dokümanı</button>
+            <button class="secondary" data-command="bankSpringDocs.runCopilotDiagnostics">Copilot Tanılama Testi</button>
+            <button class="secondary" data-command="bankSpringDocs.openLastCopilotContext">Son Context Paketini Aç</button>
+          </div>
+        </section>
+
+        <section class="scenario">
+          <div class="scenarioHeader">
+            <h2>4. İnceleme ve Bakım</h2>
+            <div class="muted">Üretilen çıktıları, audit logları ve yerel cache'i yönetir.</div>
+          </div>
+          <div class="buttonGrid">
+            <button data-command="bankSpringDocs.openRepoMap">Repo Haritasını Aç</button>
+            <button class="secondary" data-command="bankSpringDocs.openGeneratedDocs">Çıktı Klasörünü Aç</button>
+            <button class="secondary" data-command="bankSpringDocs.openCopilotAuditLog">Copilot Audit Log Aç</button>
+            <button class="secondary" data-command="bankSpringDocs.clearLocalCache">Yerel Önbelleği Temizle</button>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div class="modalBackdrop" id="qwenModal" role="dialog" aria-modal="true" aria-labelledby="qwenModalTitle">
+    <div class="modal">
+      <div class="modalHeader">
+        <div>
+          <h2 id="qwenModalTitle">Qwen Ayarları</h2>
+          <div class="muted">Endpoint, model, API key ve semantik cache ayarları burada yönetilir.</div>
+        </div>
+        <button class="ghost" id="closeQwenSettingsButton" type="button">Kapat</button>
+      </div>
+      <div class="modalBody">
+        <label class="checkLabel wide">
+          <input id="qwenEnabled" type="checkbox">
+          Qwen semantik analiz aktif
+        </label>
+        <div class="formGrid">
+          <label class="wide">
+            Qwen Endpoint
+            <input id="qwenEndpoint" type="text" placeholder="https://dashscope-intl.aliyuncs.com/compatible-mode/v1">
+          </label>
+          <label>
+            Model
+            <input id="qwenModel" type="text" placeholder="qwen3">
+          </label>
+          <label>
+            Temperature
+            <input id="qwenTemperature" type="number" min="0" max="2" step="0.1">
+          </label>
+          <label>
+            Max Token
+            <input id="qwenMaxTokens" type="number" min="256" step="256">
+          </label>
+          <label>
+            Timeout
+            <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
+          </label>
+          <label class="checkLabel wide">
+            <input id="qwenUseApiKey" type="checkbox">
+            API Key kullan
+          </label>
+          <label class="wide">
+            API Key
+            <input id="qwenApiKey" type="password" placeholder="Boş bırakılırsa mevcut gizli değer korunur">
+          </label>
+          <label class="checkLabel wide">
+            <input id="semanticCacheEnabled" type="checkbox">
+            Semantik cache aktif
+          </label>
+          <label>
+            Run başına maksimum öğe
+            <input id="semanticMaxFilesPerRun" type="number" min="1" step="1">
+          </label>
+          <label>
+            Dosya başına maksimum karakter
+            <input id="semanticMaxCharactersPerFile" type="number" min="1000" step="1000">
+          </label>
+        </div>
+      </div>
+      <div class="modalFooter">
+        <button class="secondary" id="testQwenButton" type="button">Qwen Bağlantısını Test Et</button>
+        <button id="saveQwenButton" type="button">Qwen Ayarlarını Kaydet</button>
+      </div>
+    </div>
+  </div>
+
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const repoUrl = document.getElementById("repoUrl");
+    const branch = document.getElementById("branch");
+    const analyzeButton = document.getElementById("analyzeButton");
+    const selectWorkspaceButton = document.getElementById("selectWorkspaceButton");
+    const workspaceFolder = document.getElementById("workspaceFolder");
+    const status = document.getElementById("status");
+    const defaultBranch = document.getElementById("defaultBranch");
+    const qwenModal = document.getElementById("qwenModal");
+    const openQwenSettingsButton = document.getElementById("openQwenSettingsButton");
+    const closeQwenSettingsButton = document.getElementById("closeQwenSettingsButton");
+    const quickTestQwenButton = document.getElementById("quickTestQwenButton");
+    const qwenEnabled = document.getElementById("qwenEnabled");
+    const qwenEndpoint = document.getElementById("qwenEndpoint");
+    const qwenModel = document.getElementById("qwenModel");
+    const qwenTemperature = document.getElementById("qwenTemperature");
+    const qwenMaxTokens = document.getElementById("qwenMaxTokens");
+    const qwenTimeoutSeconds = document.getElementById("qwenTimeoutSeconds");
+    const qwenUseApiKey = document.getElementById("qwenUseApiKey");
+    const qwenApiKey = document.getElementById("qwenApiKey");
+    const semanticCacheEnabled = document.getElementById("semanticCacheEnabled");
+    const semanticMaxFilesPerRun = document.getElementById("semanticMaxFilesPerRun");
+    const semanticMaxCharactersPerFile = document.getElementById("semanticMaxCharactersPerFile");
+    const testQwenButton = document.getElementById("testQwenButton");
+    const saveQwenButton = document.getElementById("saveQwenButton");
+
+    function setStatus(title, message) {
+      status.innerHTML = "<strong>" + title + "</strong>" + message;
+    }
+
+    function setModalOpen(open) {
+      qwenModal.classList.toggle("open", open);
+    }
+
+    function readQwenSettings() {
+      return {
+        enabled: qwenEnabled.checked,
+        endpoint: qwenEndpoint.value,
+        model: qwenModel.value,
+        temperature: Number(qwenTemperature.value || "0.1"),
+        maxTokens: Number(qwenMaxTokens.value || "4096"),
+        timeoutSeconds: Number(qwenTimeoutSeconds.value || "120"),
+        useApiKey: qwenUseApiKey.checked,
+        semanticCacheEnabled: semanticCacheEnabled.checked,
+        semanticMaxFilesPerRun: Number(semanticMaxFilesPerRun.value || "50"),
+        semanticMaxCharactersPerFile: Number(semanticMaxCharactersPerFile.value || "20000"),
+        apiKey: qwenApiKey.value || undefined
+      };
+    }
+
+    analyzeButton.addEventListener("click", () => {
+      analyzeButton.disabled = true;
+      setStatus("Analiz başlatıldı", "Git clone/fetch ve Spring indeksleme işlemleri çalışıyor...");
+      vscode.postMessage({ type: "analyze", repoUrl: repoUrl.value, branch: branch.value });
+    });
+
+    selectWorkspaceButton.addEventListener("click", () => {
+      vscode.postMessage({ type: "selectWorkspace" });
+    });
+
+    openQwenSettingsButton.addEventListener("click", () => setModalOpen(true));
+    closeQwenSettingsButton.addEventListener("click", () => setModalOpen(false));
+    qwenModal.addEventListener("click", (event) => {
+      if (event.target === qwenModal) {
+        setModalOpen(false);
+      }
+    });
+
+    testQwenButton.addEventListener("click", () => {
+      vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
+    });
+
+    quickTestQwenButton.addEventListener("click", () => {
+      vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
+    });
+
+    saveQwenButton.addEventListener("click", () => {
+      vscode.postMessage({ type: "saveQwenSettings", settings: readQwenSettings() });
+      qwenApiKey.value = "";
+      setModalOpen(false);
+    });
+
+    document.querySelectorAll("[data-command]").forEach((button) => {
+      button.addEventListener("click", () => {
+        vscode.postMessage({ type: "command", command: button.dataset.command });
+      });
+    });
+
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (message.type === "settings") {
+        defaultBranch.textContent = message.defaultBranch;
+        workspaceFolder.value = message.workspaceFolder || "";
+        branch.placeholder = "Boş bırakılırsa " + message.defaultBranch + " kullanılır";
+        if (message.qwen) {
+          qwenEnabled.checked = Boolean(message.qwen.enabled);
+          qwenEndpoint.value = message.qwen.endpoint || "";
+          qwenModel.value = message.qwen.model || "";
+          qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
+          qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
+          qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
+          qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
+        }
+        if (message.semantic) {
+          semanticCacheEnabled.checked = Boolean(message.semantic.cacheEnabled);
+          semanticMaxFilesPerRun.value = String(message.semantic.maxFilesPerRun ?? 50);
+          semanticMaxCharactersPerFile.value = String(message.semantic.maxCharactersPerFile ?? 20000);
+        }
+      }
+      if (message.type === "busy") {
+        analyzeButton.disabled = true;
+        setStatus("Çalışıyor", message.message);
+      }
+      if (message.type === "done") {
+        analyzeButton.disabled = false;
+        setStatus("Tamamlandı", message.message + "<br><br><span class='muted'>" + message.aiDocsPath + "</span>");
+      }
+      if (message.type === "error") {
+        analyzeButton.disabled = false;
+        setStatus("Hata", message.message);
+      }
+    });
+
+    vscode.postMessage({ type: "ready" });
+  </script>
+</body>
+</html>`;
+  }
+}
+
+function createNonce(): string {
+  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let text = "";
+  for (let i = 0; i < 32; i += 1) {
+    text += possible.charAt(Math.floor(Math.random() * possible.length));
+  }
+  return text;
+}

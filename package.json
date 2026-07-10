@@ -1,0 +1,517 @@
+{
+  "name": "bank-spring-docs-ai",
+  "displayName": "Bank Spring Docs AI",
+  "description": "Generate compact AI-assisted technical documentation for Java Spring Boot repositories using the VS Code Language Model API.",
+  "version": "0.1.0",
+  "publisher": "bank-spring-docs",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:bankSpringDocs.dashboard",
+    "onCommand:bankSpringDocs.openDashboard",
+    "onCommand:bankSpringDocs.analyzeRepositoryUrl",
+    "onCommand:bankSpringDocs.indexCurrentRepository",
+    "onCommand:bankSpringDocs.generateRepositoryOverview",
+    "onCommand:bankSpringDocs.generateSpringArchitectureDocumentation",
+    "onCommand:bankSpringDocs.generateApiDocumentation",
+    "onCommand:bankSpringDocs.generateServiceLayerDocumentation",
+    "onCommand:bankSpringDocs.generateRepositoryLayerDocumentation",
+    "onCommand:bankSpringDocs.generateEntityDocumentation",
+    "onCommand:bankSpringDocs.generateConfigurationDocumentation",
+    "onCommand:bankSpringDocs.generateExternalIntegrationsDocumentation",
+    "onCommand:bankSpringDocs.generateTestAnalysis",
+    "onCommand:bankSpringDocs.generateTechnicalAnalysis",
+    "onCommand:bankSpringDocs.generateCopilotRepositoryOverview",
+    "onCommand:bankSpringDocs.generateCopilotSpringArchitecture",
+    "onCommand:bankSpringDocs.generateCopilotApiDocumentation",
+    "onCommand:bankSpringDocs.generateCopilotServiceLayer",
+    "onCommand:bankSpringDocs.generateCopilotConfiguration",
+    "onCommand:bankSpringDocs.generateCopilotTestAnalysis",
+    "onCommand:bankSpringDocs.generateCopilotTechnicalAnalysis",
+    "onCommand:bankSpringDocs.testQwenConnection",
+    "onCommand:bankSpringDocs.saveQwenSettings",
+    "onCommand:bankSpringDocs.generateQwenSemanticAnalysis",
+    "onCommand:bankSpringDocs.generateEnrichedRepoMap",
+    "onCommand:bankSpringDocs.generateAnalysisQualityReport",
+    "onCommand:bankSpringDocs.generateAllLocalDocs",
+    "onCommand:bankSpringDocs.generateAllCopilotDocs",
+    "onCommand:bankSpringDocs.generateAgenticCopilotBackendDocs",
+    "onCommand:bankSpringDocs.openLastCopilotContext",
+    "onCommand:bankSpringDocs.openLastCopilotContextSelection",
+    "onCommand:bankSpringDocs.openLastCopilotPrompt",
+    "onCommand:bankSpringDocs.openCopilotAuditLog",
+    "onCommand:bankSpringDocs.runCopilotDiagnostics",
+    "onCommand:bankSpringDocs.openUiBffBeAnalysisPanel",
+    "onCommand:bankSpringDocs.saveMultiRepoManifest",
+    "onCommand:bankSpringDocs.cloneOrUpdateMultiRepos",
+    "onCommand:bankSpringDocs.analyzeMultiReposLocally",
+    "onCommand:bankSpringDocs.generateReactUiAnalysis",
+    "onCommand:bankSpringDocs.generateEndToEndFlowMap",
+    "onCommand:bankSpringDocs.generateQwenPageSemantics",
+    "onCommand:bankSpringDocs.generateLocalKnowledgeGraph",
+    "onCommand:bankSpringDocs.generateMultiRepoQualityReport",
+    "onCommand:bankSpringDocs.generateMultiRepoAgenticCopilotDocs",
+    "onCommand:bankSpringDocs.buildPageList",
+    "onCommand:bankSpringDocs.analyzeSelectedPage",
+    "onCommand:bankSpringDocs.openSelectedPageContextPack",
+    "onCommand:bankSpringDocs.openSelectedPageEvidencePack",
+    "onCommand:bankSpringDocs.generateSelectedPageQwenSemantics",
+    "onCommand:bankSpringDocs.generateSelectedPageCopilotDraft",
+    "onCommand:bankSpringDocs.detectSelectedPageDocumentGaps",
+    "onCommand:bankSpringDocs.repairSelectedPageDocumentGaps",
+    "onCommand:bankSpringDocs.buildFinalSelectedPageDocument",
+    "onCommand:bankSpringDocs.openFinalSelectedPageDocument",
+    "onCommand:bankSpringDocs.scoreSelectedPageDocument",
+    "onCommand:bankSpringDocs.runFullSelectedPageAnalysis",
+    "onCommand:bankSpringDocs.generatePageTechnicalAnalysis",
+    "onCommand:bankSpringDocs.openUnresolvedMultiRepoMatches",
+    "onCommand:bankSpringDocs.openMultiRepoOutputFolder",
+    "onCommand:bankSpringDocs.clearLocalCache"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "bankSpringDocs",
+          "title": "Bank Spring Docs",
+          "icon": "media/bank-spring-docs.svg"
+        }
+      ]
+    },
+    "views": {
+      "bankSpringDocs": [
+        {
+          "id": "bankSpringDocs.dashboard",
+          "name": "Dokümantasyon Paneli",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "bankSpringDocs.openDashboard",
+        "title": "Bank Spring Docs: Paneli Aç"
+      },
+      {
+        "command": "bankSpringDocs.openRepoMap",
+        "title": "Bank Spring Docs: Repo Haritasını Aç"
+      },
+      {
+        "command": "bankSpringDocs.openGeneratedDocs",
+        "title": "Bank Spring Docs: Oluşturulan Dokümanları Aç"
+      },
+      {
+        "command": "bankSpringDocs.analyzeRepositoryUrl",
+        "title": "Bank Spring Docs: Repository URL Analiz Et"
+      },
+      {
+        "command": "bankSpringDocs.indexCurrentRepository",
+        "title": "Bank Spring Docs: Index Current Repository"
+      },
+      {
+        "command": "bankSpringDocs.generateRepositoryOverview",
+        "title": "Bank Spring Docs: Generate Repository Overview"
+      },
+      {
+        "command": "bankSpringDocs.generateSpringArchitectureDocumentation",
+        "title": "Bank Spring Docs: Generate Spring Architecture Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateApiDocumentation",
+        "title": "Bank Spring Docs: Generate API Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateServiceLayerDocumentation",
+        "title": "Bank Spring Docs: Generate Service Layer Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateRepositoryLayerDocumentation",
+        "title": "Bank Spring Docs: Generate Repository Layer Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateEntityDocumentation",
+        "title": "Bank Spring Docs: Generate Entity Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateConfigurationDocumentation",
+        "title": "Bank Spring Docs: Generate Configuration Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateExternalIntegrationsDocumentation",
+        "title": "Bank Spring Docs: Generate External Integrations Documentation"
+      },
+      {
+        "command": "bankSpringDocs.generateTestAnalysis",
+        "title": "Bank Spring Docs: Generate Test Analysis"
+      },
+      {
+        "command": "bankSpringDocs.generateTechnicalAnalysis",
+        "title": "Bank Spring Docs: Generate Technical Analysis"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotRepositoryOverview",
+        "title": "Bank Spring Docs: Copilot Repository Özeti Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotSpringArchitecture",
+        "title": "Bank Spring Docs: Copilot Spring Mimari Dokümanı Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotApiDocumentation",
+        "title": "Bank Spring Docs: Copilot API Dokümantasyonu Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotServiceLayer",
+        "title": "Bank Spring Docs: Copilot Servis Katmanı Dokümanı Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotConfiguration",
+        "title": "Bank Spring Docs: Copilot Konfigürasyon Dokümanı Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotTestAnalysis",
+        "title": "Bank Spring Docs: Copilot Test Analizi Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateCopilotTechnicalAnalysis",
+        "title": "Bank Spring Docs: Copilot Teknik Analiz Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.testQwenConnection",
+        "title": "Bank Spring Docs: Qwen Bağlantısını Test Et"
+      },
+      {
+        "command": "bankSpringDocs.saveQwenSettings",
+        "title": "Bank Spring Docs: Qwen Ayarlarını Kaydet"
+      },
+      {
+        "command": "bankSpringDocs.generateQwenSemanticAnalysis",
+        "title": "Bank Spring Docs: Qwen ile Semantik Analiz Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateEnrichedRepoMap",
+        "title": "Bank Spring Docs: Zenginleştirilmiş Repo Haritası Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateAnalysisQualityReport",
+        "title": "Bank Spring Docs: Analiz Kalite Raporu Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateAllLocalDocs",
+        "title": "Bank Spring Docs: Tüm Yerel Dokümanları Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateAllCopilotDocs",
+        "title": "Bank Spring Docs: Tüm Copilot Dokümanlarını Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateAgenticCopilotBackendDocs",
+        "title": "Bank Spring Docs: Agentic Copilot Backend Dokumantasyonu Olustur"
+      },
+      {
+        "command": "bankSpringDocs.openLastCopilotContext",
+        "title": "Bank Spring Docs: Son Copilot Context Paketini Aç"
+      },
+      {
+        "command": "bankSpringDocs.openLastCopilotContextSelection",
+        "title": "Bank Spring Docs: Son Copilot Context Se?im Auditini A?"
+      },
+      {
+        "command": "bankSpringDocs.openLastCopilotPrompt",
+        "title": "Bank Spring Docs: Son Copilot Promptunu Ac"
+      },
+      {
+        "command": "bankSpringDocs.openCopilotAuditLog",
+        "title": "Bank Spring Docs: Copilot Audit Log Aç"
+      },
+      {
+        "command": "bankSpringDocs.runCopilotDiagnostics",
+        "title": "Bank Spring Docs: Copilot Tanılama Testi"
+      },
+      {
+        "command": "bankSpringDocs.openUiBffBeAnalysisPanel",
+        "title": "Bank Spring Docs: UI-BFF-BE Analizi Panelini A?"
+      },
+      {
+        "command": "bankSpringDocs.saveMultiRepoManifest",
+        "title": "Bank Spring Docs: ?oklu Repo Manifesti Kaydet"
+      },
+      {
+        "command": "bankSpringDocs.cloneOrUpdateMultiRepos",
+        "title": "Bank Spring Docs: ?oklu Repolar? Klonla veya G?ncelle"
+      },
+      {
+        "command": "bankSpringDocs.analyzeMultiReposLocally",
+        "title": "Bank Spring Docs: ?oklu Repolar? Yerel Analiz Et"
+      },
+      {
+        "command": "bankSpringDocs.generateReactUiAnalysis",
+        "title": "Bank Spring Docs: React UI Analizi Olu?tur"
+      },
+      {
+        "command": "bankSpringDocs.generateEndToEndFlowMap",
+        "title": "Bank Spring Docs: U?tan Uca Ak?? Haritas? Olu?tur"
+      },
+      {
+        "command": "bankSpringDocs.generateQwenPageSemantics",
+        "title": "Bank Spring Docs: Qwen ile Sayfa Semanti?i Olu?tur"
+      },
+      {
+        "command": "bankSpringDocs.generateLocalKnowledgeGraph",
+        "title": "Bank Spring Docs: Lokal Bilgi Grafi?i Olu?tur"
+      },
+      {
+        "command": "bankSpringDocs.generateMultiRepoQualityReport",
+        "title": "Bank Spring Docs: Coklu Repo Kalite Raporu Olustur"
+      },
+      {
+        "command": "bankSpringDocs.generateMultiRepoAgenticCopilotDocs",
+        "title": "Bank Spring Docs: UI-BFF-BE Agentic Copilot Dokumantasyonu Olustur"
+      },
+      {
+        "command": "bankSpringDocs.buildPageList",
+        "title": "Bank Spring Docs: Sayfa Listesini Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.analyzeSelectedPage",
+        "title": "Bank Spring Docs: Seçili Sayfayı Analiz Et"
+      },
+      {
+        "command": "bankSpringDocs.openSelectedPageContextPack",
+        "title": "Bank Spring Docs: Sayfa Context Paketini Aç"
+      },
+      {
+        "command": "bankSpringDocs.openSelectedPageEvidencePack",
+        "title": "Bank Spring Docs: Sayfa Evidence Paketini Aç"
+      },
+      {
+        "command": "bankSpringDocs.generateSelectedPageQwenSemantics",
+        "title": "Bank Spring Docs: Qwen ile Sayfa Semantiği Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.generateSelectedPageCopilotDraft",
+        "title": "Bank Spring Docs: Copilot ile Sayfa Taslak Dokümanı Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.detectSelectedPageDocumentGaps",
+        "title": "Bank Spring Docs: Sayfa Dokümanı Gap Analizi Yap"
+      },
+      {
+        "command": "bankSpringDocs.repairSelectedPageDocumentGaps",
+        "title": "Bank Spring Docs: Sayfa Dokümanı Gap Repair Çalıştır"
+      },
+      {
+        "command": "bankSpringDocs.buildFinalSelectedPageDocument",
+        "title": "Bank Spring Docs: Copilot ile Final Sayfa Dokümanı Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.openFinalSelectedPageDocument",
+        "title": "Bank Spring Docs: Sayfa Teknik Analiz Dokümanını Aç"
+      },
+      {
+        "command": "bankSpringDocs.scoreSelectedPageDocument",
+        "title": "Bank Spring Docs: Sayfa Doküman Kalite Skoru Oluştur"
+      },
+      {
+        "command": "bankSpringDocs.runFullSelectedPageAnalysis",
+        "title": "Bank Spring Docs: Seçili Sayfa İçin Tüm Analizi Çalıştır"
+      },
+      {
+        "command": "bankSpringDocs.generatePageTechnicalAnalysis",
+        "title": "Bank Spring Docs: Sayfa Bazl? Teknik Analiz Olu?tur"
+      },
+      {
+        "command": "bankSpringDocs.openUnresolvedMultiRepoMatches",
+        "title": "Bank Spring Docs: E?le?meyen Ak??lar? A?"
+      },
+      {
+        "command": "bankSpringDocs.openMultiRepoOutputFolder",
+        "title": "Bank Spring Docs: UI-BFF-BE ??kt? Klas?r?n? A?"
+      },
+      {
+        "command": "bankSpringDocs.clearLocalCache",
+        "title": "Bank Spring Docs: Clear Local Cache"
+      }
+    ],
+    "configuration": {
+      "title": "Bank Spring Docs AI",
+      "properties": {
+        "bankSpringDocs.defaultBranch": {
+          "type": "string",
+          "default": "release/liv",
+          "description": "Branch alanı boş bırakılırsa kullanılacak varsayılan branch."
+        },
+        "bankSpringDocs.cacheFolder": {
+          "type": "string",
+          "default": ".ai-docs",
+          "description": "Yerel indeks ve oluşturulan dokümantasyon klasörü."
+        },
+        "bankSpringDocs.workspaceFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Repository clone, cache ve .ai-docs çıktılarının yazılacağı çalışma klasörü. Boş bırakılırsa VS Code global storage kullanılır."
+        },
+        "bankSpringDocs.maxFilesPerCopilotRequest": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "description": "Maximum source files included in one Copilot context pack."
+        },
+        "bankSpringDocs.maxCharactersPerFile": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 1000,
+          "description": "Maximum characters included per source file in context packs."
+        },
+        "bankSpringDocs.enableFileSummaryCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reuse local file summaries when file hashes are unchanged."
+        },
+        "bankSpringDocs.enableSafeMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show context summaries and mask secrets before AI calls."
+        },
+        "bankSpringDocs.preferSpringBootAnalysis": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prioritize Spring Boot-specific scanning and extraction."
+        },
+        "bankSpringDocs.qwen.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Qwen tabanlı yerel semantik analizi etkinleştirir."
+        },
+        "bankSpringDocs.qwen.endpoint": {
+          "type": "string",
+          "default": "http://localhost:8000/v1/chat/completions",
+          "description": "OpenAI uyumlu yerel Qwen chat completions endpoint adresi."
+        },
+        "bankSpringDocs.qwen.model": {
+          "type": "string",
+          "default": "qwen3",
+          "description": "Yerel Qwen model adı."
+        },
+        "bankSpringDocs.qwen.temperature": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Qwen isteklerinde kullanılacak temperature değeri."
+        },
+        "bankSpringDocs.qwen.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 256,
+          "description": "Qwen yanıtları için maksimum token değeri."
+        },
+        "bankSpringDocs.qwen.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 5,
+          "description": "Qwen HTTP isteği zaman aşımı süresi."
+        },
+        "bankSpringDocs.qwen.useApiKey": {
+          "type": "boolean",
+          "default": false,
+          "description": "Etkinse Qwen isteklerinde SecretStorage içindeki API key kullanılır."
+        },
+        "bankSpringDocs.semantic.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Semantik zenginleştirme komutlarını etkinleştirir."
+        },
+        "bankSpringDocs.semantic.cacheEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Qwen semantik analiz sonuçlarını yerel dosya cache ile yeniden kullanır."
+        },
+        "bankSpringDocs.semantic.maxFilesPerRun": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Bir semantik analiz çalışmasında işlenecek maksimum öğe sayısı."
+        },
+        "bankSpringDocs.semantic.maxCharactersPerFile": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "description": "Semantik analiz bağlamında dosya başına maksimum karakter."
+        },
+        "bankSpringDocs.copilot.contextPreviewEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Copilot isteğinden önce context preview onayı gösterir."
+        },
+        "bankSpringDocs.copilot.auditLogEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Copilot istekleri için içeriksiz audit JSONL kaydı yazar."
+        },
+        "bankSpringDocs.copilot.maxContextCharacters": {
+          "type": "number",
+          "default": 24000,
+          "minimum": 4000,
+          "description": "Copilot'a gönderilecek context paketinin maksimum karakter sayısı. Model token limit hatası alırsanız düşürün."
+        },
+        "bankSpringDocs.copilot.agenticPreviousArtifactsCharacters": {
+          "type": "number",
+          "default": 18000,
+          "minimum": 4000,
+          "description": "Agentic Copilot akisinda sonraki adimlara eklenecek onceki ara cikti maksimum karakter sayisi."
+        },
+        "bankSpringDocs.copilot.agenticMaxContextCharacters": {
+          "type": "number",
+          "default": 240000,
+          "minimum": 24000,
+          "description": "Agentic Copilot adimlarinda kullanilacak maksimum context karakter sayisi. Buyuk projelerde daha kapsamli analiz icin yuksek tutulur."
+        },
+        "bankSpringDocs.copilot.modelId": {
+          "type": "string",
+          "default": "",
+          "description": "Side panelden se?ilen Copilot Language Model API model id de?eri. Bo?sa VS Code varsay?lan ilk modeli kullan?l?r."
+        },
+        "bankSpringDocs.multiRepo.agenticRunQwenSemantics": {
+          "type": "boolean",
+          "default": true,
+          "description": "UI-BFF-BE Agentic Copilot pipeline calisirken Qwen sayfa semantigi adimini otomatik calistirir. Qwen kapaliysa adim atlanir."
+        },
+        "bankSpringDocs.pageAnalysis.maxEvidenceCharacters": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 5000,
+          "description": "Sayfa bazli analiz evidence paketinde kullanilacak toplam maksimum karakter sayisi."
+        },
+        "bankSpringDocs.pageAnalysis.maxSnippetCharacters": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "description": "Sayfa bazli analiz evidence paketinde dosya/snippet basina maksimum karakter sayisi."
+        },
+        "bankSpringDocs.pageAnalysis.includeSourceEvidence": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sayfa bazli analizde secili kaynak kaniti snippetlerini evidence paketine ekler."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "npm run compile && node scripts/smoke-tests.js",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.3"
+  }
+}
