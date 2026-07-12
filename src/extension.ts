@@ -32,6 +32,7 @@ import {
   saveMultiRepoManifestCommand
 } from "./commands/multiRepoCommands";
 import { openGeneratedDocsCommand } from "./commands/openGeneratedDocsCommand";
+import { openDevAuditsCommand } from "./commands/openDevAuditsCommand";
 import { openRepoMapCommand } from "./commands/openRepoMapCommand";
 import { analyzeSelectedPageCommand, buildFinalSelectedPageDocumentCommand, buildPageListCommand, detectSelectedPageDocumentGapsCommand, generateSelectedPageCopilotDraftCommand, generateSelectedPageQwenSemanticsCommand, getSelectedPageCommand, openFinalSelectedPageDocumentCommand, openSelectedPageContextPackCommand, openSelectedPageEvidencePackCommand, repairSelectedPageDocumentGapsCommand, runFullSelectedPageAnalysisCommand, scoreSelectedPageDocumentCommand } from "./commands/pageAnalysisCommands";
 import { saveQwenSettingsCommand, testQwenConnectionCommand } from "./commands/qwenCommands";
@@ -108,6 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bankSpringDocs.generatePageTechnicalAnalysis", () => analyzeSelectedPageCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.openUnresolvedMultiRepoMatches", () => openUnresolvedMultiRepoMatchesCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.openMultiRepoOutputFolder", () => openMultiRepoOutputFolderCommand(context)),
+    vscode.commands.registerCommand("bankSpringDocs.openDevAudits", () => openDevAuditsCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.clearLocalCache", () => clearLocalCacheCommand(context))
   );
 

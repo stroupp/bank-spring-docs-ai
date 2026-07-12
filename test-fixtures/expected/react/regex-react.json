@@ -1,0 +1,25 @@
+{
+  "provider": "regex-react",
+  "routes": [
+    { "route": "/customers/search", "pageComponent": "CustomerSearchPage", "confidence": "high" },
+    { "route": "/customers/:id", "pageComponent": "CustomerSearchPage", "confidence": "medium" }
+  ],
+  "components": [
+    { "component": "CustomerSearchPage", "classification": "page", "exportType": "named" }
+  ],
+  "interactions": [
+    { "component": "CustomerSearchPage", "event": "onSubmit", "handler": "handleSubmit(submitSearch)" }
+  ],
+  "apiCalls": [
+    { "httpMethod": "GET", "path": "/api/customers/search" },
+    { "httpMethod": "POST", "path": "/api/customers/search" },
+    { "httpMethod": "GET", "path": "/api/customers/{param}" }
+  ],
+  "formFields": [
+    { "fieldName": "customerName", "component": "input" },
+    { "fieldName": "status", "component": "Controller" }
+  ],
+  "stateUsage": [
+    { "component": "CustomerSearchPage", "stateName": "status", "setter": "setStatus", "initialValue": "\"ACTIVE\"" }
+  ]
+}

@@ -45,6 +45,7 @@ const requiredSections = [
 
 export class PageDocGapDetector {
   async detect(pageRoot: string, multiRepoRoot: string): Promise<PageDocGap[]> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const draftPath = path.join(pageRoot, "copilot-draft.md");
     const draft = await fs.readFile(draftPath, "utf8");
     const pageFlow = await readJson(path.join(pageRoot, "page-flow.json"));
@@ -72,9 +73,10 @@ export class PageDocGapDetector {
       gaps.push(gap(pageName, "Kaynak Referanslari", "missing-source-reference", "Dokumanda yeterli kaynak referansi yok.", ["page-evidence-pack.md"], "high"));
     }
 
-    await fs.writeFile(path.join(pageRoot, "detected-gaps.json"), `${JSON.stringify(gaps, null, 2)}\n`, "utf8");
-    await appendGapAudit(multiRepoRoot, gaps);
-    return gaps;
+    const deduped = dedupeGaps(gaps);
+    await fs.writeFile(path.join(pageRoot, "detected-gaps.json"), `${JSON.stringify(deduped, null, 2)}\n`, "utf8");
+    await appendGapAudit(multiRepoRoot, deduped);
+    return deduped;
   }
 }
 
@@ -96,9 +98,39 @@ function splitSections(markdown: string): Map<string, string> {
   for (let index = 0; index < matches.length; index += 1) {
     const current = matches[index];
     const next = matches[index + 1];
-    result.set(normalizeHeading(current[1]), markdown.slice((current.index ?? 0) + current[0].length, next?.index ?? markdown.length).trim());
+    const key = normalizeHeading(current[1]);
+    const body = markdown.slice((current.index ?? 0) + current[0].length, next?.index ?? markdown.length).trim();
+    const existing = result.get(key);
+    result.set(key, [existing, body].filter(Boolean).join("\n\n"));
+  }
+
+  // Accept a required section emitted as an orphan level-three heading without
+  // treating nested child headings as the end of their level-two parent.
+  const childMatches = [...markdown.matchAll(/^###\s+(.+)$/gm)];
+  for (let index = 0; index < childMatches.length; index += 1) {
+    const current = childMatches[index];
+    const key = normalizeHeading(current[1]);
+    if (result.has(key) || !requiredSections.some((section) => normalizeHeading(section) === key)) {
+      continue;
+    }
+    const nextHeading = markdown.slice((current.index ?? 0) + current[0].length).search(/^#{2,3}\s+/m);
+    const contentStart = (current.index ?? 0) + current[0].length;
+    const contentEnd = nextHeading < 0 ? markdown.length : contentStart + nextHeading;
+    result.set(key, markdown.slice(contentStart, contentEnd).trim());
   }
   return result;
+}
+
+function dedupeGaps(gaps: PageDocGap[]): PageDocGap[] {
+  const seen = new Set<string>();
+  return gaps.filter((item) => {
+    const key = `${normalizeHeading(item.section)}:${item.gapType}:${item.description}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function evidenceForSection(section: string): string[] {

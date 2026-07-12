@@ -2,7 +2,9 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
 import { readJsonl } from "../storage/jsonlWriter";
+import { sha256 } from "../utils/hash";
 import { safeName } from "../utils/pathUtils";
+import { pagePipelineVersion } from "./pageArtifactMetadata";
 import { PageCandidate } from "./pageListService";
 
 type JsonRecord = Record<string, unknown>;
@@ -21,11 +23,20 @@ export class PageContextPackBuilder {
 
     const data = await this.loadRelevantData(multiRepoRoot, selectedPage);
     const sourceArtifacts = await collectSourceArtifacts(multiRepoRoot);
+    const inputHash = sha256(JSON.stringify({
+      projectName: manifest.projectName,
+      branch: manifest.branch,
+      selectedPage,
+      sourceArtifacts
+    }));
     const pageFlow = {
       projectName: manifest.projectName,
       branch: manifest.branch,
       generatedAt: new Date().toISOString(),
       sourceArtifacts,
+      sourceArtifactModifiedTimes: sourceArtifacts,
+      inputHash,
+      pipelineVersion: pagePipelineVersion,
       selectedPage,
       ...data
     };
@@ -33,7 +44,7 @@ export class PageContextPackBuilder {
     const pageFlowPath = path.join(pageRoot, "page-flow.json");
     const contextPackPath = path.join(pageRoot, "page-context-pack.md");
     await fs.writeFile(pageFlowPath, `${JSON.stringify(pageFlow, null, 2)}\n`, "utf8");
-    await fs.writeFile(contextPackPath, this.toMarkdown(manifest, selectedPage, data, sourceArtifacts), "utf8");
+    await fs.writeFile(contextPackPath, this.toMarkdown(manifest, selectedPage, data, sourceArtifacts, inputHash), "utf8");
 
     return {
       pageRoot,
@@ -173,7 +184,8 @@ export class PageContextPackBuilder {
     manifest: MultiRepoManifest,
     selectedPage: PageCandidate,
     data: Awaited<ReturnType<PageContextPackBuilder["loadRelevantData"]>>,
-    sourceArtifacts: Record<string, string>
+    sourceArtifacts: Record<string, string>,
+    inputHash: string
   ): string {
     return [
       "# Sayfa Context Paketi",
@@ -184,9 +196,21 @@ export class PageContextPackBuilder {
       `Route: ${selectedPage.route ?? "Not visible from provided context."}`,
       `Dosya: ${selectedPage.file ?? "Not visible from provided context."}`,
       `Olusturulma zamani: ${new Date().toISOString()}`,
+      `Pipeline version: ${pagePipelineVersion}`,
+      `Input hash: ${inputHash}`,
       "",
       "## Artifact Metadata",
-      fencedJson(sourceArtifacts),
+      fencedJson({
+        generatedAt: new Date().toISOString(),
+        projectName: manifest.projectName,
+        branch: manifest.branch,
+        pageName: selectedPage.pageName,
+        route: selectedPage.route,
+        sourceArtifacts,
+        sourceArtifactModifiedTimes: sourceArtifacts,
+        inputHash,
+        pipelineVersion: pagePipelineVersion
+      }),
       "",
       "## Secili Sayfa Ozeti",
       fencedJson(selectedPage),

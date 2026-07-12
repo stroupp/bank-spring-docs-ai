@@ -27,6 +27,8 @@ const { EvidencePackBuilder } = require("../dist/evidence/evidencePackBuilder");
 const { sourceContextFromFiles } = require("../dist/docs/focusedSourceContext");
 const { selectPageEvidenceFiles } = require("../dist/evidence/pageEvidenceSelector");
 const { pageSemanticPromptVersion } = require("../dist/pageanalysis/pageSemanticPrompts");
+const { normalizeHttpPath } = require("../dist/analyzer/traceability/pathNormalizer");
+const { UiToBffMatcher } = require("../dist/analyzer/traceability/uiToBffMatcher");
 
 async function main() {
   testBeServiceFlowUsesMethodCalls();
@@ -37,6 +39,7 @@ async function main() {
   await testFinalDocumentMergeAndBackup();
   await testQualityScorerUnknownData();
   testQwenPromptVersion();
+  testTraceabilityPathNormalizationAndAmbiguity();
   console.log("Smoke tests passed.");
 }
 
@@ -218,10 +221,12 @@ async function testEvidencePackExactSnippetGroups() {
   assert.match(evidence, /## React Interaction Evidence/);
   assert.match(evidence, /## React API Client Evidence/);
   assert.match(evidence, /## BFF Endpoint Evidence/);
-  assert.match(evidence, /## BFF Service \/ Outbound Client Evidence/);
+  assert.match(evidence, /## BFF Service Evidence/);
+  assert.match(evidence, /## BFF Outbound Client Evidence/);
   assert.match(evidence, /## Backend Endpoint Evidence/);
   assert.match(evidence, /## Backend Service Evidence/);
-  assert.match(evidence, /## Repository \/ Entity Evidence/);
+  assert.match(evidence, /## Repository Evidence/);
+  assert.match(evidence, /## Entity \/ DTO \/ Validation Evidence/);
   assert.match(evidence, /handleSubmit/);
   assert.match(evidence, /export const login = \(body\) => apiClient\.post/);
   assert.match(evidence, /apiClient\.post/);
@@ -319,10 +324,34 @@ async function testQualityScorerUnknownData() {
   assert.ok(score.metricsWithUnknownData.includes("evidence-pack"));
   assert.ok(score.metricsWithUnknownData.includes("gap-report"));
   assert.strictEqual(score.finalDocumentLength, 8);
+  assert.strictEqual(score.bffMatchCoverage, null);
+  assert.ok(score.metricsWithUnknownData.includes("bff-match-coverage"));
+  assert.ok(score.metricExplanations.some((metric) => metric.metric === "bff-match-coverage" && metric.status === "unknown"));
 }
 
 function testQwenPromptVersion() {
   assert.strictEqual(pageSemanticPromptVersion, "page-analysis-semantic-v2");
+}
+
+function testTraceabilityPathNormalizationAndAmbiguity() {
+  const paths = [
+    "/customers/:id",
+    "/customers/{id}",
+    "/customers/${id}",
+    "/customers/{customerId}"
+  ];
+  assert.deepStrictEqual([...new Set(paths.map(normalizeHttpPath))], ["/customers/{param}"]);
+  assert.strictEqual(normalizeHttpPath("api/customers/search"), "/api/customers/search");
+
+  const matches = new UiToBffMatcher().match(
+    [{ httpMethod: "GET", path: "/customers/:id", file: "src/api/customer.ts" }],
+    [
+      { httpMethod: "GET", path: "/customers/{id}", className: "CustomerController", handlerMethod: "get", file: "CustomerController.java" },
+      { httpMethod: "GET", path: "/customers/{customerId}", className: "LegacyCustomerController", handlerMethod: "get", file: "LegacyCustomerController.java" }
+    ]
+  );
+  assert.strictEqual(matches[0].confidence, "low");
+  assert.match(matches[0].matchReason, /Ambiguous exact match/);
 }
 
 function javaFile(file, classification, content) {

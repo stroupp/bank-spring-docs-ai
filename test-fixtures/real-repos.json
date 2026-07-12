@@ -1,0 +1,36 @@
+{
+  "workspace": ".tmp/real-repo-validation",
+  "repos": [
+    {
+      "name": "inventory-management-API",
+      "type": "spring-be",
+      "url": "https://github.com/Sebaspallero/inventory-management-API.git",
+      "branch": "main",
+      "description": "Real-life inventory management Spring Boot backend"
+    },
+    {
+      "name": "rbac-ums",
+      "type": "ui-bff-be-monorepo",
+      "url": "https://github.com/mpiumakkho/rbac-ums.git",
+      "branch": "main",
+      "paths": {
+        "ui": "frontend",
+        "bff": "web-api",
+        "be": "core-api"
+      },
+      "description": "React UI + Spring BFF + Spring backend structure"
+    },
+    {
+      "name": "bff-spring-keycloak-react-demo",
+      "type": "ui-bff-be-monorepo",
+      "url": "https://github.com/HQT-Team/bff-spring-keycloak-react-demo.git",
+      "branch": "main",
+      "paths": {
+        "ui": "backoffice",
+        "bff": "backoffice-bff",
+        "be": "product"
+      },
+      "description": "Java Spring BFF + React + backend demo"
+    }
+  ]
+}

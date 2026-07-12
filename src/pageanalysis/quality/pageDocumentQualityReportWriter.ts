@@ -5,6 +5,7 @@ import { PageDocumentQualityScore } from "./pageDocumentQualityScorer";
 
 export class PageDocumentQualityReportWriter {
   async write(pageRoot: string, score: PageDocumentQualityScore): Promise<string> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const target = path.join(pageRoot, "quality-report.md");
     await fs.writeFile(target, [
       "# Sayfa Dokuman Kalite Raporu",
@@ -22,18 +23,23 @@ export class PageDocumentQualityReportWriter {
       `- High severity gap: ${score.highSeverityGapCount}`,
       "",
       "## Coverage",
-      `- UI API call coverage: ${score.uiApiCallCoverage}`,
-      `- BFF match coverage: ${score.bffMatchCoverage}`,
-      `- BE match coverage: ${score.beMatchCoverage}`,
-      `- Parameter coverage: ${score.parameterCoverage}`,
-      `- Validation coverage: ${score.validationCoverage}`,
-      `- Service flow coverage: ${score.serviceFlowCoverage}`,
-      `- Repository/entity coverage: ${score.repositoryEntityCoverage}`,
-      `- Qwen semantic coverage: ${score.qwenSemanticCoverage}`,
+      `- UI API call coverage: ${formatCoverage(score.uiApiCallCoverage)}`,
+      `- BFF match coverage: ${formatCoverage(score.bffMatchCoverage)}`,
+      `- BE match coverage: ${formatCoverage(score.beMatchCoverage)}`,
+      `- Parameter coverage: ${formatCoverage(score.parameterCoverage)}`,
+      `- Validation coverage: ${formatCoverage(score.validationCoverage)}`,
+      `- Service flow coverage: ${formatCoverage(score.serviceFlowCoverage)}`,
+      `- Repository/entity coverage: ${formatCoverage(score.repositoryEntityCoverage)}`,
+      `- Qwen semantic coverage: ${formatCoverage(score.qwenSemanticCoverage)}`,
       `- Context pack available: ${score.contextPackAvailable ? "evet" : "hayir"}`,
       `- Evidence pack available: ${score.evidencePackAvailable ? "evet" : "hayir"}`,
       `- Output freshness issue: ${score.outputFreshnessIssues}`,
       `- Unknown metric data: ${score.metricsWithUnknownData.length ? score.metricsWithUnknownData.join(", ") : "yok"}`,
+      "",
+      "## Skor Aciklamalari",
+      ...score.metricExplanations.map((metric) =>
+        `- ${metric.metric} (${metric.status}, agirlik ${metric.weight}): ${metric.value === null ? "unknown" : metric.value.toFixed(2)}. ${metric.reason}`
+      ),
       ""
     ].join("\n"), "utf8");
     return target;
@@ -68,4 +74,8 @@ export class PageDocumentQualityReportWriter {
     ].join("\n"), "utf8");
     return target;
   }
+}
+
+function formatCoverage(value: number | null): string {
+  return value === null ? "unknown" : value.toFixed(2);
 }

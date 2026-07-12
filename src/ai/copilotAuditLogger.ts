@@ -3,6 +3,8 @@ import * as path from "path";
 
 export interface CopilotAuditEntry {
   timestamp: string;
+  runId?: string;
+  attempt?: number;
   docType: string;
   repositoryName: string;
   branch: string;

@@ -225,7 +225,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
   private async getCopilotModels(): Promise<Array<{ id: string; name: string; vendor: string; family: string; maxInputTokens: number }>> {
     try {
-      const models = await vscode.lm.selectChatModels();
+      const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
       return models.map((model) => ({
         id: model.id,
         name: model.name,

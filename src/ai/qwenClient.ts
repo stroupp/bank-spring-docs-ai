@@ -8,6 +8,12 @@ export type QwenConnectionResult = {
   endpoint?: string;
 };
 
+/** Boundary used by semantic analyzers. Tests can inject a deterministic client. */
+export interface IQwenClient {
+  ask(prompt: string, token?: vscode.CancellationToken): Promise<string>;
+  testConnection?(): Promise<QwenConnectionResult>;
+}
+
 type QwenResponse = {
   choices?: Array<{
     message?: { content?: string };
@@ -15,7 +21,7 @@ type QwenResponse = {
   }>;
 };
 
-export class QwenClient {
+export class QwenClient implements IQwenClient {
   constructor(private readonly settingsService: QwenSettingsService) {}
 
   async ask(prompt: string, token?: vscode.CancellationToken): Promise<string> {

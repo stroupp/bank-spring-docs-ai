@@ -1,12 +1,14 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { QwenClient } from "../ai/qwenClient";
+import { IQwenClient, QwenClient } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
+import { maskSecrets } from "../ai/safeContextFilter";
 import { writeJsonl } from "../storage/jsonlWriter";
 import { sha256 } from "../utils/hash";
 import { safeName } from "../utils/pathUtils";
 import { parseStrictJson } from "../semantic/semanticCacheService";
+import { buildPageArtifactMetadata } from "./pageArtifactMetadata";
 import { buildInteractionSemanticPrompt, buildPageSemanticPrompt, pageSemanticPromptVersion } from "./pageSemanticPrompts";
 
 export interface QwenPageSemanticResult {
@@ -18,14 +20,26 @@ export interface QwenPageSemanticResult {
 }
 
 export class QwenPageSemanticAnalyzer {
+  constructor(
+    private readonly injectedClient?: IQwenClient,
+    private readonly modelOverride?: string,
+    private readonly maxContextCharactersOverride?: number
+  ) {}
+
   async analyze(pageRoot: string, context: vscode.ExtensionContext, token?: vscode.CancellationToken): Promise<QwenPageSemanticResult> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const settings = new QwenSettingsService(context);
-    const client = new QwenClient(settings);
-    const model = settings.getSettings().model;
+    const client = this.injectedClient ?? new QwenClient(settings);
+    const model = this.modelOverride ?? settings.getSettings().model;
     const pageContext = await readOptional(path.join(pageRoot, "page-context-pack.md"));
     const evidence = await readOptional(path.join(pageRoot, "page-evidence-pack.md"));
     const pageFlow = await readJson(path.join(pageRoot, "page-flow.json"));
-    const combinedContext = [pageContext, evidence ? `# Focused Source Evidence\n\n${evidence}` : ""].filter(Boolean).join("\n\n---\n\n");
+    const maxContextCharacters = this.maxContextCharactersOverride
+      ?? vscode.workspace.getConfiguration("bankSpringDocs").get<number>("semantic.maxCharactersPerFile", 16000);
+    const combinedContext = prepareQwenContext(
+      [pageContext, evidence ? `# Focused Source Evidence\n\n${evidence}` : ""].filter(Boolean).join("\n\n---\n\n"),
+      maxContextCharacters
+    );
 
     const pageIdentity = String((pageFlow.selectedPage as Record<string, unknown> | undefined)?.pageName ?? path.basename(pageRoot));
     const pageSemanticsPath = path.join(pageRoot, "qwen-page-semantics.json");
@@ -34,22 +48,37 @@ export class QwenPageSemanticAnalyzer {
 
     const pagePrompt = buildPageSemanticPrompt(combinedContext);
     const pageCache = await readCache(cacheRoot, model, `page:${pageIdentity}`, pagePrompt);
-    const pageSemantics = pageCache.hit ? pageCache.value : parseStrictJson(await client.ask(pagePrompt, token));
-    if (!pageCache.hit) {
-      await writeCache(pageCache.path, pageSemantics);
+    let failures = 0;
+    let pageSemantics: unknown;
+    if (pageCache.hit) {
+      pageSemantics = pageCache.value;
+    } else {
+      let rawOutput = "";
+      try {
+        rawOutput = await client.ask(pagePrompt, token);
+        pageSemantics = parseStrictJson(rawOutput);
+        await writeCache(pageCache.path, pageSemantics);
+      } catch (error) {
+        failures += 1;
+        if (rawOutput) {
+          await writeDebug(cacheRoot, `page-${pageIdentity}`, rawOutput);
+        }
+        pageSemantics = failedSemanticRecord(pageIdentity, error);
+      }
     }
-    await fs.writeFile(pageSemanticsPath, `${JSON.stringify(pageSemantics, null, 2)}\n`, "utf8");
+    const metadata = await buildPageArtifactMetadata(pageRoot, ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"]);
+    await fs.writeFile(pageSemanticsPath, `${JSON.stringify(withMetadata(pageSemantics, metadata), null, 2)}\n`, "utf8");
 
     let cacheHits = pageCache.hit ? 1 : 0;
-    let failures = 0;
     const interactionRecords = importantInteractions(pageFlow);
     const interactionSemantics: unknown[] = [];
     for (const interaction of interactionRecords) {
       if (token?.isCancellationRequested) {
         break;
       }
+      let rawOutput = "";
       try {
-        const prompt = buildInteractionSemanticPrompt(JSON.stringify({
+        const prompt = buildInteractionSemanticPrompt(prepareQwenContext(JSON.stringify({
           selectedPage: pageFlow.selectedPage,
           interaction,
           pageFlows: pageFlow.pageFlows,
@@ -57,7 +86,7 @@ export class QwenPageSemanticAnalyzer {
           uiToBffMatches: pageFlow.uiToBffMatches,
           bffToBeMatches: pageFlow.bffToBeMatches,
           evidence
-        }, null, 2));
+        }, null, 2), maxContextCharacters));
         const identity = `interaction:${pageIdentity}:${safeName(JSON.stringify(interaction).slice(0, 160))}`;
         const cached = await readCache(cacheRoot, model, identity, prompt);
         if (cached.hit) {
@@ -65,11 +94,15 @@ export class QwenPageSemanticAnalyzer {
           cacheHits += 1;
           continue;
         }
-        const parsed = parseStrictJson(await client.ask(prompt, token));
+        rawOutput = await client.ask(prompt, token);
+        const parsed = parseStrictJson(rawOutput);
         await writeCache(cached.path, parsed);
         interactionSemantics.push(parsed);
       } catch {
         failures += 1;
+        if (rawOutput) {
+          await writeDebug(cacheRoot, `interaction-${pageIdentity}`, rawOutput);
+        }
       }
     }
 
@@ -82,6 +115,28 @@ export class QwenPageSemanticAnalyzer {
       failures
     };
   }
+}
+
+export function prepareQwenContext(value: string, maxCharacters: number): string {
+  const safe = maskSecrets(value);
+  if (maxCharacters <= 0) {
+    return "";
+  }
+  if (safe.length <= maxCharacters) {
+    return safe;
+  }
+  const marker = "\n[PAGE_CONTEXT_TRUNCATED_FOR_QWEN_TOKEN_LIMIT]";
+  if (maxCharacters <= marker.length) {
+    return marker.slice(0, maxCharacters);
+  }
+  return `${safe.slice(0, maxCharacters - marker.length)}${marker}`;
+}
+
+function withMetadata(value: unknown, metadata: Awaited<ReturnType<typeof buildPageArtifactMetadata>>): unknown {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return { ...(value as Record<string, unknown>), _metadata: metadata };
+  }
+  return { _metadata: metadata, value };
 }
 
 async function readOptional(filePath: string): Promise<string> {
@@ -125,4 +180,19 @@ async function readCache(root: string, model: string, identity: string, prompt: 
 async function writeCache(cachePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(cachePath), { recursive: true });
   await fs.writeFile(cachePath, JSON.stringify(value, null, 2), "utf8");
+}
+
+async function writeDebug(root: string, identity: string, rawOutput: string): Promise<void> {
+  const target = path.join(root, "debug", `${safeName(identity)}-${Date.now()}.txt`);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, rawOutput, "utf8");
+}
+
+function failedSemanticRecord(pageIdentity: string, error: unknown): Record<string, unknown> {
+  return {
+    page: pageIdentity,
+    confidence: "low",
+    uncertainties: ["Qwen semantik analizi tamamlanamadı; yerel context ve evidence artefaktları kullanılmaya devam edilebilir."],
+    error: error instanceof Error ? error.message : String(error)
+  };
 }

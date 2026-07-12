@@ -15,13 +15,16 @@ export interface EvidenceSnippet {
 
 export type EvidenceSnippetGroup =
   | "React Page Evidence"
+  | "React Route Evidence"
   | "React Interaction Evidence"
   | "React API Client Evidence"
   | "BFF Endpoint Evidence"
-  | "BFF Service / Outbound Client Evidence"
+  | "BFF Service Evidence"
+  | "BFF Outbound Client Evidence"
   | "Backend Endpoint Evidence"
   | "Backend Service Evidence"
-  | "Repository / Entity Evidence";
+  | "Repository Evidence"
+  | "Entity / DTO / Validation Evidence";
 
 export interface EvidenceSnippetResult {
   snippets: EvidenceSnippet[];
@@ -36,6 +39,7 @@ export async function buildPageEvidenceSnippets(
   const snippets: EvidenceSnippet[] = [];
   const uncertainties: string[] = [];
   snippets.push(...await reactHandlerSnippetExtractor(manifest.repos.ui.localPath, pageFlow, maxSnippetCharacters, uncertainties));
+  snippets.push(...await reactRouteSnippetExtractor(manifest.repos.ui.localPath, pageFlow, maxSnippetCharacters, uncertainties));
   snippets.push(...await reactApiClientSnippetExtractor(manifest.repos.ui.localPath, pageFlow, maxSnippetCharacters, uncertainties));
   snippets.push(...await javaControllerMethodSnippetExtractor(manifest.repos.bff.localPath, pageFlow, "bff", maxSnippetCharacters, uncertainties));
   snippets.push(...await javaServiceMethodSnippetExtractor(manifest.repos.bff.localPath, pageFlow, "bff", maxSnippetCharacters, uncertainties));
@@ -43,6 +47,35 @@ export async function buildPageEvidenceSnippets(
   snippets.push(...await javaServiceMethodSnippetExtractor(manifest.repos.be.localPath, pageFlow, "be", maxSnippetCharacters, uncertainties));
   snippets.push(...await javaRepositoryMethodSnippetExtractor(manifest.repos.be.localPath, pageFlow, maxSnippetCharacters, uncertainties));
   return { snippets: dedupeSnippets(snippets), uncertainties: unique(uncertainties) };
+}
+
+export async function reactRouteSnippetExtractor(
+  repoRoot: string,
+  pageFlow: Record<string, unknown>,
+  maxSnippetCharacters: number,
+  uncertainties: string[]
+): Promise<EvidenceSnippet[]> {
+  const result: EvidenceSnippet[] = [];
+  for (const route of asRecords(pageFlow.routes)) {
+    const file = String(route.file ?? "");
+    const routePath = String(route.route ?? route.path ?? "");
+    const component = String(route.pageComponent ?? route.component ?? asRecord(pageFlow.selectedPage).pageName ?? "");
+    if (!file || (!routePath && !component)) {
+      continue;
+    }
+    const content = await readRepoFile(repoRoot, file);
+    if (!content) {
+      uncertainties.push(`React route snippet not found because file is unreadable: ${file}`);
+      continue;
+    }
+    const block = extractRouteWindow(content, routePath, component);
+    if (block) {
+      result.push(snippet("React Route Evidence", file, `${routePath || "route"} -> ${component || "page"}`, "Route definition matched to the selected page.", confidence(route), block, maxSnippetCharacters));
+    } else {
+      uncertainties.push(`Exact React route snippet was not found for ${routePath || component} in ${file}.`);
+    }
+  }
+  return result;
 }
 
 export async function reactHandlerSnippetExtractor(
@@ -175,6 +208,7 @@ export async function javaServiceMethodSnippetExtractor(
       ...asStringArray(flow.candidateServices),
       ...asStringArray(flow.candidateClients)
     ];
+    const serviceNames = new Set(asStringArray(flow.candidateServices).map(normalizeName));
     const methodNames = unique([
       String(flow.handler ?? ""),
       ...asStringArray(flow.methodCalls).map(extractMethodNameFromFlowText),
@@ -192,10 +226,17 @@ export async function javaServiceMethodSnippetExtractor(
         uncertainties.push(`Service/outbound snippet not found because file is unreadable: ${file}`);
         continue;
       }
-      const blocks = methodNames.map((method) => extractJavaMethod(content, method, false)).filter((value): value is string => Boolean(value));
-      if (blocks.length) {
-        const symbolName = `${componentName}.${methodNames.slice(0, Math.max(1, blocks.length)).join("|")}`;
-        result.push(snippet(layer === "bff" ? "BFF Service / Outbound Client Evidence" : "Backend Service Evidence", file, symbolName, `Service/client flow evidence for ${flow.endpoint ?? "endpoint"}.`, confidence(flow), blocks.join("\n\n...\n\n"), maxSnippetCharacters));
+      const matchedMethods = methodNames
+        .map((method) => ({ method, block: extractJavaMethod(content, method, false) }))
+        .filter((item): item is { method: string; block: string } => Boolean(item.block));
+      if (matchedMethods.length) {
+        const symbolName = `${componentName}.${matchedMethods.map((item) => item.method).join("|")}`;
+        const group: EvidenceSnippetGroup = layer === "be"
+          ? "Backend Service Evidence"
+          : serviceNames.has(normalizeName(componentName))
+            ? "BFF Service Evidence"
+            : "BFF Outbound Client Evidence";
+        result.push(snippet(group, file, symbolName, `Service/client flow evidence for ${flow.endpoint ?? "endpoint"}.`, confidence(flow), matchedMethods.map((item) => item.block).join("\n\n...\n\n"), maxSnippetCharacters));
       } else {
         uncertainties.push(`Exact service/client method snippet was not found for ${componentName} in ${file}.`);
       }
@@ -211,7 +252,12 @@ export async function javaRepositoryMethodSnippetExtractor(
   uncertainties: string[]
 ): Promise<EvidenceSnippet[]> {
   const result: EvidenceSnippet[] = [];
-  for (const record of [...asRecords(pageFlow.repositories), ...asRecords(pageFlow.entities), ...asRecords(pageFlow.beDtos), ...asRecords(pageFlow.beValidations)]) {
+  const records = [
+    ...asRecords(pageFlow.repositories).map((record) => ({ record, group: "Repository Evidence" as const })),
+    ...[...asRecords(pageFlow.entities), ...asRecords(pageFlow.beDtos), ...asRecords(pageFlow.beValidations)]
+      .map((record) => ({ record, group: "Entity / DTO / Validation Evidence" as const }))
+  ];
+  for (const { record, group } of records) {
     const file = String(record.file ?? "");
     if (!file) {
       continue;
@@ -222,14 +268,29 @@ export async function javaRepositoryMethodSnippetExtractor(
       continue;
     }
     const method = String(record.method ?? "");
-    const block = method ? extractJavaMethod(content, method, true) : extractJavaClassBlock(content, String(record.entity ?? record.className ?? ""));
+    const block = method
+      ? extractJavaMethod(content, method, true)
+      : extractJavaFieldOrClassBlock(content, String(record.fieldOrParameter ?? ""), String(record.entity ?? record.className ?? ""));
     if (block) {
-      result.push(snippet("Repository / Entity Evidence", file, String(record.method ?? record.entity ?? record.className ?? path.basename(file)), "Repository/entity/DTO evidence matched from backend flow.", confidence(record), block, maxSnippetCharacters));
+      result.push(snippet(group, file, String(record.method ?? record.entity ?? record.className ?? record.fieldOrParameter ?? path.basename(file)), "Repository/entity/DTO/validation evidence matched from backend flow.", confidence(record), block, maxSnippetCharacters));
     } else {
       uncertainties.push(`Exact repository/entity/DTO snippet was not found in ${file}.`);
     }
   }
   return result;
+}
+
+function extractJavaFieldOrClassBlock(content: string, fieldName: string, className: string): string | undefined {
+  if (fieldName) {
+    const fieldPattern = new RegExp(`(?:^\\s*(?:@[A-Za-z0-9_.]+(?:\\([^)]*\\))?\\s*)*)^\\s*(?:private|protected|public)?\\s*(?:final\\s+)?[A-Za-z0-9_<>,.? \\[\\]]+\\s+${escapeRegex(fieldName)}\\s*(?:[;=])`, "gm");
+    const match = fieldPattern.exec(content);
+    if (match) {
+      const start = annotationStart(content, match.index);
+      const endOfLine = content.indexOf("\n", fieldPattern.lastIndex);
+      return [relevantImports(content), content.slice(start, endOfLine < 0 ? fieldPattern.lastIndex : endOfLine)].filter(Boolean).join("\n");
+    }
+  }
+  return extractJavaClassBlock(content, className);
 }
 
 function extractJavaMethod(content: string, methodName: string, includeAnnotations: boolean): string | undefined {
@@ -355,6 +416,16 @@ function extractApiCallWindow(content: string, apiPath: string, method: string):
     return undefined;
   }
   return content.slice(Math.max(0, index - 700), Math.min(content.length, index + 1200));
+}
+
+function extractRouteWindow(content: string, routePath: string, component: string): string | undefined {
+  const markers = [routePath, component].filter(Boolean);
+  const indexes = markers.map((marker) => content.indexOf(marker)).filter((index) => index >= 0);
+  if (!indexes.length) {
+    return undefined;
+  }
+  const index = Math.min(...indexes);
+  return content.slice(Math.max(0, index - 500), Math.min(content.length, index + 1000));
 }
 
 function extractNearbyStateAndImports(content: string, componentName: string, handler: string): string | undefined {

@@ -1,0 +1,68 @@
+{
+  "endpoints": [
+    {
+      "httpMethod": "GET",
+      "path": "/api/customers/{customerId}",
+      "handlerMethod": "getCustomer",
+      "parser": "tree-sitter-java",
+      "confidence": "high",
+      "pathVariables": ["customerId"]
+    },
+    {
+      "httpMethod": "GET",
+      "path": "/api/customers/search",
+      "handlerMethod": "searchCustomers",
+      "securityAnnotations": ["PreAuthorize"],
+      "requestParams": ["status"]
+    },
+    {
+      "httpMethod": "POST",
+      "path": "/api/customers/search",
+      "handlerMethod": "create",
+      "requestBody": "CustomerSearchRequest",
+      "validationAnnotations": ["Valid"]
+    },
+    {
+      "httpMethod": "PUT",
+      "path": "/api/customers/{customerId}",
+      "handlerMethod": "update"
+    },
+    {
+      "httpMethod": "DELETE",
+      "path": "/api/customers/{customerId}",
+      "handlerMethod": "delete"
+    },
+    {
+      "httpMethod": "GET",
+      "path": "/api/orders/{orderId}",
+      "handlerMethod": "getOrder",
+      "requestParams": ["includeHistory"]
+    },
+    {
+      "httpMethod": "GET",
+      "path": "/api/legacy/orders/{orderId}",
+      "handlerMethod": "getOrder"
+    }
+  ],
+  "parameterChecks": [
+    {
+      "handlerMethod": "searchCustomers",
+      "name": "status",
+      "source": "query",
+      "defaultValue": "ACTIVE"
+    },
+    {
+      "handlerMethod": "getOrder",
+      "name": "includeHistory",
+      "source": "query",
+      "defaultValue": "false",
+      "required": false
+    },
+    {
+      "handlerMethod": "getOrder",
+      "name": "X-Tenant-Id",
+      "source": "header",
+      "required": true
+    }
+  ]
+}

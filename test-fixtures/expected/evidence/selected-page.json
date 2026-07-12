@@ -1,0 +1,24 @@
+{
+  "requiredGroups": [
+    "React Page Evidence",
+    "React Interaction Evidence",
+    "React API Client Evidence",
+    "BFF Endpoint Evidence",
+    "BFF Outbound Client Evidence",
+    "Backend Endpoint Evidence",
+    "Backend Service Evidence",
+    "Repository Evidence",
+    "Entity / DTO / Validation Evidence"
+  ],
+  "requiredSymbols": [
+    "CustomerSearchPage",
+    "submitSearch",
+    "GET /api/customers/search",
+    "CustomerSearchController.searchCustomers",
+    "CustomerRiskClient.checkRisk",
+    "CustomerService.getCustomer",
+    "searchByName",
+    "Customer"
+  ],
+  "maxSnippetCharacters": 1800
+}

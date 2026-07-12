@@ -14,6 +14,7 @@ import { PageSectionRegenerator } from "../pageanalysis/gapRepair/pageSectionReg
 import { PageDocumentQualityScorer } from "../pageanalysis/quality/pageDocumentQualityScorer";
 import { PageDocumentQualityReportWriter } from "../pageanalysis/quality/pageDocumentQualityReportWriter";
 import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
+import { ArtifactFreshnessService } from "../pageanalysis/artifactFreshnessService";
 import { safeName } from "../utils/pathUtils";
 
 export async function buildPageListCommand(context: vscode.ExtensionContext): Promise<PageCandidate | undefined> {
@@ -73,7 +74,8 @@ export async function analyzeSelectedPageCommand(context: vscode.ExtensionContex
     return analyzeSelectedPageCommand(context);
   }
 
-  await vscode.window.withProgress(
+  try {
+    await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Bank Spring Docs: SeÃ§ili sayfa analiz ediliyor",
@@ -81,7 +83,9 @@ export async function analyzeSelectedPageCommand(context: vscode.ExtensionContex
     },
     async (progress) => {
       progress.report({ message: "Sayfa context paketi oluÅŸturuluyor..." });
-      await ensurePagePipelineFreshness(manifestService.getMultiRepoRoot(), manifest);
+      if (!await ensurePagePipelineFreshness(manifestService.getMultiRepoRoot(), manifest)) {
+        return;
+      }
       const result = await new PageContextPackBuilder().build(manifestService.getMultiRepoRoot(), manifest, selectedPage);
       progress.report({ message: "Sayfa evidence paketi oluÅŸturuluyor..." });
       await new EvidencePackBuilder().build(result.pageRoot, manifest);
@@ -89,7 +93,10 @@ export async function analyzeSelectedPageCommand(context: vscode.ExtensionContex
       await vscode.window.showTextDocument(document, { preview: false });
       vscode.window.showInformationMessage(`Bank Spring Docs: Sayfa context paketi oluÅŸturuldu: ${result.contextPackPath}`);
     }
-  );
+    );
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: Secili sayfa analizi tamamlanamadi. ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export async function openSelectedPageContextPackCommand(context: vscode.ExtensionContext): Promise<void> {
@@ -153,6 +160,7 @@ export async function generateSelectedPageQwenSemanticsCommand(context: vscode.E
     vscode.window.showWarningMessage("Bank Spring Docs: Sayfa context paketi bulunamadÄ±. Ã–nce seÃ§ili sayfayÄ± analiz et.");
     return;
   }
+  await warnIfPageArtifactsStale(pageRoot);
 
   await vscode.window.withProgress(
     {
@@ -182,6 +190,7 @@ export async function generateSelectedPageCopilotDraftCommand(context: vscode.Ex
     vscode.window.showWarningMessage("Bank Spring Docs: Sayfa context paketi bulunamadÄ±. Ã–nce seÃ§ili sayfayÄ± analiz et.");
     return;
   }
+  await warnIfPageArtifactsStale(pageRoot);
 
   await vscode.window.withProgress(
     {
@@ -333,7 +342,8 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
   }
 
   const multiRepoRoot = manifestService.getMultiRepoRoot();
-  await vscode.window.withProgress(
+  try {
+    await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Bank Spring Docs: SeÃ§ili sayfa iÃ§in tÃ¼m analiz Ã§alÄ±ÅŸÄ±yor",
@@ -342,7 +352,9 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
     async (progress, token) => {
       progress.report({ message: "1/9 Artifact tazeligi kontrol ediliyor..." });
 
-      await ensurePagePipelineFreshness(multiRepoRoot, manifest);
+      if (!await ensurePagePipelineFreshness(multiRepoRoot, manifest)) {
+        return;
+      }
 
       progress.report({ message: "2/9 Context paketi olusturuluyor..." });
 
@@ -388,21 +400,35 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
       await vscode.window.showTextDocument(document, { preview: false });
       vscode.window.showInformationMessage(`Bank Spring Docs: TÃ¼m sayfa analizi tamamlandÄ±. Skor: ${score.score} (${score.grade}).`);
     }
-  );
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/cancel/i.test(message)) {
+      vscode.window.showWarningMessage("Bank Spring Docs: Tum sayfa analizi kullanici tarafindan iptal edildi. Olusan ara dosyalar korundu.");
+      return;
+    }
+    vscode.window.showErrorMessage(`Bank Spring Docs: Tum sayfa analizi tamamlanamadi. Olusan ara dosyalar korundu. Detay: ${message}`);
+  }
 }
 
 function selectedPageRoot(multiRepoRoot: string, selectedPage: PageCandidate): string {
   return path.join(multiRepoRoot, "page-analysis", "pages", safeName(selectedPage.pageName || selectedPage.route || "page"));
 }
 
-async function ensurePagePipelineFreshness(multiRepoRoot: string, manifest: NonNullable<Awaited<ReturnType<MultiRepoManifestService["readManifest"]>>>): Promise<void> {
+async function ensurePagePipelineFreshness(multiRepoRoot: string, manifest: NonNullable<Awaited<ReturnType<MultiRepoManifestService["readManifest"]>>>): Promise<boolean> {
   const result = await new PagePipelineFreshnessService().ensure(multiRepoRoot, manifest);
   const highIssues = result.issues.filter((issue) => issue.severity === "high");
   if (highIssues.length) {
     vscode.window.showWarningMessage(
-      `Bank Spring Docs: Sayfa analizi icin ${highIssues.length} temel artifact eksik. Detay: ${result.reportPath}`
+      `Bank Spring Docs: Sayfa analizi baslatilamadi. ${highIssues.length} zorunlu temel artifact eksik. Once UI, BFF ve BE yerel analizlerini calistir. Detay: ${result.reportPath}`
     );
+    return false;
   }
+  const warnings = result.issues.filter((issue) => issue.severity !== "high");
+  if (warnings.length) {
+    vscode.window.showWarningMessage(`Bank Spring Docs: Sayfa analizi ${warnings.length} artifact uyarisi ile devam ediyor. Detay: ${result.reportPath}`);
+  }
+  return true;
 }
 
 async function warnIfOutputStale(pageRoot: string, target: string, dependencies: string[]): Promise<boolean> {
@@ -420,6 +446,15 @@ async function warnIfOutputStale(pageRoot: string, target: string, dependencies:
     );
   }
   return staleIssues.length > 0;
+}
+
+async function warnIfPageArtifactsStale(pageRoot: string): Promise<void> {
+  const result = await new ArtifactFreshnessService().check(pageRoot);
+  if (result.warnings.length) {
+    vscode.window.showWarningMessage(
+      `Bank Spring Docs: Sayfa artifactlerinde ${result.warnings.length} eksik/eski girdi uyarisi var. Islem devam edecek. Detay: ${result.reportPath}`
+    );
+  }
 }
 
 async function exists(filePath: string): Promise<boolean> {

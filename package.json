@@ -14,6 +14,8 @@
     "onStartupFinished",
     "onView:bankSpringDocs.dashboard",
     "onCommand:bankSpringDocs.openDashboard",
+    "onCommand:bankSpringDocs.openRepoMap",
+    "onCommand:bankSpringDocs.openGeneratedDocs",
     "onCommand:bankSpringDocs.analyzeRepositoryUrl",
     "onCommand:bankSpringDocs.indexCurrentRepository",
     "onCommand:bankSpringDocs.generateRepositoryOverview",
@@ -71,6 +73,7 @@
     "onCommand:bankSpringDocs.generatePageTechnicalAnalysis",
     "onCommand:bankSpringDocs.openUnresolvedMultiRepoMatches",
     "onCommand:bankSpringDocs.openMultiRepoOutputFolder",
+    "onCommand:bankSpringDocs.openDevAudits",
     "onCommand:bankSpringDocs.clearLocalCache"
   ],
   "main": "./dist/extension.js",
@@ -335,6 +338,10 @@
         "title": "Bank Spring Docs: UI-BFF-BE ??kt? Klas?r?n? A?"
       },
       {
+        "command": "bankSpringDocs.openDevAudits",
+        "title": "Bank Spring Docs: Geliştirici Denetim Raporlarını Aç"
+      },
+      {
         "command": "bankSpringDocs.clearLocalCache",
         "title": "Bank Spring Docs: Clear Local Cache"
       }
@@ -506,12 +513,22 @@
   "scripts": {
     "compile": "tsc -p ./",
     "test": "npm run compile && node scripts/smoke-tests.js",
+    "test:fixtures": "npm run compile && node scripts/parser-fixture-tests.js && node scripts/traceability-fixture-tests.js && node scripts/evidence-fixture-tests.js",
+    "test:ast-spike": "npm run compile && node scripts/tree-sitter-java-spike-tests.js",
+    "test:qwen-boundary": "node scripts/qwen-boundary-tests.js",
+    "test:copilot-boundary": "node scripts/copilot-boundary-tests.js",
+    "test:copilot-model-selection": "npm run compile && node scripts/copilot-model-selection-tests.js",
+    "test:agentic-status": "npm run compile && node scripts/agentic-run-status-tests.js",
+    "test:doc-quality": "node scripts/document-quality-check.js",
+    "validate:real-repos": "npm run compile && node scripts/real-repo-validation.js",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.90.0",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-java": "^0.23.5",
     "typescript": "^5.5.3"
   }
 }

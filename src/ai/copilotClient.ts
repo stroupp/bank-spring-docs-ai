@@ -32,24 +32,87 @@ export interface CopilotChatRequest {
   combinedText?: string;
 }
 
+/** Boundary around the VS Code Language Model API. */
+export interface ICopilotClient {
+  send(
+    prompt: string | CopilotChatRequest,
+    token: vscode.CancellationToken,
+    onProgress?: CopilotProgressHandler
+  ): Promise<CopilotResponseWithUsage>;
+}
+
+/** Production adapter. Automated tests inject ICopilotClient and never load vscode.lm. */
+export class RealCopilotClient implements ICopilotClient {
+  private pinnedModelPromise: Promise<vscode.LanguageModelChat> | undefined;
+
+  async send(
+    prompt: string | CopilotChatRequest,
+    token: vscode.CancellationToken,
+    onProgress?: CopilotProgressHandler
+  ): Promise<CopilotResponseWithUsage> {
+    return sendWithVsCodeLanguageModel(prompt, token, onProgress, await this.getPinnedModel());
+  }
+
+  private getPinnedModel(): Promise<vscode.LanguageModelChat> {
+    if (!this.pinnedModelPromise) {
+      this.pinnedModelPromise = selectStandardCopilotModel().catch((error) => {
+        this.pinnedModelPromise = undefined;
+        throw error;
+      });
+    }
+    return this.pinnedModelPromise;
+  }
+}
+
 export async function askCopilot(prompt: string, token: vscode.CancellationToken): Promise<string> {
   return (await askCopilotWithUsage(prompt, token)).text;
 }
 
 export async function askCopilotWithUsage(prompt: string | CopilotChatRequest, token: vscode.CancellationToken, onProgress?: CopilotProgressHandler): Promise<CopilotResponseWithUsage> {
+  return new RealCopilotClient().send(prompt, token, onProgress);
+}
+
+async function selectStandardCopilotModel(): Promise<vscode.LanguageModelChat> {
+  const selectedModelId = vscode.workspace.getConfiguration("bankSpringDocs").get<string>("copilot.modelId", "").trim();
+  const selector: vscode.LanguageModelChatSelector = selectedModelId
+    ? { vendor: "copilot", id: selectedModelId }
+    : { vendor: "copilot" };
+
   let models: vscode.LanguageModelChat[];
   try {
-    models = await vscode.lm.selectChatModels();
+    models = await vscode.lm.selectChatModels(selector);
   } catch (error) {
     throw new Error(`Copilot model selection failed. Make sure GitHub Copilot is enabled and signed in. ${formatError(error)}`);
   }
 
-  if (!models.length) {
-    throw new Error("No language model is available. Make sure GitHub Copilot is enabled and signed in to VS Code.");
+  // Filter again defensively because multiple providers can expose the same model ID.
+  // In particular, the Copilot CLI provider uses vendor `copilotcli` and must not be
+  // substituted for the standard VS Code Copilot Language Model provider.
+  const standardModels = models.filter((model) =>
+    model.vendor === "copilot" && (!selectedModelId || model.id === selectedModelId)
+  );
+
+  if (selectedModelId && !standardModels.length) {
+    throw new Error(
+      `Configured Copilot model '${selectedModelId}' is not available from the standard 'copilot' provider. ` +
+      "Open the Bank Spring Docs panel and select an available GitHub Copilot model."
+    );
   }
 
+  if (!standardModels.length) {
+    throw new Error("No model is available from the standard 'copilot' provider. Make sure GitHub Copilot is enabled and signed in to VS Code.");
+  }
+
+  return standardModels[0];
+}
+
+async function sendWithVsCodeLanguageModel(
+  prompt: string | CopilotChatRequest,
+  token: vscode.CancellationToken,
+  onProgress: CopilotProgressHandler | undefined,
+  model: vscode.LanguageModelChat
+): Promise<CopilotResponseWithUsage> {
   try {
-    const model = selectPreferredModel(models);
     const modelInfo = modelInfoFrom(model);
     const messages = buildMessages(prompt);
     const usageText = typeof prompt === "string" ? prompt : prompt.combinedText ?? `${prompt.instructions ?? ""}\n\n${prompt.userPrompt}`;
@@ -123,17 +186,6 @@ function modelInfoFrom(model: vscode.LanguageModelChat): CopilotModelInfo {
     version: model.version,
     maxInputTokens: model.maxInputTokens
   };
-}
-
-function selectPreferredModel(models: vscode.LanguageModelChat[]): vscode.LanguageModelChat {
-  const selectedModelId = vscode.workspace.getConfiguration("bankSpringDocs").get<string>("copilot.modelId", "").trim();
-  if (selectedModelId) {
-    const selected = models.find((model) => model.id === selectedModelId);
-    if (selected) {
-      return selected;
-    }
-  }
-  return models[0];
 }
 
 async function tryCountTokens(model: vscode.LanguageModelChat, prompt: string, token: vscode.CancellationToken): Promise<number | undefined> {

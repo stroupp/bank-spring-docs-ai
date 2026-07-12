@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { askCopilotWithUsage, CopilotUsageEstimate } from "../ai/copilotClient";
+import { CopilotResponseWithUsage, CopilotUsageEstimate, ICopilotClient, RealCopilotClient } from "../ai/copilotClient";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
 import { buildCopilotMultiRepoAgenticPrompt, CopilotMultiRepoAgenticStep } from "../ai/prompts";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
@@ -9,6 +9,7 @@ import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
 import { readJsonl } from "../storage/jsonlWriter";
 import { buildFocusedSourceContext, FocusedSourceIndex } from "./focusedSourceContext";
 import { MarkdownWriter } from "./markdownWriter";
+import { MultiRepoAgenticRunStatus, MultiRepoAgenticRunStatusWriter } from "./multiRepoAgenticRunStatus";
 
 export interface MultiRepoCopilotAgenticProgress {
   step: CopilotMultiRepoAgenticStep;
@@ -24,7 +25,11 @@ export interface MultiRepoCopilotAgenticResult {
   finalDocumentPath: string;
   workspaceRoot: string;
   stepArtifacts: string[];
+  /** Total request attempts across the original run and all resumes. */
   requestCount: number;
+  /** Requests made by this invocation only. */
+  newRequestCount: number;
+  reusedStepCount: number;
   estimatedTotalTokens: number;
 }
 
@@ -48,30 +53,76 @@ const stepLabels: Record<CopilotMultiRepoAgenticStep, string> = {
   "final-cross-layer-synthesis": "Final UI-BFF-BE sentezi"
 };
 
+const statusPhaseByStep: Record<CopilotMultiRepoAgenticStep, string> = {
+  "cross-layer-plan": "copilot-cross-layer-plan",
+  "ui-analysis": "copilot-ui-analysis",
+  "bff-analysis": "copilot-bff-analysis",
+  "be-analysis": "copilot-be-analysis",
+  "traceability-analysis": "copilot-traceability-analysis",
+  "cross-layer-diagrams": "copilot-cross-layer-diagrams",
+  "final-cross-layer-synthesis": "copilot-final-cross-layer-synthesis"
+};
+
 export class MultiRepoCopilotAgenticDocumentationGenerator {
-  constructor(private readonly markdownWriter = new MarkdownWriter()) {}
+  constructor(
+    private readonly markdownWriter = new MarkdownWriter(),
+    private readonly copilotClient: ICopilotClient = new RealCopilotClient()
+  ) {}
 
   async generate(
     multiRepoRoot: string,
     manifest: MultiRepoManifest,
     token: vscode.CancellationToken,
-    onProgress?: (progress: MultiRepoCopilotAgenticProgress) => void
+    onProgress?: (progress: MultiRepoCopilotAgenticProgress) => void,
+    existingRunStatus?: MultiRepoAgenticRunStatusWriter
   ): Promise<MultiRepoCopilotAgenticResult> {
-    const runId = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-    const workspaceRoot = path.join(multiRepoRoot, "copilot-workspace", "agentic-ui-bff-be", runId);
-    await fs.mkdir(workspaceRoot, { recursive: true });
+    const runStatus = existingRunStatus ?? await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
+    const runId = runStatus.runId;
+    const workspaceRoot = runStatus.workspaceRoot;
 
     const previousOutputs: string[] = [];
     const stepArtifacts: string[] = [];
     let finalBody = "";
-    let estimatedTotalTokens = 0;
+    const priorUsage = summarizePriorCopilotUsage(runStatus.snapshot());
+    let estimatedTotalTokens = priorUsage.estimatedTotalTokens;
+    let requestCount = priorUsage.requestCount;
+    let newRequestCount = 0;
+    let reusedStepCount = 0;
 
+    try {
     for (let index = 0; index < steps.length; index += 1) {
       const step = steps[index];
+      const statusPhase = statusPhaseByStep[step];
       const stepIndex = index + 1;
       const stepLabel = stepLabels[step];
       if (token.isCancellationRequested) {
         throw new Error("Multi-repo Copilot agentic analysis was cancelled.");
+      }
+
+      if (runStatus.isPhaseReusable(statusPhase)) {
+        const validation = await runStatus.validatePhaseArtifacts(statusPhase);
+        if (!validation.valid || !validation.copilotOutputArtifact) {
+          throw new Error(`Reusable Copilot output is unavailable for multi-repo agentic step: ${step}.`);
+        }
+        const reusedOutput = await fs.readFile(validation.copilotOutputArtifact, "utf8");
+        if (!reusedOutput.trim()) {
+          throw new Error(`Reusable Copilot output is empty for multi-repo agentic step: ${step}.`);
+        }
+        stepArtifacts.push(validation.copilotOutputArtifact);
+        previousOutputs.push(`# ${step}\n\n${reusedOutput}`);
+        if (step === "final-cross-layer-synthesis") {
+          finalBody = reusedOutput;
+        }
+        reusedStepCount += 1;
+        onProgress?.({
+          step,
+          stepIndex,
+          totalSteps: steps.length,
+          stepLabel,
+          phase: "completed",
+          message: `Adim ${stepIndex}/${steps.length} - ${stepLabel}: onceki cikti yeniden kullanildi`
+        });
+        continue;
       }
 
       onProgress?.({
@@ -82,48 +133,205 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         phase: "started",
         message: `Adim ${stepIndex}/${steps.length} - ${stepLabel} baslatildi`
       });
+      await runStatus.startPhase(statusPhase);
+      const attempt = runStatus.currentAttempt(statusPhase);
+      const artifactStem = attempt > 1 ? `${step}-attempt-${attempt}` : step;
 
       const context = await this.buildContextForStep(multiRepoRoot, manifest, step, previousOutputs);
       const previousContext = this.previousArtifactsContext(previousOutputs);
       const promptRequest = buildCopilotMultiRepoAgenticPrompt(step, context.safeText, previousContext);
-      const promptPath = await this.writeArtifact(workspaceRoot, `${step}-prompt.md`, promptRequest.combinedText);
-      const contextPath = await this.writeArtifact(workspaceRoot, `${step}-context.md`, context.safeText);
+      const promptPath = await this.writeArtifact(workspaceRoot, `${artifactStem}-prompt.md`, promptRequest.combinedText);
+      const contextPath = await this.writeArtifact(workspaceRoot, `${artifactStem}-context.md`, context.safeText);
+      await runStatus.updatePhase(statusPhase, {
+        artifacts: [promptPath, contextPath],
+        details: {
+          requestStarted: true,
+          responseReceived: false,
+          charactersSent: context.safeText.length,
+          maskedSecrets: context.maskedSecrets,
+          includedIndexes: context.includedIndexes,
+          attempt
+        }
+      });
 
-      const response = await askCopilotWithUsage(promptRequest, token, (usage) => {
+      const requestStartedAt = Date.now();
+      let response: CopilotResponseWithUsage | undefined;
+      try {
+        requestCount += 1;
+        newRequestCount += 1;
+        response = await this.copilotClient.send(promptRequest, token, (usage) => {
+          onProgress?.({
+            step,
+            stepIndex,
+            totalSteps: steps.length,
+            stepLabel,
+            phase: "streaming",
+            message: `Adim ${stepIndex}/${steps.length} - ${stepLabel}: yaklasik ${usage.estimatedTotalTokens} token`,
+            usage
+          });
+        });
+        await runStatus.updatePhase(statusPhase, {
+          details: {
+            responseReceived: true,
+            outputCharacters: response.usage.outputCharacters,
+            estimatedInputTokens: response.usage.estimatedInputTokens,
+            estimatedOutputTokens: response.usage.estimatedOutputTokens,
+            estimatedTotalTokens: response.usage.estimatedTotalTokens,
+            modelCountedInputTokens: response.usage.modelCountedInputTokens,
+            selectedModelId: response.model.id,
+            selectedModelName: response.model.name,
+            selectedModelVendor: response.model.vendor,
+            selectedModelFamily: response.model.family,
+            selectedModelVersion: response.model.version,
+            selectedModelMaxInputTokens: response.model.maxInputTokens,
+            durationMs: Date.now() - requestStartedAt
+          }
+        });
+        if (!response.text.trim()) {
+          throw new Error(`Copilot returned an empty response for multi-repo agentic step: ${step}.`);
+        }
+
+        estimatedTotalTokens += response.usage.estimatedTotalTokens;
+        const outputPath = await this.writeArtifact(workspaceRoot, `${artifactStem}.md`, response.text);
+        await runStatus.updatePhase(statusPhase, { artifacts: [outputPath] });
+        stepArtifacts.push(outputPath);
+        previousOutputs.push(`# ${step}\n\n${response.text}`);
+        if (step === "final-cross-layer-synthesis") {
+          finalBody = response.text;
+        }
+
         onProgress?.({
           step,
           stepIndex,
           totalSteps: steps.length,
           stepLabel,
-          phase: "streaming",
-          message: `Adim ${stepIndex}/${steps.length} - ${stepLabel}: yaklasik ${usage.estimatedTotalTokens} token`,
-          usage
+          phase: "completed",
+          message: `Adim ${stepIndex}/${steps.length} - ${stepLabel} tamamlandi`,
+          usage: response.usage
         });
-      });
-      if (!response.text.trim()) {
-        throw new Error(`Copilot returned an empty response for multi-repo agentic step: ${step}.`);
+
+        await new CopilotAuditLogger().write(multiRepoRoot, {
+          timestamp: new Date().toISOString(),
+          runId,
+          attempt,
+          docType: `multi-repo-agentic-${step}`,
+          repositoryName: manifest.projectName,
+          branch: manifest.branch,
+          contextPackPath: path.relative(multiRepoRoot, contextPath),
+          promptPackPath: path.relative(multiRepoRoot, promptPath),
+          charactersSent: context.safeText.length,
+          includedIndexes: context.includedIndexes,
+          maskedSecrets: context.maskedSecrets,
+          promptProfile: "agentic-ui-bff-be-documentation",
+          estimatedInputTokens: response.usage.estimatedInputTokens,
+          estimatedOutputTokens: response.usage.estimatedOutputTokens,
+          estimatedTotalTokens: response.usage.estimatedTotalTokens,
+          modelCountedInputTokens: response.usage.modelCountedInputTokens,
+          outputCharacters: response.usage.outputCharacters,
+          durationMs: Date.now() - requestStartedAt,
+          copilotRequestStarted: true,
+          copilotResponseReceived: true,
+          selectedModelId: response.model.id,
+          selectedModelName: response.model.name,
+          selectedModelVendor: response.model.vendor,
+          selectedModelFamily: response.model.family,
+          selectedModelVersion: response.model.version,
+          selectedModelMaxInputTokens: response.model.maxInputTokens,
+          modelFamily: "copilot",
+          status: "success"
+        });
+        await runStatus.completePhase(statusPhase, {
+          artifacts: [promptPath, contextPath, outputPath],
+          details: { status: "success" }
+        });
+      } catch (error) {
+        await this.writeFailureAudit(multiRepoRoot, manifest, runId, attempt, step, context, contextPath, promptPath, response, requestStartedAt, token, error);
+        throw error;
       }
+    }
 
-      estimatedTotalTokens += response.usage.estimatedTotalTokens;
-      const outputPath = await this.writeArtifact(workspaceRoot, `${step}.md`, response.text);
-      stepArtifacts.push(outputPath);
-      previousOutputs.push(`# ${step}\n\n${response.text}`);
-      if (step === "final-cross-layer-synthesis") {
-        finalBody = response.text;
+    let finalDocumentPath: string;
+    if (runStatus.isPhaseReusable("final-document")) {
+      const validation = await runStatus.validatePhaseArtifacts("final-document");
+      if (!validation.valid || !validation.existingArtifacts[0]) {
+        throw new Error("Reusable final Agentic document is unavailable.");
       }
+      finalDocumentPath = validation.existingArtifacts[0];
+    } else {
+      await runStatus.startPhase("final-document");
+      finalDocumentPath = await this.markdownWriter.write(
+        multiRepoRoot,
+        `agentic-ui-bff-be-technical-analysis-${runId}.md`,
+        "Agentic UI-BFF-BE Technical Analysis",
+        manifest.projectName,
+        manifest.branch,
+        finalBody || previousOutputs.join("\n\n---\n\n"),
+        path.join("generated-docs", "agentic"),
+        "Bank Spring Docs AI via multi-step GitHub Copilot Language Model API"
+      );
+      await runStatus.updatePhase("final-document", { artifacts: [finalDocumentPath] });
+      await runStatus.completePhase("final-document", { artifacts: [finalDocumentPath] });
+    }
 
-      onProgress?.({
-        step,
-        stepIndex,
-        totalSteps: steps.length,
-        stepLabel,
-        phase: "completed",
-        message: `Adim ${stepIndex}/${steps.length} - ${stepLabel} tamamlandi`,
-        usage: response.usage
-      });
+    if (!runStatus.isPhaseReusable("run-summary")) {
+      await runStatus.startPhase("run-summary");
+      await this.writeRunSummary(
+        workspaceRoot,
+        manifest,
+        runId,
+        finalDocumentPath,
+        stepArtifacts,
+        estimatedTotalTokens,
+        requestCount,
+        newRequestCount,
+        reusedStepCount
+      );
+      const summaryArtifacts = [path.join(workspaceRoot, "run-summary.json"), path.join(workspaceRoot, "run-summary.md")];
+      await runStatus.completePhase("run-summary", { artifacts: summaryArtifacts });
+    }
+    const result = {
+      finalDocumentPath,
+      workspaceRoot,
+      stepArtifacts,
+      requestCount,
+      newRequestCount,
+      reusedStepCount,
+      estimatedTotalTokens
+    };
+    await runStatus.finishSuccess(result);
+    return result;
+    } catch (error) {
+      if (runStatus.snapshot().status === "running") {
+        try {
+          await runStatus.finishFailure(error, token.isCancellationRequested || /cancel/i.test(error instanceof Error ? error.message : String(error)));
+        } catch {
+          // Preserve the original pipeline failure if status persistence also fails.
+        }
+      }
+      throw error;
+    }
+  }
 
+  private async writeFailureAudit(
+    multiRepoRoot: string,
+    manifest: MultiRepoManifest,
+    runId: string,
+    attempt: number,
+    step: CopilotMultiRepoAgenticStep,
+    context: { safeText: string; includedIndexes: string[]; maskedSecrets: number },
+    contextPath: string,
+    promptPath: string,
+    response: CopilotResponseWithUsage | undefined,
+    requestStartedAt: number,
+    token: vscode.CancellationToken,
+    error: unknown
+  ): Promise<void> {
+    const message = maskSecretsWithStats(error instanceof Error ? error.message : String(error)).text.slice(0, 4000);
+    try {
       await new CopilotAuditLogger().write(multiRepoRoot, {
         timestamp: new Date().toISOString(),
+        runId,
+        attempt,
         docType: `multi-repo-agentic-${step}`,
         repositoryName: manifest.projectName,
         branch: manifest.branch,
@@ -133,43 +341,27 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         includedIndexes: context.includedIndexes,
         maskedSecrets: context.maskedSecrets,
         promptProfile: "agentic-ui-bff-be-documentation",
-        estimatedInputTokens: response.usage.estimatedInputTokens,
-        estimatedOutputTokens: response.usage.estimatedOutputTokens,
-        estimatedTotalTokens: response.usage.estimatedTotalTokens,
-        modelCountedInputTokens: response.usage.modelCountedInputTokens,
-        outputCharacters: response.usage.outputCharacters,
+        estimatedInputTokens: response?.usage.estimatedInputTokens,
+        estimatedOutputTokens: response?.usage.estimatedOutputTokens,
+        estimatedTotalTokens: response?.usage.estimatedTotalTokens,
+        modelCountedInputTokens: response?.usage.modelCountedInputTokens,
+        outputCharacters: response?.usage.outputCharacters ?? 0,
+        durationMs: Date.now() - requestStartedAt,
         copilotRequestStarted: true,
-        copilotResponseReceived: true,
-        selectedModelId: response.model.id,
-        selectedModelName: response.model.name,
-        selectedModelVendor: response.model.vendor,
-        selectedModelFamily: response.model.family,
-        selectedModelVersion: response.model.version,
-        selectedModelMaxInputTokens: response.model.maxInputTokens,
+        copilotResponseReceived: Boolean(response),
+        selectedModelId: response?.model.id,
+        selectedModelName: response?.model.name,
+        selectedModelVendor: response?.model.vendor,
+        selectedModelFamily: response?.model.family,
+        selectedModelVersion: response?.model.version,
+        selectedModelMaxInputTokens: response?.model.maxInputTokens,
         modelFamily: "copilot",
-        status: "success"
+        status: token.isCancellationRequested || /cancel/i.test(message) ? "cancelled" : "failed",
+        error: message
       });
+    } catch {
+      // Failure auditing is best-effort and must not hide the original Copilot error.
     }
-
-    const finalDocumentPath = await this.markdownWriter.write(
-      multiRepoRoot,
-      `agentic-ui-bff-be-technical-analysis-${runId}.md`,
-      "Agentic UI-BFF-BE Technical Analysis",
-      manifest.projectName,
-      manifest.branch,
-      finalBody || previousOutputs.join("\n\n---\n\n"),
-      path.join("generated-docs", "agentic"),
-      "Bank Spring Docs AI via multi-step GitHub Copilot Language Model API"
-    );
-
-    await this.writeRunSummary(workspaceRoot, manifest, runId, finalDocumentPath, stepArtifacts, estimatedTotalTokens);
-    return {
-      finalDocumentPath,
-      workspaceRoot,
-      stepArtifacts,
-      requestCount: steps.length,
-      estimatedTotalTokens
-    };
   }
 
   private async buildContextForStep(
@@ -388,7 +580,10 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
     runId: string,
     finalDocumentPath: string,
     stepArtifacts: string[],
-    estimatedTotalTokens: number
+    estimatedTotalTokens: number,
+    requestCount: number,
+    newRequestCount: number,
+    reusedStepCount: number
   ): Promise<void> {
     await fs.writeFile(path.join(workspaceRoot, "run-summary.json"), `${JSON.stringify({
       projectName: manifest.projectName,
@@ -396,7 +591,11 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
       runId,
       finalDocumentPath,
       stepArtifacts,
-      estimatedTotalTokens
+      estimatedTotalTokens,
+      requestCount,
+      newRequestCount,
+      reusedStepCount,
+      runStatusPath: path.join(workspaceRoot, "run-status.json")
     }, null, 2)}\n`, "utf8");
     await fs.writeFile(path.join(workspaceRoot, "run-summary.md"), [
       "# Multi-Repo Copilot Agentic Run Summary",
@@ -405,7 +604,11 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
       `Branch: ${manifest.branch}`,
       `Run: ${runId}`,
       `Estimated tokens: ${estimatedTotalTokens}`,
+      `Request attempts: ${requestCount}`,
+      `New requests in this invocation: ${newRequestCount}`,
+      `Reused Copilot steps: ${reusedStepCount}`,
       `Final document: ${finalDocumentPath}`,
+      `Run status: ${path.join(workspaceRoot, "run-status.json")}`,
       "",
       "## Step Artifacts",
       ...stepArtifacts.map((artifact) => `- ${artifact}`),
@@ -426,4 +629,26 @@ function applyBudget(value: string, maxCharacters: number): string {
     return value;
   }
   return `${value.slice(0, maxCharacters)}\n[CONTEXT_PACK_TRUNCATED_FOR_COPILOT_TOKEN_LIMIT]`;
+}
+
+function summarizePriorCopilotUsage(status: MultiRepoAgenticRunStatus): { requestCount: number; estimatedTotalTokens: number } {
+  let requestCount = 0;
+  let estimatedTotalTokens = 0;
+  const addDetails = (details: Record<string, unknown> | undefined): void => {
+    if (!details || details.requestStarted !== true) {
+      return;
+    }
+    requestCount += 1;
+    const tokens = details.estimatedTotalTokens;
+    if (typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0) {
+      estimatedTotalTokens += tokens;
+    }
+  };
+  for (const phase of status.phases.filter((item) => item.category === "copilot")) {
+    for (const attempt of phase.history ?? []) {
+      addDetails(attempt.details);
+    }
+    addDetails(phase.details);
+  }
+  return { requestCount, estimatedTotalTokens };
 }

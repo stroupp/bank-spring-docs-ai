@@ -1,0 +1,13 @@
+{
+  "normalizedPaths": ["/customers/{param}", "/api/customers/search"],
+  "uiToBff": [
+    { "uiApiCall": "GET /api/customers/search", "confidence": "high" },
+    { "uiApiCall": "GET /api/customers/{param}", "confidence": "low" },
+    { "uiApiCall": "POST /api/missing", "confidence": "unmatched" }
+  ],
+  "bffToBe": [
+    { "bffOutboundCall": "GET /customers/search", "confidence": "high" },
+    { "bffOutboundCall": "DELETE /customers/{param}", "confidence": "unmatched" }
+  ],
+  "unresolvedCount": 3
+}

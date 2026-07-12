@@ -2,7 +2,14 @@ export function normalizeHttpPath(value: string | undefined): string {
   if (!value) {
     return "/";
   }
-  let path = value.trim().split("?")[0];
+  let path = value.trim().split(/[?#]/)[0];
+  if (/^https?:\/\//i.test(path)) {
+    try {
+      path = new URL(path).pathname;
+    } catch {
+      // Keep the original text and continue with conservative normalization.
+    }
+  }
   if (!path.startsWith("/")) {
     path = `/${path}`;
   }
@@ -16,7 +23,7 @@ export function normalizeHttpPath(value: string | undefined): string {
 }
 
 export function withoutCommonApiPrefix(value: string): string {
-  return normalizeHttpPath(value).replace(/^\/api(?=\/)/, "");
+  return normalizeHttpPath(value).replace(/^\/api(?=\/)/i, "");
 }
 
 export function pathSuffixMatches(left: string, right: string): boolean {

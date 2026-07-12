@@ -16,6 +16,7 @@ export interface PageSectionRepairResult {
 
 export class PageSectionRegenerator {
   async repair(multiRepoRoot: string, pageRoot: string, token: vscode.CancellationToken): Promise<PageSectionRepairResult> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const gaps = JSON.parse(await fs.readFile(path.join(pageRoot, "detected-gaps.json"), "utf8")) as PageDocGap[];
     const plan = buildPageGapRepairPlan(gaps);
     const safe = maskSecretsWithStats(await buildRepairContext(pageRoot, plan));

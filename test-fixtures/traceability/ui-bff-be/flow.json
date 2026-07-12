@@ -1,0 +1,20 @@
+{
+  "uiApiCalls": [
+    { "clientFunction": "searchCustomers", "httpMethod": "GET", "path": "api/customers/search", "file": "src/api/customerApi.ts", "usedBy": ["CustomerSearchPage"] },
+    { "clientFunction": "getCustomer", "httpMethod": "GET", "path": "/api/customers/:id", "file": "src/api/customerApi.ts" },
+    { "clientFunction": "missing", "httpMethod": "POST", "path": "/api/missing", "file": "src/api/customerApi.ts" }
+  ],
+  "bffEndpoints": [
+    { "httpMethod": "GET", "path": "/api/customers/search", "className": "CustomerBffController", "handlerMethod": "search", "file": "CustomerBffController.java" },
+    { "httpMethod": "GET", "path": "/api/customers/{customerId}", "className": "CustomerBffController", "handlerMethod": "get", "file": "CustomerBffController.java" },
+    { "httpMethod": "GET", "path": "/api/customers/{legacyId}", "className": "LegacyCustomerBffController", "handlerMethod": "get", "file": "LegacyCustomerBffController.java" }
+  ],
+  "outboundCalls": [
+    { "client": "CustomerClient", "method": "search", "httpMethod": "GET", "targetPath": "/customers/search", "sourceEndpoint": "GET /api/customers/search", "file": "CustomerClient.java" },
+    { "client": "CustomerClient", "method": "missing", "httpMethod": "DELETE", "targetPath": "/customers/{customerId}", "file": "CustomerClient.java" }
+  ],
+  "beEndpoints": [
+    { "httpMethod": "GET", "path": "/api/customers/search", "className": "CustomerController", "handlerMethod": "search", "file": "CustomerController.java" },
+    { "httpMethod": "GET", "path": "/customers/search", "className": "InternalCustomerController", "handlerMethod": "search", "file": "InternalCustomerController.java" }
+  ]
+}

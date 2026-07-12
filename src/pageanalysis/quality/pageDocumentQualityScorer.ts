@@ -1,9 +1,23 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { readJsonl, writeJsonl } from "../../storage/jsonlWriter";
+import { buildPageArtifactMetadata, PageArtifactMetadata } from "../pageArtifactMetadata";
+import { ArtifactFreshnessService } from "../artifactFreshnessService";
 import { PageOutputFreshnessService } from "../pageOutputFreshnessService";
 
+export interface PageQualityMetricExplanation {
+  metric: string;
+  status: "measured" | "unknown";
+  value: number | null;
+  weight: number;
+  reason: string;
+}
+
 export interface PageDocumentQualityScore {
+  generatedAt: string;
+  pipelineVersion: string;
+  inputHash: string;
+  sourceArtifactModifiedTimes: Record<string, string>;
   page: string;
   route?: string;
   score: number;
@@ -13,18 +27,19 @@ export interface PageDocumentQualityScore {
   sourceReferenceCount: number;
   unresolvedGapCount: number;
   highSeverityGapCount: number;
-  uiApiCallCoverage: number;
-  bffMatchCoverage: number;
-  beMatchCoverage: number;
-  parameterCoverage: number;
-  validationCoverage: number;
-  serviceFlowCoverage: number;
-  repositoryEntityCoverage: number;
-  qwenSemanticCoverage: number;
+  uiApiCallCoverage: number | null;
+  bffMatchCoverage: number | null;
+  beMatchCoverage: number | null;
+  parameterCoverage: number | null;
+  validationCoverage: number | null;
+  serviceFlowCoverage: number | null;
+  repositoryEntityCoverage: number | null;
+  qwenSemanticCoverage: number | null;
   evidencePackAvailable: boolean;
   contextPackAvailable: boolean;
   finalDocumentLength: number;
   metricsWithUnknownData: string[];
+  metricExplanations: PageQualityMetricExplanation[];
   outputFreshnessIssues: number;
 }
 
@@ -50,6 +65,7 @@ const requiredSections = [
 
 export class PageDocumentQualityScorer {
   async score(multiRepoRoot: string, pageRoot: string): Promise<PageDocumentQualityScore> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const pageFlowPath = path.join(pageRoot, "page-flow.json");
     const gapsPath = path.join(pageRoot, "detected-gaps.json");
     const finalDocPath = path.join(pageRoot, "final-page-technical-analysis.md");
@@ -88,55 +104,153 @@ export class PageDocumentQualityScorer {
       outputChecks.push({ target: "qwen-interaction-semantics.jsonl", dependencies: ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"] });
     }
     const outputFreshness = await new PageOutputFreshnessService().checkMany(pageRoot, outputChecks);
-    const outputFreshnessIssueCount = outputFreshness.issues.length;
+    const artifactFreshness = await new ArtifactFreshnessService().check(pageRoot);
+    const outputFreshnessIssueCount = outputFreshness.issues.length + artifactFreshness.warnings.length;
     const gaps = await readJsonArray(gapsPath);
     const headings = extractNormalizedHeadings(finalDoc);
     const requiredSectionsPresent = requiredSections.filter((section) => headings.has(normalizeHeading(section))).length;
     const sourceReferenceCount = (finalDoc.match(/src[\\/][^\s)`]+?\.(?:java|ts|tsx|js|jsx|properties|ya?ml|json)/g) ?? []).length;
     const highSeverityGapCount = gaps.filter((gap) => gap.severity === "high").length;
     const qwenFreshnessIssues = outputFreshness.issues.filter((issue) => issue.target.startsWith("qwen-")).length;
-    const qwenSemanticCoverage = qwenPageAvailable ? (qwenFreshnessIssues ? 0.5 : 1) : 0;
+    const qwenSemanticCoverage = qwenPageAvailable ? (qwenFreshnessIssues ? 0.5 : 1) : null;
     const finalDocumentLength = finalDoc.length;
-    const metricsWithUnknownData = [
+    const metricsWithUnknownData = new Set<string>([
       ...(!pageFlowAvailable ? ["page-flow"] : []),
       ...(!contextPackAvailable ? ["context-pack"] : []),
       ...(!evidencePackAvailable ? ["evidence-pack"] : []),
       ...(!gapsAvailable ? ["gap-report"] : []),
       ...(!finalDoc ? ["final-or-draft-document"] : []),
       ...(outputFreshnessIssueCount ? ["stale-output"] : [])
-    ];
+    ]);
 
-    const uiApiCallCount = (pageFlow.uiApiCalls as unknown[] | undefined)?.length ?? 0;
-    const uiApiCallCoverage = ratio(uiApiCallCount, uiApiCallCount);
-    const bffMatchCoverage = ratio(nonEmptyCount(pageFlow.uiToBffMatches, "bffEndpoint"), uiApiCallCount);
-    const beMatchCoverage = ratio(nonEmptyCount(pageFlow.bffToBeMatches, "beEndpoint"), Math.max(1, nonEmptyCount(pageFlow.uiToBffMatches, "bffEndpoint")));
+    const uiApiCalls = asRecords(pageFlow.uiApiCalls);
+    const uiApiCallCount = uiApiCalls.length;
+    const matchedBffCount = nonEmptyCount(pageFlow.uiToBffMatches, "bffEndpoint");
+    const matchedBeCount = nonEmptyCount(pageFlow.bffToBeMatches, "beEndpoint");
+    const uiApiCallCoverage = uiApiCallCount > 0 ? recordMentionCoverage(finalDoc, uiApiCalls, ["clientFunction", "path", "httpMethod"]) : null;
+    const bffMatchCoverage = uiApiCallCount > 0 ? ratio(matchedBffCount, uiApiCallCount) : null;
+    const beMatchCoverage = matchedBffCount > 0 ? ratio(matchedBeCount, matchedBffCount) : null;
     const beServiceFlows = asRecords(pageFlow.beServiceFlows);
     const trustedBeServiceFlowCount = beServiceFlows.filter((flow) => String(flow.confidence ?? "") !== "low").length;
-    const serviceFlowCoverage = ratio(trustedBeServiceFlowCount, Math.max(1, nonEmptyCount(pageFlow.bffToBeMatches, "beEndpoint")));
-    const repositoryEntityCoverage = ratio(((pageFlow.repositories as unknown[] | undefined)?.length ?? 0) + ((pageFlow.entities as unknown[] | undefined)?.length ?? 0), 2);
-    const parameterCoverage = /parametre|parameter|form alan/i.test(finalDoc) ? 0.8 : 0;
-    const validationCoverage = /validasyon|validation|@Valid|hata/i.test(finalDoc) ? 0.7 : 0;
+    const serviceFlowCoverage = matchedBeCount > 0 ? ratio(trustedBeServiceFlowCount, matchedBeCount) : null;
+    const repositoryEntityRecords = [...asRecords(pageFlow.repositories), ...asRecords(pageFlow.entities)];
+    const repositoryEntityCoverage = trustedBeServiceFlowCount > 0
+      ? (repositoryEntityRecords.length ? recordMentionCoverage(finalDoc, repositoryEntityRecords, ["repository", "method", "entity", "table"]) : 0)
+      : null;
+    const parameterRecords = collectParameterRecords(pageFlow);
+    const parameterCoverage = parameterRecords.length ? recordMentionCoverage(finalDoc, parameterRecords, ["name", "field", "fieldOrParameter"]) : null;
+    const validationRecords = asRecords(pageFlow.beValidations);
+    const validationCoverage = validationRecords.length ? recordMentionCoverage(finalDoc, validationRecords, ["annotation", "fieldOrParameter", "className"]) : null;
+
+    const coverageMetrics: Array<{ name: string; value: number | null; weight: number; reason: string }> = [
+      { name: "ui-api-call-coverage", value: uiApiCallCoverage, weight: 6, reason: uiApiCallCount ? `${uiApiCallCount} indexed UI API calls were checked against document text.` : "No selected-page UI API calls are available." },
+      { name: "bff-match-coverage", value: bffMatchCoverage, weight: 7, reason: uiApiCallCount ? `${matchedBffCount}/${uiApiCallCount} UI calls have a BFF endpoint.` : "BFF coverage has no UI API-call denominator." },
+      { name: "be-match-coverage", value: beMatchCoverage, weight: 7, reason: matchedBffCount ? `${matchedBeCount}/${matchedBffCount} BFF matches have a BE endpoint.` : "BE coverage has no matched BFF denominator." },
+      { name: "parameter-coverage", value: parameterCoverage, weight: 5, reason: parameterRecords.length ? `${parameterRecords.length} extracted form/endpoint parameter records were checked against document text.` : "No selected-page parameter evidence is available." },
+      { name: "validation-coverage", value: validationCoverage, weight: 5, reason: validationRecords.length ? `${validationRecords.length} extracted validation records were checked against document text.` : "No selected-page validation evidence is available." },
+      { name: "service-flow-coverage", value: serviceFlowCoverage, weight: 4, reason: matchedBeCount ? `${trustedBeServiceFlowCount}/${matchedBeCount} BE matches have non-low-confidence service flows.` : "Service-flow coverage has no matched BE denominator." },
+      { name: "repository-entity-coverage", value: repositoryEntityCoverage, weight: 4, reason: trustedBeServiceFlowCount ? `${repositoryEntityRecords.length} trusted repository/entity records were checked against document text.` : "No trusted BE service flow is available." },
+      { name: "qwen-semantic-coverage", value: qwenSemanticCoverage, weight: 2, reason: qwenPageAvailable ? (qwenFreshnessIssues ? "Qwen semantics exist but are stale." : "Fresh Qwen page semantics are available.") : "Qwen semantics are optional and unavailable." }
+    ];
+    for (const metric of coverageMetrics) {
+      if (metric.value === null) {
+        metricsWithUnknownData.add(metric.name);
+      }
+    }
+
+    const metricExplanations: PageQualityMetricExplanation[] = [
+      {
+        metric: "required-sections",
+        status: finalDoc ? "measured" : "unknown",
+        value: finalDoc ? requiredSectionsPresent / requiredSections.length : null,
+        weight: 20,
+        reason: `${requiredSectionsPresent}/${requiredSections.length} required sections are present.`
+      },
+      {
+        metric: "source-references",
+        status: finalDoc ? "measured" : "unknown",
+        value: finalDoc ? Math.min(sourceReferenceCount / 10, 1) : null,
+        weight: 12,
+        reason: `${sourceReferenceCount} source-path references were found.`
+      },
+      {
+        metric: "gap-count",
+        status: gapsAvailable ? "measured" : "unknown",
+        value: gapsAvailable ? 1 - Math.min(gaps.length / 10, 1) : null,
+        weight: 12,
+        reason: gapsAvailable ? `${gaps.length} unresolved gaps remain.` : "The gap report is unavailable."
+      },
+      {
+        metric: "high-severity-gaps",
+        status: gapsAvailable ? "measured" : "unknown",
+        value: gapsAvailable ? 1 - Math.min(highSeverityGapCount / 3, 1) : null,
+        weight: 8,
+        reason: gapsAvailable ? `${highSeverityGapCount} high-severity gaps remain.` : "The gap report is unavailable."
+      },
+      ...coverageMetrics.map((metric) => ({
+      metric: metric.name,
+      status: metric.value === null ? "unknown" : "measured",
+      value: metric.value,
+      weight: metric.weight,
+      reason: metric.reason
+      } as PageQualityMetricExplanation)),
+      {
+        metric: "artifact-availability",
+        status: "measured",
+        value: (Number(contextPackAvailable) + Number(evidencePackAvailable)) / 2,
+        weight: 3,
+        reason: `Context pack: ${contextPackAvailable ? "available" : "missing"}; evidence pack: ${evidencePackAvailable ? "available" : "missing"}.`
+      },
+      {
+        metric: "document-length",
+        status: finalDoc ? "measured" : "unknown",
+        value: finalDoc ? documentLengthScore(finalDocumentLength) : null,
+        weight: 5,
+        reason: `The scored document contains ${finalDocumentLength} characters.`
+      },
+      {
+        metric: "artifact-freshness",
+        status: "measured",
+        value: Math.max(0, 1 - Math.min(outputFreshnessIssueCount / 5, 1)),
+        weight: 0,
+        reason: `${outputFreshnessIssueCount} output freshness issues apply as a deduction.`
+      }
+    ];
 
     const score = Math.max(0, Math.min(100, Math.round(
-      (requiredSectionsPresent / requiredSections.length) * 25 +
-      Math.min(sourceReferenceCount / 10, 1) * 15 +
-      (1 - Math.min(gaps.length / 10, 1)) * 15 +
-      (1 - Math.min(highSeverityGapCount / 3, 1)) * 10 +
-      bffMatchCoverage * 8 +
-      beMatchCoverage * 8 +
-      parameterCoverage * 5 +
-      validationCoverage * 5 +
-      serviceFlowCoverage * 4 +
-      repositoryEntityCoverage * 3 +
-      qwenSemanticCoverage * 1 +
-      (evidencePackAvailable ? 1 : 0) +
+      (requiredSectionsPresent / requiredSections.length) * 20 +
+      Math.min(sourceReferenceCount / 10, 1) * 12 +
+      (gapsAvailable ? (1 - Math.min(gaps.length / 10, 1)) * 12 : 0) +
+      (gapsAvailable ? (1 - Math.min(highSeverityGapCount / 3, 1)) * 8 : 0) +
+      (uiApiCallCoverage ?? 0) * 6 +
+      (bffMatchCoverage ?? 0) * 7 +
+      (beMatchCoverage ?? 0) * 7 +
+      (parameterCoverage ?? 0) * 5 +
+      (validationCoverage ?? 0) * 5 +
+      (serviceFlowCoverage ?? 0) * 4 +
+      (repositoryEntityCoverage ?? 0) * 4 +
+      (qwenSemanticCoverage ?? 0) * 2 +
+      (evidencePackAvailable ? 2 : 0) +
       (contextPackAvailable ? 1 : 0) +
-      documentLengthScore(finalDocumentLength) * 2 -
-      Math.min(metricsWithUnknownData.length * 4, 12) -
+      documentLengthScore(finalDocumentLength) * 5 -
+      Math.min(metricsWithUnknownData.size * 2, 12) -
       Math.min(outputFreshnessIssueCount * 2, 10)
     )));
 
+    const metadata: PageArtifactMetadata = await buildPageArtifactMetadata(pageRoot, [
+      "page-flow.json",
+      "page-context-pack.md",
+      "page-evidence-pack.md",
+      "copilot-draft.md",
+      "detected-gaps.json",
+      "repaired-sections.md",
+      "final-page-technical-analysis.md"
+    ]);
     const result: PageDocumentQualityScore = {
+      generatedAt: metadata.generatedAt,
+      pipelineVersion: metadata.pipelineVersion,
+      inputHash: metadata.inputHash,
+      sourceArtifactModifiedTimes: metadata.sourceArtifactModifiedTimes,
       page: String(selectedPage?.pageName ?? path.basename(pageRoot)),
       route: selectedPage?.route ? String(selectedPage.route) : undefined,
       score,
@@ -157,7 +271,8 @@ export class PageDocumentQualityScorer {
       evidencePackAvailable,
       contextPackAvailable,
       finalDocumentLength,
-      metricsWithUnknownData,
+      metricsWithUnknownData: [...metricsWithUnknownData],
+      metricExplanations,
       outputFreshnessIssues: outputFreshnessIssueCount
     };
     await fs.writeFile(path.join(pageRoot, "quality-score.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
@@ -172,9 +287,30 @@ async function appendQuality(multiRepoRoot: string, score: PageDocumentQualitySc
   await writeJsonl(target, [...existing.filter((item) => item.page !== score.page || item.route !== score.route), score]);
 }
 
+function collectParameterRecords(pageFlow: Record<string, unknown>): Array<Record<string, unknown>> {
+  const endpointParameters = [...asRecords(pageFlow.bffEndpoints), ...asRecords(pageFlow.beEndpoints)]
+    .flatMap((endpoint) => asRecords(endpoint.parameters));
+  return [...asRecords(pageFlow.formFields), ...endpointParameters];
+}
+
+function recordMentionCoverage(markdown: string, records: Array<Record<string, unknown>>, keys: string[]): number {
+  if (!records.length) {
+    return 0;
+  }
+  const normalizedDocument = markdown.toLowerCase();
+  const mentioned = records.filter((record) => keys.some((key) => {
+    const value = String(record[key] ?? "").trim().toLowerCase();
+    if (value.length < 2) {
+      return false;
+    }
+    return normalizedDocument.includes(value);
+  })).length;
+  return ratio(mentioned, records.length);
+}
+
 function ratio(value: number, total: number): number {
   if (total <= 0) {
-    return 1;
+    return 0;
   }
   return Math.max(0, Math.min(1, value / total));
 }

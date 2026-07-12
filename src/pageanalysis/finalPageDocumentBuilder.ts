@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
 
 export interface FinalPageDocumentResult {
   finalDocumentPath: string;
@@ -7,21 +8,41 @@ export interface FinalPageDocumentResult {
 
 export class FinalPageDocumentBuilder {
   async build(pageRoot: string): Promise<FinalPageDocumentResult> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const pageFlow = await readJson(path.join(pageRoot, "page-flow.json"));
     const selectedPage = pageFlow.selectedPage as Record<string, unknown> | undefined;
     const draftStale = await staleDependenciesFor(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"]);
     const repairStale = await staleDependenciesFor(pageRoot, "repaired-sections.md", ["detected-gaps.json", "page-context-pack.md", "page-evidence-pack.md", "copilot-draft.md"]);
     const draft = draftStale.length ? "" : await readOptional(path.join(pageRoot, "copilot-draft.md"));
     const repaired = repairStale.length ? "" : await readOptional(path.join(pageRoot, "repaired-sections.md"));
+    if (!draft.trim()) {
+      const reason = draftStale.length
+        ? `Copilot taslagi su girdilerden eski: ${draftStale.join(", ")}.`
+        : "Copilot taslagi bulunamadi veya bos.";
+      throw new Error(`Final sayfa dokumani olusturulamadi. ${reason}`);
+    }
     const mergedBody = mergeRepairedSections(draft, repaired);
     const qwenAvailable = Boolean(await readOptional(path.join(pageRoot, "qwen-page-semantics.json")));
     const finalDocumentPath = path.join(pageRoot, "final-page-technical-analysis.md");
+    const metadata = await buildPageArtifactMetadata(pageRoot, [
+      "page-context-pack.md",
+      "page-evidence-pack.md",
+      "copilot-draft.md",
+      "detected-gaps.json",
+      "repaired-sections.md"
+    ]);
     const content = [
       "# Final Sayfa Teknik Analiz Dokumani",
       "",
+      pageMetadataComment(metadata),
+      "",
+      `Proje: ${metadata.projectName}`,
+      `Branch: ${metadata.branch}`,
       `Sayfa: ${selectedPage?.pageName ?? path.basename(pageRoot)}`,
       `Route: ${selectedPage?.route ?? "Not visible from provided context."}`,
-      `Olusturulma zamani: ${new Date().toISOString()}`,
+      `Olusturulma zamani: ${metadata.generatedAt}`,
+      `Pipeline version: ${metadata.pipelineVersion}`,
+      `Input hash: ${metadata.inputHash}`,
       `Qwen semantik mevcut: ${qwenAvailable ? "evet" : "hayir"}`,
       draftStale.length ? `Copilot draft atlandi: ${draftStale.join(", ")} dosyalarindan eski.` : "",
       repairStale.length ? `Repaired sections atlandi: ${repairStale.join(", ")} dosyalarindan eski.` : "",
@@ -56,7 +77,9 @@ function mergeRepairedSections(draft: string, repaired: string): string {
     }
     const draftSection = findSection(merged, section.normalizedHeading);
     if (draftSection) {
-      merged = `${merged.slice(0, draftSection.start)}${section.text.trim()}\n\n${merged.slice(draftSection.end).trimStart()}`;
+      const previousText = merged.slice(draftSection.start, draftSection.end);
+      const replacement = preserveSourceReferences(section.text.trim(), previousText);
+      merged = `${merged.slice(0, draftSection.start)}${replacement}\n\n${merged.slice(draftSection.end).trimStart()}`;
       replaced.add(section.normalizedHeading);
     } else {
       unmatched.push(section.text.trim());
@@ -67,6 +90,25 @@ function mergeRepairedSections(draft: string, repaired: string): string {
     merged = `${merged.trimEnd()}\n\n---\n\n## Ek Onarim Notlari\n\n${unmatched.join("\n\n")}\n`;
   }
   return merged;
+}
+
+function preserveSourceReferences(replacement: string, previousText: string): string {
+  const previousReferences = sourceReferences(previousText);
+  const replacementReferences = new Set(sourceReferences(replacement));
+  const missing = previousReferences.filter((reference) => !replacementReferences.has(reference));
+  if (!missing.length) {
+    return replacement;
+  }
+  return [
+    replacement,
+    "",
+    "Kaynak referanslari (onceki taslaktan korundu):",
+    ...missing.map((reference) => `- ${reference}`)
+  ].join("\n");
+}
+
+function sourceReferences(markdown: string): string[] {
+  return [...new Set(markdown.match(/src[\\/][^\s)`]+?\.(?:java|ts|tsx|js|jsx|properties|ya?ml|json)/g) ?? [])];
 }
 
 function splitSections(markdown: string): Array<{ normalizedHeading: string; text: string }> {

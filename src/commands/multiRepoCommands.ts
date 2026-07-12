@@ -1,8 +1,10 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { getDefaultBranch } from "../git/branchResolver";
+import { maskSecretsWithStats } from "../ai/safeContextFilter";
 import { LocalKnowledgeGraphBuilder } from "../graph/localKnowledgeGraphBuilder";
 import { MultiRepoCopilotAgenticDocumentationGenerator } from "../docs/multiRepoCopilotAgenticDocumentationGenerator";
+import { MultiRepoAgenticRunStatusWriter } from "../docs/multiRepoAgenticRunStatus";
 import { MultiRepoGitService } from "../multirepo/multiRepoGitService";
 import { MultiRepoInput, MultiRepoManifest, MultiRepoManifestService } from "../multirepo/multiRepoManifestService";
 import { MultiRepoQualityReportGenerator } from "../multirepo/multiRepoQualityReportGenerator";
@@ -10,6 +12,7 @@ import { MultiRepoReactAnalysisService } from "../multirepo/multiRepoReactAnalys
 import { MultiRepoSpringAnalysisService } from "../multirepo/multiRepoSpringAnalysisService";
 import { MultiRepoTraceabilityService } from "../multirepo/multiRepoTraceabilityService";
 import { PageSemanticAnalyzer } from "../semantic/multirepo/pageSemanticAnalyzer";
+import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
 
 export async function openUiBffBeAnalysisPanelCommand(): Promise<void> {
   await vscode.commands.executeCommand("workbench.view.extension.bankSpringDocs");
@@ -26,6 +29,7 @@ export async function saveMultiRepoManifestCommand(
 
   const service = new MultiRepoManifestService(context);
   const manifest = await service.saveManifest(manifestInput);
+  await new SelectedPageStateService(context).clearSelectedPage();
   vscode.window.showInformationMessage("Bank Spring Docs: Coklu repo manifesti kaydedildi.");
   return manifest;
 }
@@ -301,84 +305,244 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
     return undefined;
   }
 
-  const result = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: UI-BFF-BE Agentic Copilot calisiyor",
-      cancellable: true
-    },
-    async (progress, token) => {
-      const multiRepoRoot = manifestService.getMultiRepoRoot();
-      progress.report({ message: "React UI indeksleri hazirlaniyor..." });
-      await new MultiRepoReactAnalysisService().analyze({
-        repoUrl: manifest.repos.ui.url,
-        repoRoot: manifest.repos.ui.localPath,
-        outputRoot: path.join(multiRepoRoot, "ui"),
-        branch: manifest.branch
-      });
-
-      const springAnalyzer = new MultiRepoSpringAnalysisService();
-      progress.report({ message: "BFF Spring indeksleri hazirlaniyor..." });
-      await springAnalyzer.analyze({
-        repoUrl: manifest.repos.bff.url,
-        repoRoot: manifest.repos.bff.localPath,
-        outputRoot: path.join(multiRepoRoot, "bff"),
-        branch: manifest.branch,
-        role: "bff"
-      });
-
-      progress.report({ message: "BE Spring indeksleri hazirlaniyor..." });
-      await springAnalyzer.analyze({
-        repoUrl: manifest.repos.be.url,
-        repoRoot: manifest.repos.be.localPath,
-        outputRoot: path.join(multiRepoRoot, "be"),
-        branch: manifest.branch,
-        role: "be"
-      });
-
-      progress.report({ message: "Traceability hazirlaniyor..." });
-      await new MultiRepoTraceabilityService().build(multiRepoRoot, manifest);
-
-      const shouldRunQwen = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("multiRepo.agenticRunQwenSemantics", true);
-      const qwenEnabled = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false);
-      if (shouldRunQwen && qwenEnabled) {
-        progress.report({ message: "Qwen sayfa semantigi agentic pipeline icin hazirlaniyor..." });
-        await new PageSemanticAnalyzer().analyze(multiRepoRoot, context, manifest, token);
-      } else if (shouldRunQwen && !qwenEnabled) {
-        progress.report({ message: "Qwen semantigi acik degil, agentic pipeline Qwen adimini atladi." });
-      }
-
-      progress.report({ message: "Knowledge graph ve kalite raporu hazirlaniyor..." });
-      await new LocalKnowledgeGraphBuilder().build(multiRepoRoot, manifest);
-      await new MultiRepoQualityReportGenerator().generate(multiRepoRoot, manifest);
-
-      manifest.repos.ui.status = "analyzed";
-      manifest.repos.bff.status = "analyzed";
-      manifest.repos.be.status = "analyzed";
-      manifest.repos.ui.error = undefined;
-      manifest.repos.bff.error = undefined;
-      manifest.repos.be.error = undefined;
-      await manifestService.updateManifest(manifest);
-
-      return new MultiRepoCopilotAgenticDocumentationGenerator().generate(
-        multiRepoRoot,
-        manifest,
-        token,
-        (event) => progress.report({
-          message: event.message,
-          increment: event.phase === "started" ? 100 / 7 : 0
-        })
+  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  let runStatus: MultiRepoAgenticRunStatusWriter;
+  try {
+    const resumable = await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest);
+    if (resumable) {
+      const previous = resumable.snapshot();
+      const completedCopilotSteps = previous.phases.filter((phase) => phase.category === "copilot" && phase.status === "completed").length;
+      const action = await vscode.window.showWarningMessage(
+        `Bank Spring Docs: Önceki Agentic çalışma '${previous.currentPhase ?? "bilinmeyen aşama"}' aşamasında durdu. ${completedCopilotSteps} Copilot adımı yeniden kullanılabilir.`,
+        { modal: true },
+        "Kaldığı Yerden Devam Et",
+        "Yeni Analiz Başlat",
+        "İptal"
       );
+      if (action === "Kaldığı Yerden Devam Et") {
+        runStatus = resumable;
+        await runStatus.prepareResume();
+      } else if (action === "Yeni Analiz Başlat") {
+        runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
+      } else {
+        return manifest;
+      }
+    } else {
+      runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
     }
-  );
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: Agentic çalışma durumu oluşturulamadı: ${errorText(error)}`);
+    return manifest;
+  }
+
+  let cancelled = false;
+  let result;
+  try {
+    result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Bank Spring Docs: UI-BFF-BE Agentic Copilot çalışıyor",
+        cancellable: true
+      },
+      async (progress, token) => {
+        const ensureNotCancelled = (): void => {
+          if (token.isCancellationRequested) {
+            throw new Error("Agentic analysis was cancelled by the user.");
+          }
+          };
+        try {
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("local-ui-analysis")) {
+            progress.report({ message: "React UI analizi önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("local-ui-analysis");
+            progress.report({ message: "React UI indeksleri hazırlanıyor..." });
+            const uiResult = await new MultiRepoReactAnalysisService().analyze({
+              repoUrl: manifest.repos.ui.url,
+              repoRoot: manifest.repos.ui.localPath,
+              outputRoot: path.join(multiRepoRoot, "ui"),
+              branch: manifest.branch
+            });
+            await runStatus.completePhase("local-ui-analysis", {
+              details: { ...uiResult },
+              artifacts: [path.join(uiResult.outputRoot, "repo-map.md"), path.join(uiResult.outputRoot, "manifest.json")]
+            });
+          }
+
+          ensureNotCancelled();
+          const springAnalyzer = new MultiRepoSpringAnalysisService();
+          if (runStatus.isPhaseReusable("local-bff-analysis")) {
+            progress.report({ message: "BFF analizi önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("local-bff-analysis");
+            progress.report({ message: "BFF Spring indeksleri hazırlanıyor..." });
+            const bffResult = await springAnalyzer.analyze({
+              repoUrl: manifest.repos.bff.url,
+              repoRoot: manifest.repos.bff.localPath,
+              outputRoot: path.join(multiRepoRoot, "bff"),
+              branch: manifest.branch,
+              role: "bff"
+            });
+            await runStatus.completePhase("local-bff-analysis", {
+              details: { ...bffResult },
+              artifacts: [path.join(bffResult.outputRoot, "repo-map.md"), path.join(bffResult.outputRoot, "manifest.json")]
+            });
+          }
+
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("local-be-analysis")) {
+            progress.report({ message: "BE analizi önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("local-be-analysis");
+            progress.report({ message: "BE Spring indeksleri hazırlanıyor..." });
+            const beResult = await springAnalyzer.analyze({
+              repoUrl: manifest.repos.be.url,
+              repoRoot: manifest.repos.be.localPath,
+              outputRoot: path.join(multiRepoRoot, "be"),
+              branch: manifest.branch,
+              role: "be"
+            });
+            await runStatus.completePhase("local-be-analysis", {
+              details: { ...beResult },
+              artifacts: [path.join(beResult.outputRoot, "repo-map.md"), path.join(beResult.outputRoot, "manifest.json")]
+            });
+          }
+
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("local-traceability")) {
+            progress.report({ message: "Traceability önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("local-traceability");
+            progress.report({ message: "Traceability hazırlanıyor..." });
+            const traceabilityResult = await new MultiRepoTraceabilityService().build(multiRepoRoot, manifest);
+            await runStatus.completePhase("local-traceability", {
+              details: { ...traceabilityResult },
+              artifacts: [traceabilityResult.reportPath, path.join(multiRepoRoot, "traceability", "traceability-report.json")]
+            });
+          }
+
+          ensureNotCancelled();
+          const shouldRunQwen = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("multiRepo.agenticRunQwenSemantics", true);
+          const qwenEnabled = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false);
+          if (runStatus.isPhaseReusable("qwen-semantics")) {
+            progress.report({ message: "Qwen semantiği önceki çalışmadan yeniden kullanılıyor..." });
+          } else if (shouldRunQwen && qwenEnabled) {
+            await runStatus.startPhase("qwen-semantics");
+            progress.report({ message: "Qwen sayfa semantiği Agentic pipeline için hazırlanıyor..." });
+            const qwenStats = await new PageSemanticAnalyzer().analyze(multiRepoRoot, context, manifest, token);
+            await runStatus.updatePhase("qwen-semantics", {
+              details: { ...qwenStats, partial: qwenStats.failures > 0 },
+              artifacts: [
+                path.join(multiRepoRoot, "ui", "semantic", "interaction-semantics.jsonl"),
+                path.join(multiRepoRoot, "traceability", "semantic", "page-flow-semantics.jsonl")
+              ]
+            });
+            ensureNotCancelled();
+            await runStatus.completePhase("qwen-semantics", { details: { warning: qwenStats.failures > 0 ? `${qwenStats.failures} semantic item(s) failed.` : undefined } });
+            if (qwenStats.failures > 0) {
+              progress.report({ message: `Qwen semantik analizi kısmen tamamlandı; ${qwenStats.failures} hata çalışma durumuna kaydedildi.` });
+            }
+          } else {
+            const reason = shouldRunQwen ? "Qwen is disabled in settings." : "Agentic Qwen semantics is disabled in settings.";
+            await runStatus.skipPhase("qwen-semantics", reason);
+            progress.report({ message: "Qwen semantiği kapalı; Agentic pipeline bu adımı atladı." });
+          }
+
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("knowledge-graph")) {
+            progress.report({ message: "Knowledge graph önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("knowledge-graph");
+            progress.report({ message: "Knowledge graph hazırlanıyor..." });
+            const graphResult = await new LocalKnowledgeGraphBuilder().build(multiRepoRoot, manifest);
+            await runStatus.completePhase("knowledge-graph", {
+              details: { ...graphResult },
+              artifacts: [graphResult.summaryPath, path.join(graphResult.graphRoot, "graph-summary.json")]
+            });
+          }
+
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("quality-report")) {
+            progress.report({ message: "Kalite raporu önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("quality-report");
+            progress.report({ message: "Çoklu repo kalite raporu hazırlanıyor..." });
+            const qualityResult = await new MultiRepoQualityReportGenerator().generate(multiRepoRoot, manifest);
+            await runStatus.completePhase("quality-report", {
+              details: { ...qualityResult },
+              artifacts: [qualityResult.markdownPath, qualityResult.jsonPath]
+            });
+          }
+
+          ensureNotCancelled();
+          if (runStatus.isPhaseReusable("manifest-update")) {
+            progress.report({ message: "Manifest önceki çalışmadan yeniden kullanılıyor..." });
+          } else {
+            await runStatus.startPhase("manifest-update");
+            manifest.repos.ui.status = "analyzed";
+            manifest.repos.bff.status = "analyzed";
+            manifest.repos.be.status = "analyzed";
+            manifest.repos.ui.error = undefined;
+            manifest.repos.bff.error = undefined;
+            manifest.repos.be.error = undefined;
+            await manifestService.updateManifest(manifest);
+            await runStatus.completePhase("manifest-update", { artifacts: [path.join(multiRepoRoot, "manifest.json")] });
+          }
+
+          ensureNotCancelled();
+          return await new MultiRepoCopilotAgenticDocumentationGenerator().generate(
+            multiRepoRoot,
+            manifest,
+            token,
+            (event) => progress.report({
+              message: event.message,
+              increment: event.phase === "started" ? 100 / 7 : 0
+            }),
+            runStatus
+          );
+        } catch (error) {
+          cancelled = token.isCancellationRequested || /cancel/i.test(errorText(error));
+          if (runStatus.snapshot().status === "running") {
+            try {
+              await runStatus.finishFailure(error, cancelled);
+            } catch {
+              // Preserve the pipeline error if status persistence also fails.
+            }
+          }
+          throw error;
+        }
+      }
+    );
+  } catch (error) {
+    const phaseId = runStatus.snapshot().currentPhase ?? "unknown";
+    const action = cancelled
+      ? await vscode.window.showWarningMessage(
+        "Bank Spring Docs: Agentic analiz iptal edildi. Tamamlanan ara çıktılar ve çalışma durumu korundu.",
+        "Çalışma Durumunu Aç",
+        "Ara Çıktıları Aç"
+      )
+      : await vscode.window.showErrorMessage(
+        `Bank Spring Docs: Agentic analiz '${phaseId}' aşamasında başarısız oldu. Çalışma durumu ve ara çıktılar korundu.`,
+        "Çalışma Durumunu Aç",
+        "Ara Çıktıları Aç"
+      );
+    if (action === "Çalışma Durumunu Aç") {
+      await vscode.window.showTextDocument(vscode.Uri.file(runStatus.runStatusMarkdownPath), { preview: false });
+    }
+    if (action === "Ara Çıktıları Aç") {
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(runStatus.workspaceRoot));
+    }
+    return manifest;
+  }
 
   const document = await vscode.workspace.openTextDocument(result.finalDocumentPath);
   await vscode.window.showTextDocument(document, { preview: false });
   const action = await vscode.window.showInformationMessage(
-    `Bank Spring Docs: UI-BFF-BE Agentic Copilot tamamlandi. ${result.requestCount} istek, yaklasik ${result.estimatedTotalTokens} token.`,
+    `Bank Spring Docs: UI-BFF-BE Agentic Copilot tamamlandı. ${result.newRequestCount} yeni istek, ${result.reusedStepCount} yeniden kullanılan adım, toplam ${result.requestCount} istek denemesi.`,
     "Final Dokumani Ac",
     "Ara Ciktilari Ac",
-    "Audit Log Ac"
+    "Audit Log Ac",
+    "Çalışma Durumunu Aç"
   );
   if (action === "Final Dokumani Ac") {
     const finalDocument = await vscode.workspace.openTextDocument(result.finalDocumentPath);
@@ -391,6 +555,9 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
     const auditPath = path.join(manifestService.getMultiRepoRoot(), "audit", "copilot-requests.jsonl");
     const auditDocument = await vscode.workspace.openTextDocument(auditPath);
     await vscode.window.showTextDocument(auditDocument, { preview: false });
+  }
+  if (action === "Çalışma Durumunu Aç") {
+    await vscode.window.showTextDocument(vscode.Uri.file(runStatus.runStatusMarkdownPath), { preview: false });
   }
 
   return manifest;
@@ -409,6 +576,10 @@ export async function openUnresolvedMultiRepoMatchesCommand(context: vscode.Exte
 
 export async function multiRepoPhaseNotImplementedCommand(featureName: string): Promise<void> {
   vscode.window.showInformationMessage(`Bank Spring Docs: ${featureName} Phase A sonrasinda eklenecek.`);
+}
+
+function errorText(error: unknown): string {
+  return maskSecretsWithStats(error instanceof Error ? error.message : String(error)).text.slice(0, 1000);
 }
 
 async function promptForManifestInput(context: vscode.ExtensionContext): Promise<MultiRepoInput | undefined> {

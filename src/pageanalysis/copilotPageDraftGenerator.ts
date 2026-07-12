@@ -1,10 +1,11 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { askCopilotWithUsage } from "../ai/copilotClient";
+import { CopilotResponseWithUsage, ICopilotClient, RealCopilotClient } from "../ai/copilotClient";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
 import { buildCopilotPageDraftPrompt } from "./pageTechnicalAnalysisPrompts";
+import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
 
 export interface CopilotPageDraftResult {
   draftPath: string;
@@ -20,46 +21,81 @@ interface CopilotPageContextBuildResult {
 }
 
 export class CopilotPageDraftGenerator {
+  constructor(
+    private readonly client: ICopilotClient = new RealCopilotClient(),
+    private readonly maxContextCharacters?: number
+  ) {}
+
   async generate(multiRepoRoot: string, pageRoot: string, token: vscode.CancellationToken): Promise<CopilotPageDraftResult> {
+    await fs.mkdir(pageRoot, { recursive: true });
     const context = await this.buildContext(pageRoot);
     const safe = maskSecretsWithStats(context.text);
     const prompt = buildCopilotPageDraftPrompt(safe.text);
+    const metadata = await buildPageArtifactMetadata(pageRoot, [
+      "page-context-pack.md",
+      "page-evidence-pack.md",
+      "qwen-page-semantics.json",
+      "qwen-interaction-semantics.jsonl"
+    ]);
     const contextPath = path.join(pageRoot, "copilot-draft-context-pack.md");
     const promptPath = path.join(pageRoot, "copilot-draft-prompt.md");
     const draftPath = path.join(pageRoot, "copilot-draft.md");
     await fs.writeFile(contextPath, safe.text, "utf8");
     await fs.writeFile(promptPath, prompt.combinedText, "utf8");
 
-    const response = await askCopilotWithUsage(prompt, token);
-    await fs.writeFile(draftPath, response.text, "utf8");
-    await new CopilotAuditLogger().write(multiRepoRoot, {
-      timestamp: new Date().toISOString(),
-      docType: "page-analysis-draft",
-      repositoryName: "multi-repo-page-analysis",
-      branch: "multi-repo",
-      contextPackPath: path.relative(multiRepoRoot, contextPath),
-      promptPackPath: path.relative(multiRepoRoot, promptPath),
-      charactersSent: safe.text.length,
-      includedIndexes: context.includedFiles,
-      skippedIndexes: context.skippedFiles,
-      maskedSecrets: safe.maskedSecrets,
-      promptProfile: "page-technical-analysis-draft",
-      estimatedInputTokens: response.usage.estimatedInputTokens,
-      estimatedOutputTokens: response.usage.estimatedOutputTokens,
-      estimatedTotalTokens: response.usage.estimatedTotalTokens,
-      modelCountedInputTokens: response.usage.modelCountedInputTokens,
-      outputCharacters: response.usage.outputCharacters,
-      copilotRequestStarted: true,
-      copilotResponseReceived: true,
-      selectedModelId: response.model.id,
-      selectedModelName: response.model.name,
-      selectedModelVendor: response.model.vendor,
-      selectedModelFamily: response.model.family,
-      selectedModelVersion: response.model.version,
-      selectedModelMaxInputTokens: response.model.maxInputTokens,
-      modelFamily: "copilot",
-      status: "success"
-    });
+    let response: CopilotResponseWithUsage;
+    try {
+      response = await this.client.send(prompt, token);
+      await fs.writeFile(draftPath, `${pageMetadataComment(metadata)}\n\n${response.text.trim()}\n`, "utf8");
+      await new CopilotAuditLogger().write(multiRepoRoot, {
+        timestamp: new Date().toISOString(),
+        docType: "page-analysis-draft",
+        repositoryName: metadata.projectName,
+        branch: metadata.branch,
+        contextPackPath: path.relative(multiRepoRoot, contextPath),
+        promptPackPath: path.relative(multiRepoRoot, promptPath),
+        charactersSent: safe.text.length,
+        includedIndexes: context.includedFiles,
+        skippedIndexes: context.skippedFiles,
+        maskedSecrets: safe.maskedSecrets,
+        promptProfile: "page-technical-analysis-draft",
+        estimatedInputTokens: response.usage.estimatedInputTokens,
+        estimatedOutputTokens: response.usage.estimatedOutputTokens,
+        estimatedTotalTokens: response.usage.estimatedTotalTokens,
+        modelCountedInputTokens: response.usage.modelCountedInputTokens,
+        outputCharacters: response.usage.outputCharacters,
+        copilotRequestStarted: true,
+        copilotResponseReceived: true,
+        selectedModelId: response.model.id,
+        selectedModelName: response.model.name,
+        selectedModelVendor: response.model.vendor,
+        selectedModelFamily: response.model.family,
+        selectedModelVersion: response.model.version,
+        selectedModelMaxInputTokens: response.model.maxInputTokens,
+        modelFamily: "copilot",
+        status: "success"
+      });
+    } catch (error) {
+      await new CopilotAuditLogger().write(multiRepoRoot, {
+        timestamp: new Date().toISOString(),
+        docType: "page-analysis-draft",
+        repositoryName: metadata.projectName,
+        branch: metadata.branch,
+        contextPackPath: path.relative(multiRepoRoot, contextPath),
+        promptPackPath: path.relative(multiRepoRoot, promptPath),
+        charactersSent: safe.text.length,
+        includedIndexes: context.includedFiles,
+        skippedIndexes: context.skippedFiles,
+        maskedSecrets: safe.maskedSecrets,
+        promptProfile: "page-technical-analysis-draft",
+        copilotRequestStarted: true,
+        copilotResponseReceived: false,
+        modelFamily: "copilot",
+        status: token.isCancellationRequested ? "cancelled" : "failed",
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
 
     return {
       draftPath,
@@ -95,7 +131,10 @@ export class CopilotPageDraftGenerator {
     }
     const allSections = [...skippedSections, ...sections];
     return {
-      text: applyBudget(allSections.join("\n\n---\n\n"), vscode.workspace.getConfiguration("bankSpringDocs").get<number>("copilot.maxContextCharacters", 24000)),
+      text: applyBudget(
+        allSections.join("\n\n---\n\n"),
+        this.maxContextCharacters ?? vscode.workspace.getConfiguration("bankSpringDocs").get<number>("copilot.maxContextCharacters", 24000)
+      ),
       includedFiles,
       skippedFiles
     };
@@ -135,8 +174,15 @@ async function statOptional(filePath: string): Promise<{ mtimeMs: number } | und
 }
 
 function applyBudget(value: string, maxCharacters: number): string {
+  if (maxCharacters <= 0) {
+    return "";
+  }
   if (value.length <= maxCharacters) {
     return value;
   }
-  return `${value.slice(0, maxCharacters)}\n[PAGE_CONTEXT_TRUNCATED_FOR_COPILOT_TOKEN_LIMIT]`;
+  const marker = "\n[PAGE_CONTEXT_TRUNCATED_FOR_COPILOT_TOKEN_LIMIT]";
+  if (maxCharacters <= marker.length) {
+    return marker.slice(0, maxCharacters);
+  }
+  return `${value.slice(0, maxCharacters - marker.length)}${marker}`;
 }

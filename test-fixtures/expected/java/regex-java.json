@@ -1,0 +1,24 @@
+{
+  "provider": "regex-java",
+  "endpoints": [
+    { "httpMethod": "GET", "path": "/api/customers/{customerId}", "handlerMethod": "getCustomer", "responseType": "ResponseEntity<CustomerResponse>" },
+    { "httpMethod": "GET", "path": "/api/customers/search", "handlerMethod": "searchCustomers", "requestParams": ["status"] },
+    { "httpMethod": "POST", "path": "/api/customers/search", "handlerMethod": "create", "requestBody": "CustomerSearchRequest" },
+    { "httpMethod": "PUT", "path": "/api/customers/{customerId}", "handlerMethod": "update" },
+    { "httpMethod": "DELETE", "path": "/api/customers/{customerId}", "handlerMethod": "delete" }
+  ],
+  "models": [
+    { "entity": "Customer", "table": "customers", "idField": "id" },
+    { "className": "CustomerSearchRequest", "reason": "class name suffix" }
+  ],
+  "serviceCalls": [
+    { "className": "CustomerService", "methodName": "getCustomer", "targetType": "CustomerRiskClient", "targetMethod": "checkRisk" },
+    { "className": "CustomerService", "methodName": "getCustomer", "targetType": "CustomerRepository", "targetMethod": "findById" },
+    { "className": "CustomerService", "methodName": "getCustomer", "targetType": "CustomerRepository", "targetMethod": "findByExternalId" }
+  ],
+  "repositoryMethods": [
+    { "repository": "CustomerRepository", "method": "findByExternalId", "entity": "Customer" },
+    { "repository": "CustomerRepository", "method": "findByStatus", "entity": "Customer" },
+    { "repository": "CustomerRepository", "method": "searchByName", "entity": "Customer", "confidence": "high" }
+  ]
+}
