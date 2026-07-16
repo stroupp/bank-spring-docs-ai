@@ -159,31 +159,31 @@
       },
       {
         "command": "bankSpringDocs.generateCopilotRepositoryOverview",
-        "title": "Bank Spring Docs: Copilot Repository Özeti Oluştur"
+        "title": "Bank Spring Docs: AI Repository Özeti Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotSpringArchitecture",
-        "title": "Bank Spring Docs: Copilot Spring Mimari Dokümanı Oluştur"
+        "title": "Bank Spring Docs: AI Spring Mimari Dokümanı Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotApiDocumentation",
-        "title": "Bank Spring Docs: Copilot API Dokümantasyonu Oluştur"
+        "title": "Bank Spring Docs: AI API Dokümantasyonu Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotServiceLayer",
-        "title": "Bank Spring Docs: Copilot Servis Katmanı Dokümanı Oluştur"
+        "title": "Bank Spring Docs: AI Servis Katmanı Dokümanı Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotConfiguration",
-        "title": "Bank Spring Docs: Copilot Konfigürasyon Dokümanı Oluştur"
+        "title": "Bank Spring Docs: AI Konfigürasyon Dokümanı Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotTestAnalysis",
-        "title": "Bank Spring Docs: Copilot Test Analizi Oluştur"
+        "title": "Bank Spring Docs: AI Test Analizi Oluştur"
       },
       {
         "command": "bankSpringDocs.generateCopilotTechnicalAnalysis",
-        "title": "Bank Spring Docs: Copilot Teknik Analiz Oluştur"
+        "title": "Bank Spring Docs: AI Teknik Analiz Oluştur"
       },
       {
         "command": "bankSpringDocs.testQwenConnection",
@@ -211,27 +211,27 @@
       },
       {
         "command": "bankSpringDocs.generateAllCopilotDocs",
-        "title": "Bank Spring Docs: Tüm Copilot Dokümanlarını Oluştur"
+        "title": "Bank Spring Docs: Tüm AI Dokümanlarını Oluştur"
       },
       {
         "command": "bankSpringDocs.generateAgenticCopilotBackendDocs",
-        "title": "Bank Spring Docs: Agentic Copilot Backend Dokumantasyonu Olustur"
+        "title": "Bank Spring Docs: Agentic AI Backend Dokümantasyonu Oluştur"
       },
       {
         "command": "bankSpringDocs.openLastCopilotContext",
-        "title": "Bank Spring Docs: Son Copilot Context Paketini Aç"
+        "title": "Bank Spring Docs: Son AI Context Paketini Aç"
       },
       {
         "command": "bankSpringDocs.openLastCopilotContextSelection",
-        "title": "Bank Spring Docs: Son Copilot Context Se?im Auditini A?"
+        "title": "Bank Spring Docs: Son AI Context Seçim Auditini Aç"
       },
       {
         "command": "bankSpringDocs.openLastCopilotPrompt",
-        "title": "Bank Spring Docs: Son Copilot Promptunu Ac"
+        "title": "Bank Spring Docs: Son AI Promptunu Aç"
       },
       {
         "command": "bankSpringDocs.openCopilotAuditLog",
-        "title": "Bank Spring Docs: Copilot Audit Log Aç"
+        "title": "Bank Spring Docs: AI Audit Log Aç"
       },
       {
         "command": "bankSpringDocs.runCopilotDiagnostics",
@@ -275,7 +275,7 @@
       },
       {
         "command": "bankSpringDocs.generateMultiRepoAgenticCopilotDocs",
-        "title": "Bank Spring Docs: UI-BFF-BE Agentic Copilot Dokumantasyonu Olustur"
+        "title": "Bank Spring Docs: UI-BFF-BE Agentic AI Dokümantasyonu Oluştur"
       },
       {
         "command": "bankSpringDocs.buildPageList",
@@ -299,7 +299,7 @@
       },
       {
         "command": "bankSpringDocs.generateSelectedPageCopilotDraft",
-        "title": "Bank Spring Docs: Copilot ile Sayfa Taslak Dokümanı Oluştur"
+        "title": "Bank Spring Docs: AI ile Sayfa Taslak Dokümanı Oluştur"
       },
       {
         "command": "bankSpringDocs.detectSelectedPageDocumentGaps",
@@ -311,7 +311,7 @@
       },
       {
         "command": "bankSpringDocs.buildFinalSelectedPageDocument",
-        "title": "Bank Spring Docs: Copilot ile Final Sayfa Dokümanı Oluştur"
+        "title": "Bank Spring Docs: Final Sayfa Dokümanı Oluştur"
       },
       {
         "command": "bankSpringDocs.openFinalSelectedPageDocument",
@@ -357,18 +357,20 @@
         "bankSpringDocs.cacheFolder": {
           "type": "string",
           "default": ".ai-docs",
+          "scope": "machine",
           "description": "Yerel indeks ve oluşturulan dokümantasyon klasörü."
         },
         "bankSpringDocs.workspaceFolder": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "Repository clone, cache ve .ai-docs çıktılarının yazılacağı çalışma klasörü. Boş bırakılırsa VS Code global storage kullanılır."
         },
         "bankSpringDocs.maxFilesPerCopilotRequest": {
           "type": "number",
           "default": 8,
           "minimum": 1,
-          "description": "Maximum source files included in one Copilot context pack."
+          "description": "Bir AI context paketine dahil edilen maksimum kaynak dosyası. Ayar adı geriye dönük uyumluluk için korunur."
         },
         "bankSpringDocs.maxCharactersPerFile": {
           "type": "number",
@@ -391,19 +393,53 @@
           "default": true,
           "description": "Prioritize Spring Boot-specific scanning and extraction."
         },
+        "bankSpringDocs.ai.provider": {
+          "type": "string",
+          "enum": [
+            "copilot",
+            "qwen"
+          ],
+          "enumDescriptions": [
+            "Doküman üretim adımlarında GitHub Copilot Language Model API kullanılır.",
+            "Doküman üretim adımlarında yapılandırılmış yerel veya kurum içi Qwen endpoint'i kullanılır."
+          ],
+          "default": "copilot",
+          "description": "Tüm AI destekli doküman üretim adımlarında kullanılacak sağlayıcı. Yerel statik analiz adımları bu ayardan etkilenmez."
+        },
         "bankSpringDocs.qwen.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Qwen tabanlı yerel semantik analizi etkinleştirir."
+          "description": "Qwen semantik analizini ve Qwen seçildiğinde AI doküman üretimini etkinleştirir."
+        },
+        "bankSpringDocs.qwen.bankingEnvironment": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Etkinse kullanıcının yapıştırdığı onaylı banking HTTPS Qwen endpoint'i kullanılır; istek modeli ONIKS olur ve Authorization başlığı gönderilmez."
         },
         "bankSpringDocs.qwen.endpoint": {
           "type": "string",
           "default": "http://localhost:8000/v1/chat/completions",
-          "description": "OpenAI uyumlu yerel Qwen chat completions endpoint adresi."
+          "scope": "machine",
+          "description": "OpenAI uyumlu Qwen chat completions endpoint adresi. Workspace ayarları bu makine kapsamlı güvenlik ayarını değiştiremez."
+        },
+        "bankSpringDocs.qwen.allowedHosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "localhost",
+            "127.0.0.1",
+            "::1"
+          ],
+          "scope": "machine",
+          "description": "Qwen'e kaynak kanıtı göndermesine izin verilen kesin endpoint hostları. Banking modunda güvenilir çalışma alanından kaydedilen veya test edilen host buraya makine kapsamında eklenir."
         },
         "bankSpringDocs.qwen.model": {
           "type": "string",
           "default": "qwen3",
+          "scope": "machine",
           "description": "Yerel Qwen model adı."
         },
         "bankSpringDocs.qwen.temperature": {
@@ -424,6 +460,24 @@
           "default": 120,
           "minimum": 5,
           "description": "Qwen HTTP isteği zaman aşımı süresi."
+        },
+        "bankSpringDocs.qwen.generationTimeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 30,
+          "description": "Qwen ile uzun doküman üretim isteklerinde kullanılacak zaman aşımı süresi."
+        },
+        "bankSpringDocs.qwen.generationMaxTokens": {
+          "type": "number",
+          "default": 16384,
+          "minimum": 256,
+          "description": "Qwen doküman üretim yanıtları için maksimum token değeri."
+        },
+        "bankSpringDocs.qwen.contextWindowTokens": {
+          "type": "number",
+          "default": 131072,
+          "minimum": 8192,
+          "description": "Qwen sunucusunda kullanılabilir olduğu varsayılan toplam context penceresi. Prompt bütçesi hesaplanırken kullanılır."
         },
         "bankSpringDocs.qwen.useApiKey": {
           "type": "boolean",
@@ -455,30 +509,30 @@
         "bankSpringDocs.copilot.contextPreviewEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Copilot isteğinden önce context preview onayı gösterir."
+          "description": "Seçili AI sağlayıcısına istek gönderilmeden önce context preview onayı gösterir."
         },
         "bankSpringDocs.copilot.auditLogEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Copilot istekleri için içeriksiz audit JSONL kaydı yazar."
+          "description": "Copilot veya Qwen doküman üretim istekleri için içeriksiz audit JSONL kaydı yazar."
         },
         "bankSpringDocs.copilot.maxContextCharacters": {
           "type": "number",
           "default": 24000,
           "minimum": 4000,
-          "description": "Copilot'a gönderilecek context paketinin maksimum karakter sayısı. Model token limit hatası alırsanız düşürün."
+          "description": "Seçili AI sağlayıcısına gönderilecek context paketinin maksimum karakter sayısı. Model token limit hatası alırsanız düşürün."
         },
         "bankSpringDocs.copilot.agenticPreviousArtifactsCharacters": {
           "type": "number",
           "default": 18000,
           "minimum": 4000,
-          "description": "Agentic Copilot akisinda sonraki adimlara eklenecek onceki ara cikti maksimum karakter sayisi."
+          "description": "Agentic AI akışında sonraki adımlara eklenecek önceki ara çıktı maksimum karakter sayısı."
         },
         "bankSpringDocs.copilot.agenticMaxContextCharacters": {
           "type": "number",
           "default": 240000,
           "minimum": 24000,
-          "description": "Agentic Copilot adimlarinda kullanilacak maksimum context karakter sayisi. Buyuk projelerde daha kapsamli analiz icin yuksek tutulur."
+          "description": "Agentic AI adımlarında kullanılacak maksimum context karakter sayısı. Büyük projelerde daha kapsamlı analiz için yüksek tutulur."
         },
         "bankSpringDocs.copilot.modelId": {
           "type": "string",
@@ -488,7 +542,40 @@
         "bankSpringDocs.multiRepo.agenticRunQwenSemantics": {
           "type": "boolean",
           "default": true,
-          "description": "UI-BFF-BE Agentic Copilot pipeline calisirken Qwen sayfa semantigi adimini otomatik calistirir. Qwen kapaliysa adim atlanir."
+          "description": "UI-BFF-BE Agentic AI pipeline çalışırken Qwen sayfa semantiği adımını otomatik çalıştırır. Qwen kapalıysa adım atlanır."
+        },
+        "bankSpringDocs.pageAnalysis.qwenOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Etkinse side paneldeki tam sayfa analizi AI adımlarını yalnızca yapılandırılmış Qwen modeliyle çalıştırır. Global AI sağlayıcısını değiştirmez."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters": {
+          "type": "number",
+          "default": 180000,
+          "minimum": 12000,
+          "maximum": 1000000,
+          "description": "Qwen3-only sayfa analizinde secili tek bir UI, BFF veya BE kaynak dosyasindan alinabilecek maksimum karakter. Buyuk dosyalar bas ve son kisim korunarak sinirlanir."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxTotalSourceCharacters": {
+          "type": "number",
+          "default": 720000,
+          "minimum": 30000,
+          "maximum": 5000000,
+          "description": "Qwen3-only iteratif sayfa analizinde UI, BFF ve BE arasinda adil paylastirilan toplam ham kaynak karakter butcesi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxModelCalls": {
+          "type": "number",
+          "default": 48,
+          "minimum": 2,
+          "maximum": 200,
+          "description": "Bir Qwen3-only sayfa analizi calistirmasinda yapilabilecek yeni model cagrilarinin ust siniri. Tamamlanan adimlar resume sirasinda bu limite dahil edilmez."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxReduceLevels": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Chunk analizleri final sentez contextine sigmazsa kullanilabilecek hiyerarsik Qwen3 ledger birlestirme seviyesi."
         },
         "bankSpringDocs.pageAnalysis.maxEvidenceCharacters": {
           "type": "number",
@@ -512,17 +599,24 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "npm run compile && node scripts/smoke-tests.js",
+    "test": "npm run compile && node scripts/run-deterministic-test-suite.js",
     "test:fixtures": "npm run compile && node scripts/parser-fixture-tests.js && node scripts/traceability-fixture-tests.js && node scripts/evidence-fixture-tests.js",
     "test:ast-spike": "npm run compile && node scripts/tree-sitter-java-spike-tests.js",
-    "test:qwen-boundary": "node scripts/qwen-boundary-tests.js",
-    "test:copilot-boundary": "node scripts/copilot-boundary-tests.js",
+    "test:qwen-boundary": "npm run compile && node scripts/qwen-boundary-tests.js",
+    "test:qwen-page": "npm run compile && node scripts/qwen-page-pipeline-tests.js",
+    "test:qwen-gap-repair": "npm run compile && node scripts/qwen-gap-repair-tests.js",
+    "test:qwen-only-panel": "npm run compile && node scripts/qwen-only-panel-tests.js",
+    "test:qwen-only-command": "npm run compile && node scripts/qwen-only-command-tests.js",
+    "test:copilot-boundary": "npm run compile && node scripts/copilot-boundary-tests.js",
     "test:copilot-model-selection": "npm run compile && node scripts/copilot-model-selection-tests.js",
+    "test:ai-provider": "npm run compile && node scripts/ai-provider-boundary-tests.js",
     "test:agentic-status": "npm run compile && node scripts/agentic-run-status-tests.js",
+    "test:pipeline": "npm run compile && node scripts/deterministic-pipeline-tests.js",
+    "test:all": "npm run compile && node scripts/run-deterministic-test-suite.js",
     "test:doc-quality": "node scripts/document-quality-check.js",
     "validate:real-repos": "npm run compile && node scripts/real-repo-validation.js",
     "watch": "tsc -watch -p ./",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm test"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",

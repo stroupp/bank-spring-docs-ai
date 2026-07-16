@@ -3,8 +3,10 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { QwenClient } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
+import { maskSecrets } from "../ai/safeContextFilter";
 import { readJsonl, writeJsonl } from "../storage/jsonlWriter";
 import { sha256 } from "../utils/hash";
+import { ensureWithin } from "../utils/pathUtils";
 import { buildEndpointSemanticPrompt } from "./qwenSemanticPrompts";
 import { SemanticRunStats } from "./classSemanticAnalyzer";
 import { parseStrictJson, SemanticCacheService } from "./semanticCacheService";
@@ -29,9 +31,10 @@ export class EndpointSemanticAnalyzer {
     for (const endpoint of endpoints) {
       const identity = `${endpoint.httpMethod}:${endpoint.path}:${endpoint.className}.${endpoint.handlerMethod}`;
       try {
+        ensureNotCancelled(token);
         const relevantDependencies = dependencies.filter((edge) => edge.from === endpoint.className).slice(0, 20);
-        const sourceSnippet = await readEndpointSnippet(path.join(repoRoot, endpoint.file), endpoint.handlerMethod, maxCharacters);
-        const contextPayload = JSON.stringify({ endpoint, dependencies: relevantDependencies, sourceSnippet }, null, 2);
+        const sourceSnippet = await readEndpointSnippet(repoRoot, endpoint.file, endpoint.handlerMethod, maxCharacters);
+        const contextPayload = maskSecrets(JSON.stringify({ endpoint, dependencies: relevantDependencies, sourceSnippet }, null, 2));
         const cacheKey = cache.buildCacheKey(identity, sha256(contextPayload));
         const cached = cacheEnabled ? await cache.read("endpoints", identity, cacheKey) : undefined;
         if (cached) {
@@ -45,6 +48,7 @@ export class EndpointSemanticAnalyzer {
         enriched.push(parsed);
         stats.analyzed += 1;
       } catch (error) {
+        ensureNotCancelled(token);
         stats.failures += 1;
         await cache.writeDebug(identity, error instanceof Error ? error.message : String(error));
       }
@@ -55,9 +59,23 @@ export class EndpointSemanticAnalyzer {
   }
 }
 
-async function readEndpointSnippet(filePath: string, methodName: string, maxCharacters: number): Promise<string> {
+function ensureNotCancelled(token?: vscode.CancellationToken): void {
+  if (token?.isCancellationRequested) {
+    throw new Error("Qwen isteği kullanıcı tarafından iptal edildi.");
+  }
+}
+
+async function readEndpointSnippet(repoRoot: string, relativeFile: string, methodName: string, maxCharacters: number): Promise<string> {
+  const filePath = path.resolve(repoRoot, relativeFile);
+  if (!ensureWithin(repoRoot, filePath)) {
+    return "Not visible from provided context.";
+  }
   try {
-    const content = await fs.readFile(filePath, "utf8");
+    const [realRoot, realFile] = await Promise.all([fs.realpath(repoRoot), fs.realpath(filePath)]);
+    if (!ensureWithin(realRoot, realFile)) {
+      return "Not visible from provided context.";
+    }
+    const content = await fs.readFile(realFile, "utf8");
     const nameIndex = content.search(new RegExp(`\\b${escapeRegExp(methodName)}\\s*\\(`));
     if (nameIndex < 0) {
       return content.slice(0, maxCharacters);

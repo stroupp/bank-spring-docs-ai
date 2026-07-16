@@ -1,8 +1,15 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { askCopilotWithUsage, CopilotUsageEstimate } from "../ai/copilotClient";
+import { RealCopilotClient } from "../ai/copilotClient";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
+import {
+  DocumentationModelInfo,
+  DocumentationModelProvider,
+  DocumentationModelResponse,
+  DocumentationModelUsage,
+  IDocumentationModelClient
+} from "../ai/documentationModelClient";
 import { buildCopilotAgenticPrompt, CopilotAgenticStep } from "../ai/prompts";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
 import { readJsonl } from "../storage/jsonlWriter";
@@ -16,7 +23,7 @@ export interface CopilotAgenticProgress {
   stepLabel: string;
   phase: "started" | "streaming" | "completed";
   message: string;
-  usage?: CopilotUsageEstimate;
+  usage?: DocumentationModelUsage;
 }
 
 export interface CopilotAgenticResult {
@@ -47,7 +54,8 @@ const stepLabels: Record<CopilotAgenticStep, string> = {
 
 export class CopilotAgenticDocumentationGenerator {
   constructor(
-    private readonly markdownWriter = new MarkdownWriter()
+    private readonly markdownWriter = new MarkdownWriter(),
+    private readonly client: IDocumentationModelClient = new RealCopilotClient()
   ) {}
 
   async generate(
@@ -65,13 +73,15 @@ export class CopilotAgenticDocumentationGenerator {
     const previousOutputs: string[] = [];
     let estimatedTotalTokens = 0;
     let finalBody = "";
+    let finalModel: DocumentationModelInfo | undefined;
+    let finalProvider = resolveProvider(undefined, this.client.provider);
 
     for (let index = 0; index < steps.length; index += 1) {
       const step = steps[index];
       const stepIndex = index + 1;
       const stepLabel = stepLabels[step];
       if (token.isCancellationRequested) {
-        throw new Error("Copilot agentic analysis was cancelled.");
+        throw new Error(`${providerDisplayName(finalProvider)} agentic analysis was cancelled.`);
       }
 
       onProgress?.({
@@ -88,21 +98,45 @@ export class CopilotAgenticDocumentationGenerator {
       const promptPath = await this.writeArtifact(workspaceRoot, `${step}-prompt.md`, promptRequest.combinedText);
       const contextPath = await this.writeArtifact(workspaceRoot, `${step}-context.md`, rawContext.safeText);
 
-      const response = await askCopilotWithUsage(promptRequest, token, (usage) => {
-        onProgress?.({
-          step,
-          stepIndex,
-          totalSteps: steps.length,
-          stepLabel,
-          phase: "streaming",
-          message: `Adim ${stepIndex}/${steps.length} - ${stepLabel}: yaklasik ${usage.estimatedTotalTokens} token`,
-          usage
+      const requestStartedAt = Date.now();
+      let response: DocumentationModelResponse;
+      let responseReceived = false;
+      try {
+        response = await this.client.send(promptRequest, token, (usage) => {
+          onProgress?.({
+            step,
+            stepIndex,
+            totalSteps: steps.length,
+            stepLabel,
+            phase: "streaming",
+            message: `Adim ${stepIndex}/${steps.length} - ${stepLabel}: yaklasik ${usage.estimatedTotalTokens} token`,
+            usage
+          });
         });
-      });
-      if (!response.text.trim()) {
-        throw new Error(`Copilot returned an empty response for agentic step: ${step}.`);
+        responseReceived = true;
+        if (!response.text.trim()) {
+          throw new Error(`${providerDisplayName(resolveProvider(response.provider, this.client.provider))} returned an empty response for agentic step: ${step}.`);
+        }
+      } catch (error) {
+        await this.auditFailedStep(aiDocsPath, {
+          step,
+          repositoryName,
+          branch,
+          contextPath,
+          promptPath,
+          charactersSent: rawContext.safeText.length,
+          includedIndexes: rawContext.includedIndexes,
+          maskedSecrets: rawContext.maskedSecrets,
+          provider: resolveProvider(undefined, this.client.provider),
+          durationMs: Date.now() - requestStartedAt,
+          responseReceived,
+          cancelled: token.isCancellationRequested,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        throw error;
       }
-
+      finalProvider = resolveProvider(response.provider, this.client.provider);
+      finalModel = response.model;
       estimatedTotalTokens += response.usage.estimatedTotalTokens;
       const outputPath = await this.writeArtifact(workspaceRoot, `${step}.md`, response.text);
       stepArtifacts.push(outputPath);
@@ -131,7 +165,10 @@ export class CopilotAgenticDocumentationGenerator {
         includedIndexes: rawContext.includedIndexes,
         maskedSecrets: rawContext.maskedSecrets,
         usage: response.usage,
-        model: response.model
+        model: response.model,
+        provider: finalProvider,
+        finishReason: response.finishReason,
+        requestId: response.requestId
       });
     }
 
@@ -143,7 +180,7 @@ export class CopilotAgenticDocumentationGenerator {
       branch,
       finalBody || previousOutputs.join("\n\n---\n\n"),
       path.join("copiloted-generated-docs", "agentic"),
-      "Bank Spring Docs AI via multi-step GitHub Copilot Language Model API"
+      modelAttribution(finalProvider, finalModel?.name)
     );
 
     await this.writeRunSummary(workspaceRoot, {
@@ -152,7 +189,9 @@ export class CopilotAgenticDocumentationGenerator {
       runId,
       finalDocumentPath,
       stepArtifacts,
-      estimatedTotalTokens
+      estimatedTotalTokens,
+      provider: finalProvider,
+      modelName: finalModel?.name
     });
 
     return {
@@ -364,15 +403,19 @@ export class CopilotAgenticDocumentationGenerator {
       finalDocumentPath: string;
       stepArtifacts: string[];
       estimatedTotalTokens: number;
+      provider: DocumentationModelProvider;
+      modelName?: string;
     }
   ): Promise<void> {
     await fs.writeFile(path.join(workspaceRoot, "run-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf8");
     await fs.writeFile(path.join(workspaceRoot, "run-summary.md"), [
-      "# Copilot Agentic Run Summary",
+      `# ${providerDisplayName(summary.provider)} Agentic Run Summary`,
       "",
       `Repository: ${summary.repositoryName}`,
       `Branch: ${summary.branch}`,
       `Run: ${summary.runId}`,
+      `Provider: ${summary.provider}`,
+      `Model: ${summary.modelName ?? "unknown"}`,
       `Estimated tokens: ${summary.estimatedTotalTokens}`,
       `Final document: ${summary.finalDocumentPath}`,
       "",
@@ -391,15 +434,11 @@ export class CopilotAgenticDocumentationGenerator {
     charactersSent: number;
     includedIndexes: string[];
     maskedSecrets: number;
-    usage: CopilotUsageEstimate;
-    model: {
-      id: string;
-      name: string;
-      vendor: string;
-      family: string;
-      version: string;
-      maxInputTokens: number;
-    };
+    usage: DocumentationModelUsage;
+    model: DocumentationModelInfo;
+    provider: DocumentationModelProvider;
+    finishReason?: string;
+    requestId?: string;
   }): Promise<void> {
     await new CopilotAuditLogger().write(aiDocsPath, {
       timestamp: new Date().toISOString(),
@@ -416,6 +455,9 @@ export class CopilotAgenticDocumentationGenerator {
       estimatedOutputTokens: input.usage.estimatedOutputTokens,
       estimatedTotalTokens: input.usage.estimatedTotalTokens,
       modelCountedInputTokens: input.usage.modelCountedInputTokens,
+      promptTokens: input.usage.promptTokens,
+      completionTokens: input.usage.completionTokens,
+      totalTokens: input.usage.totalTokens,
       outputCharacters: input.usage.outputCharacters,
       copilotRequestStarted: true,
       copilotResponseReceived: true,
@@ -425,10 +467,71 @@ export class CopilotAgenticDocumentationGenerator {
       selectedModelFamily: input.model.family,
       selectedModelVersion: input.model.version,
       selectedModelMaxInputTokens: input.model.maxInputTokens,
-      modelFamily: "copilot",
+      provider: input.provider,
+      finishReason: input.finishReason,
+      requestId: input.requestId,
+      modelFamily: input.provider,
       status: "success"
     });
   }
+
+  private async auditFailedStep(aiDocsPath: string, input: {
+    step: CopilotAgenticStep;
+    repositoryName: string;
+    branch: string;
+    contextPath: string;
+    promptPath: string;
+    charactersSent: number;
+    includedIndexes: string[];
+    maskedSecrets: number;
+    provider: DocumentationModelProvider;
+    durationMs: number;
+    responseReceived: boolean;
+    cancelled: boolean;
+    error: string;
+  }): Promise<void> {
+    try {
+      await new CopilotAuditLogger().write(aiDocsPath, {
+        timestamp: new Date().toISOString(),
+        docType: `agentic-${input.step}`,
+        repositoryName: input.repositoryName,
+        branch: input.branch,
+        contextPackPath: path.relative(aiDocsPath, input.contextPath),
+        promptPackPath: path.relative(aiDocsPath, input.promptPath),
+        charactersSent: input.charactersSent,
+        includedIndexes: input.includedIndexes,
+        maskedSecrets: input.maskedSecrets,
+        promptProfile: "agentic-backend-documentation",
+        durationMs: input.durationMs,
+        copilotRequestStarted: true,
+        copilotResponseReceived: input.responseReceived,
+        provider: input.provider,
+        modelFamily: input.provider,
+        status: input.cancelled ? "cancelled" : "failed",
+        error: input.error
+      });
+    } catch {
+      // The original provider failure remains primary if best-effort auditing fails.
+    }
+  }
+}
+
+function providerDisplayName(provider: DocumentationModelProvider): string {
+  return provider === "qwen" ? "Qwen" : "Copilot";
+}
+
+function resolveProvider(
+  responseProvider?: DocumentationModelProvider,
+  clientProvider?: DocumentationModelProvider
+): DocumentationModelProvider {
+  return responseProvider ?? clientProvider ?? "copilot";
+}
+
+function modelAttribution(provider: DocumentationModelProvider, modelName?: string): string {
+  const model = modelName ? ` (${modelName})` : "";
+  return provider === "qwen"
+    ? `Bank Spring Docs AI via multi-step configured Qwen endpoint${model}`
+    : `Bank Spring Docs AI via multi-step GitHub Copilot Language Model API${model}`;
 }
 
 async function readJsonlContent(filePath: string, maxCharacters: number): Promise<string> {

@@ -2,6 +2,10 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { readJsonl } from "../storage/jsonlWriter";
 import { MultiRepoManifest } from "./multiRepoManifestService";
+import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
+import { MultiRepoArtifactIdentityService } from "./multiRepoArtifactIdentityService";
+import { PipelineArtifactReceiptService } from "./pipelineArtifactReceiptService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 
 type Severity = "critical" | "warning" | "info";
 
@@ -66,15 +70,23 @@ const artifacts: ArtifactSpec[] = [
   { key: "pageFlowSemantics", relativePath: "traceability/semantic/page-flow-semantics.jsonl", label: "Qwen page-flow semantics", critical: false }
 ];
 
+const flowArtifactKeys = new Set(["bffFlows", "beServiceFlows", "uiToBff", "bffToBe", "pageFlows"]);
+const weakConfidenceValues = new Set(["low", "partial", "unmatched"]);
+const weakOutcomeValues = new Set(["empty", "error", "failed", "failure", "incomplete", "partial", "unmatched", "unresolved"]);
+
 export class MultiRepoQualityReportGenerator {
   async generate(multiRepoRoot: string, manifest: MultiRepoManifest): Promise<MultiRepoQualityReportResult> {
+    await new MultiRepoArtifactIdentityService().assertCompatible(multiRepoRoot, manifest);
+    const hasTraceability = await new PipelineArtifactReceiptService()
+      .assertTraceabilityCompatible(multiRepoRoot, manifest, { allowMissing: true });
     const recordsByKey = new Map<string, Record<string, unknown>[]>();
     const ratings: ArtifactRating[] = [];
     const findings: Finding[] = [];
 
     for (const artifact of artifacts) {
       const fullPath = path.join(multiRepoRoot, artifact.relativePath);
-      const exists = await fileExists(fullPath);
+      const isTraceabilityArtifact = artifact.relativePath.startsWith("traceability/");
+      const exists = (!isTraceabilityArtifact || hasTraceability) && await fileExists(fullPath);
       const records = exists ? await readJsonl<Record<string, unknown>>(fullPath) : [];
       recordsByKey.set(artifact.key, records);
       const rating = this.rateArtifact(artifact, exists, records);
@@ -82,6 +94,12 @@ export class MultiRepoQualityReportGenerator {
       if (artifact.critical && rating.rating !== "good") {
         findings.push({
           severity: "critical",
+          message: `${artifact.label} is ${rating.rating}.`,
+          recommendation: this.recommendationFor(artifact.key)
+        });
+      } else if (flowArtifactKeys.has(artifact.key) && (rating.rating === "weak" || rating.rating === "empty")) {
+        findings.push({
+          severity: "warning",
           message: `${artifact.label} is ${rating.rating}.`,
           recommendation: this.recommendationFor(artifact.key)
         });
@@ -94,6 +112,7 @@ export class MultiRepoQualityReportGenerator {
     const report = {
       projectName: manifest.projectName,
       branch: manifest.branch,
+      pipelineIdentity: manifest.pipelineIdentity,
       generatedAt: new Date().toISOString(),
       score,
       rating,
@@ -102,11 +121,13 @@ export class MultiRepoQualityReportGenerator {
     };
 
     const reportRoot = path.join(multiRepoRoot, "quality");
+    await assertPathContainedForWrite(multiRepoRoot, reportRoot);
     await fs.mkdir(reportRoot, { recursive: true });
+    await assertPathContainedForWrite(multiRepoRoot, reportRoot);
     const jsonPath = path.join(reportRoot, "multi-repo-quality-report.json");
     const markdownPath = path.join(reportRoot, "multi-repo-quality-report.md");
-    await fs.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-    await fs.writeFile(markdownPath, this.toMarkdown(report), "utf8");
+    await atomicWriteJson(jsonPath, report);
+    await atomicWriteFile(markdownPath, this.toMarkdown(report));
 
     return {
       markdownPath,
@@ -124,9 +145,32 @@ export class MultiRepoQualityReportGenerator {
       notes.push("File has not been generated yet.");
       return { ...artifact, records: 0, rating: "missing", notes };
     }
+    if (artifact.key === "unresolved") {
+      if (records.length === 0) {
+        notes.push("No unresolved flow matches remain.");
+        return { ...artifact, records: 0, rating: "good", notes };
+      }
+      notes.push(`${records.length} unresolved flow match record(s) require review.`);
+      return { ...artifact, records: records.length, rating: "weak", notes };
+    }
     if (records.length === 0) {
       notes.push("File exists but contains no records.");
       return { ...artifact, records: 0, rating: "empty", notes };
+    }
+    if (flowArtifactKeys.has(artifact.key)) {
+      const flowSignals = this.flowQualitySignals(artifact.key, records);
+      if (flowSignals.weakRecords > 0) {
+        if (flowSignals.lowConfidence > 0) {
+          notes.push(`${flowSignals.lowConfidence}/${records.length} flow record(s) have low, partial, or unmatched confidence.`);
+        }
+        if (flowSignals.weakOutcome > 0) {
+          notes.push(`${flowSignals.weakOutcome}/${records.length} flow record(s) report an unresolved or failed outcome.`);
+        }
+        if (flowSignals.incomplete > 0) {
+          notes.push(`${flowSignals.incomplete}/${records.length} flow record(s) are missing a required downstream endpoint.`);
+        }
+        return { ...artifact, records: records.length, rating: "weak", notes };
+      }
     }
     if (artifact.key === "uiForms" && records.length < 2) {
       notes.push("Few form fields were detected; confirm UI form extraction for login/search screens.");
@@ -141,6 +185,42 @@ export class MultiRepoQualityReportGenerator {
       return { ...artifact, records: records.length, rating: "weak", notes };
     }
     return { ...artifact, records: records.length, rating: "good", notes };
+  }
+
+  private flowQualitySignals(key: string, records: Record<string, unknown>[]): {
+    weakRecords: number;
+    lowConfidence: number;
+    weakOutcome: number;
+    incomplete: number;
+  } {
+    let lowConfidence = 0;
+    let weakOutcome = 0;
+    let incomplete = 0;
+    const weakRecordIndexes = new Set<number>();
+
+    records.forEach((record, index) => {
+      const confidence = normalizedValue(record.confidence);
+      if (confidence && weakConfidenceValues.has(confidence)) {
+        lowConfidence++;
+        weakRecordIndexes.add(index);
+      }
+
+      const outcome = firstNormalizedValue(record, ["outcome", "matchOutcome", "result", "status"]);
+      if (outcome && weakOutcomeValues.has(outcome)) {
+        weakOutcome++;
+        weakRecordIndexes.add(index);
+      }
+
+      const missesRequiredEndpoint = (key === "uiToBff" && !hasText(record.bffEndpoint)) ||
+        (key === "bffToBe" && !hasText(record.beEndpoint)) ||
+        (key === "pageFlows" && (!hasText(record.bffEndpoint) || !hasText(record.beEndpoint)));
+      if (missesRequiredEndpoint) {
+        incomplete++;
+        weakRecordIndexes.add(index);
+      }
+    });
+
+    return { weakRecords: weakRecordIndexes.size, lowConfidence, weakOutcome, incomplete };
   }
 
   private addCrossArtifactFindings(recordsByKey: Map<string, Record<string, unknown>[]>, findings: Finding[]): void {
@@ -217,10 +297,13 @@ export class MultiRepoQualityReportGenerator {
   private calculateScore(ratings: ArtifactRating[], findings: Finding[]): number {
     let score = 100;
     for (const rating of ratings) {
-      if (rating.rating === "missing" && artifacts.find((artifact) => artifact.key === rating.key)?.critical) {
+      const artifact = artifacts.find((candidate) => candidate.key === rating.key);
+      if (rating.rating === "missing" && artifact?.critical) {
         score -= 12;
-      } else if (rating.rating === "empty" && artifacts.find((artifact) => artifact.key === rating.key)?.critical) {
+      } else if (rating.rating === "empty" && artifact?.critical) {
         score -= 15;
+      } else if (rating.rating === "empty" && flowArtifactKeys.has(rating.key)) {
+        score -= 6;
       } else if (rating.rating === "weak") {
         score -= 4;
       }
@@ -305,7 +388,32 @@ async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
   }
+}
+
+function normalizedValue(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized || undefined;
+}
+
+function firstNormalizedValue(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = normalizedValue(record[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function hasText(value: unknown): boolean {
+  return typeof value === "string" && Boolean(value.trim());
 }

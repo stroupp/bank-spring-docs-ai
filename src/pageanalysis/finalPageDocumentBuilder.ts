@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
+import { atomicWriteFile } from "../storage/atomicFile";
 
 export interface FinalPageDocumentResult {
   finalDocumentPath: string;
@@ -17,11 +18,12 @@ export class FinalPageDocumentBuilder {
     const repaired = repairStale.length ? "" : await readOptional(path.join(pageRoot, "repaired-sections.md"));
     if (!draft.trim()) {
       const reason = draftStale.length
-        ? `Copilot taslagi su girdilerden eski: ${draftStale.join(", ")}.`
-        : "Copilot taslagi bulunamadi veya bos.";
+        ? `AI taslagi su girdilerden eski: ${draftStale.join(", ")}.`
+        : "AI taslagi bulunamadi veya bos.";
       throw new Error(`Final sayfa dokumani olusturulamadi. ${reason}`);
     }
     const mergedBody = mergeRepairedSections(draft, repaired);
+    const draftGeneration = parseGenerationMetadata(draft);
     const qwenAvailable = Boolean(await readOptional(path.join(pageRoot, "qwen-page-semantics.json")));
     const finalDocumentPath = path.join(pageRoot, "final-page-technical-analysis.md");
     const metadata = await buildPageArtifactMetadata(pageRoot, [
@@ -43,8 +45,11 @@ export class FinalPageDocumentBuilder {
       `Olusturulma zamani: ${metadata.generatedAt}`,
       `Pipeline version: ${metadata.pipelineVersion}`,
       `Input hash: ${metadata.inputHash}`,
+      draftGeneration.provider ? `Taslak saglayicisi: ${draftGeneration.provider}` : "",
+      draftGeneration.model ? `Taslak modeli: ${draftGeneration.model}` : "",
+      draftGeneration.pipeline ? `Taslak pipeline: ${draftGeneration.pipeline}` : "",
       `Qwen semantik mevcut: ${qwenAvailable ? "evet" : "hayir"}`,
-      draftStale.length ? `Copilot draft atlandi: ${draftStale.join(", ")} dosyalarindan eski.` : "",
+      draftStale.length ? `AI draft atlandi: ${draftStale.join(", ")} dosyalarindan eski.` : "",
       repairStale.length ? `Repaired sections atlandi: ${repairStale.join(", ")} dosyalarindan eski.` : "",
       `Evidence pack: ${path.join(pageRoot, "page-evidence-pack.md")}`,
       `Quality score: ${path.join(pageRoot, "quality-score.json")}`,
@@ -58,8 +63,25 @@ export class FinalPageDocumentBuilder {
       "- Desteklenmeyen bilgilerin eklenmemesi icin kaynak/context referanslari korunmalidir."
     ].filter(Boolean).join("\n");
     await backupExisting(finalDocumentPath);
-    await fs.writeFile(finalDocumentPath, content, "utf8");
+    await atomicWriteFile(finalDocumentPath, content);
     return { finalDocumentPath };
+  }
+}
+
+function parseGenerationMetadata(markdown: string): Record<string, string> {
+  const match = markdown.match(/<!--\s*bank-spring-docs-generation\s+({[^\r\n]*})\s*-->/);
+  if (!match) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(match[1]) as Record<string, unknown>;
+    return Object.fromEntries(
+      ["provider", "model", "pipeline"]
+        .filter((key) => parsed[key] !== undefined)
+        .map((key) => [key, String(parsed[key])])
+    );
+  } catch {
+    return {};
   }
 }
 

@@ -21,14 +21,17 @@ export function classifyReactFile(filePath: string, content: string): ReactFileC
   if (/\.(test|spec)\.(tsx|ts|jsx|js)$/.test(normalized) || normalized.includes("__tests__")) {
     return "test";
   }
+  // Explicit page conventions are stronger ownership evidence than an inline
+  // fetch/axios call. Pages often load their own data and must remain indexable
+  // as pages for route, form, state, and API-consumer attribution.
+  if (normalized.includes("/pages/") || normalized.includes("/views/") || /Page\.(tsx|jsx|ts|js)$/.test(filePath)) {
+    return "page";
+  }
   if (normalized.includes("/api/") || normalized.includes("api-client") || /axios|fetch\(|createApi|baseQuery/i.test(content)) {
     return "api-client";
   }
   if (normalized.includes("/routes/") || /<Route\s|createBrowserRouter|useRoutes|const\s+routes\s*=/.test(content)) {
     return "route";
-  }
-  if (normalized.includes("/pages/") || normalized.includes("/views/") || /Page\.(tsx|jsx|ts|js)$/.test(filePath)) {
-    return "page";
   }
   if (/^use[A-Z]/.test(name.replace(/\.(tsx|ts|jsx|js)$/i, "")) || normalized.includes("/hooks/")) {
     return "hook";

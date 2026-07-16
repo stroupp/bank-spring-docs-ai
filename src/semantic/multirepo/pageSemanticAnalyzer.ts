@@ -3,10 +3,11 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { QwenClient } from "../../ai/qwenClient";
 import { QwenSettingsService } from "../../ai/qwenSettingsService";
+import { maskSecrets } from "../../ai/safeContextFilter";
 import { parseStrictJson } from "../semanticCacheService";
 import { readJsonl, writeJsonl } from "../../storage/jsonlWriter";
 import { sha256 } from "../../utils/hash";
-import { safeName } from "../../utils/pathUtils";
+import { ensureWithin, safeName } from "../../utils/pathUtils";
 import { buildPageFlowSemanticPrompt, buildUiInteractionSemanticPrompt } from "./crossLayerSemanticPrompts";
 import { MultiRepoSemanticCacheService } from "./multiRepoSemanticCacheService";
 import { MultiRepoManifest } from "../../multirepo/multiRepoManifestService";
@@ -86,13 +87,11 @@ export class PageSemanticAnalyzer {
 
     const interactionOutputs: unknown[] = [];
     for (const interaction of interactions) {
-      if (token?.isCancellationRequested) {
-        break;
-      }
+      ensureNotCancelled(token);
       try {
         const identity = `${interaction.page ?? interaction.component}-${interaction.handler}-${interaction.label}`;
         const contextPayload = await this.buildInteractionContext(interaction, manifest, maxSourceCharacters);
-        const contextText = JSON.stringify(contextPayload, null, 2);
+        const contextText = maskSecrets(JSON.stringify(contextPayload, null, 2));
         const sourceHash = sha256(contextText);
         const cacheKey = cache.buildCacheKey(identity, sourceHash);
         const cached = await cache.read("ui-interactions", identity, cacheKey);
@@ -109,19 +108,18 @@ export class PageSemanticAnalyzer {
         interactionOutputs.push(parsed);
         stats.interactionsAnalyzed += 1;
       } catch {
+        ensureNotCancelled(token);
         stats.failures += 1;
       }
     }
 
     const pageFlowOutputs: unknown[] = [];
     for (const flow of pageFlows) {
-      if (token?.isCancellationRequested) {
-        break;
-      }
+      ensureNotCancelled(token);
       try {
         const identity = `${flow.page}-${flow.route ?? "no-route"}-${flow.uiApiCall}`;
         const contextPayload = await this.buildPageFlowContext(flow, uiToBff, bffToBe, manifest, maxSourceCharacters);
-        const contextText = JSON.stringify(contextPayload, null, 2);
+        const contextText = maskSecrets(JSON.stringify(contextPayload, null, 2));
         const sourceHash = sha256(contextText);
         const cacheKey = cache.buildCacheKey(identity, sourceHash);
         const cached = await cache.read("page-flows", identity, cacheKey);
@@ -138,6 +136,7 @@ export class PageSemanticAnalyzer {
         pageFlowOutputs.push(parsed);
         stats.pageFlowsAnalyzed += 1;
       } catch {
+        ensureNotCancelled(token);
         stats.failures += 1;
       }
     }
@@ -189,7 +188,15 @@ export class PageSemanticAnalyzer {
       return undefined;
     }
     try {
-      const content = await fs.readFile(path.join(repoRoot, relativeFile), "utf8");
+      const filePath = path.resolve(repoRoot, relativeFile);
+      if (!ensureWithin(repoRoot, filePath)) {
+        return undefined;
+      }
+      const [realRoot, realFile] = await Promise.all([fs.realpath(repoRoot), fs.realpath(filePath)]);
+      if (!ensureWithin(realRoot, realFile)) {
+        return undefined;
+      }
+      const content = await fs.readFile(realFile, "utf8");
       const snippet = this.focusedSnippet(content, focus, maxCharacters);
       return {
         file: relativeFile,
@@ -215,5 +222,11 @@ export class PageSemanticAnalyzer {
       return content.slice(start, end);
     }
     return content.slice(0, maxCharacters);
+  }
+}
+
+function ensureNotCancelled(token?: vscode.CancellationToken): void {
+  if (token?.isCancellationRequested) {
+    throw new Error("Qwen isteği kullanıcı tarafından iptal edildi.");
   }
 }

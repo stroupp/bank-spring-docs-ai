@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { QwenClient } from "../ai/qwenClient";
+import { QwenClient, QwenConnectionResult } from "../ai/qwenClient";
 import { QwenSettingsService, QwenSettingsUpdate } from "../ai/qwenSettingsService";
 
 export async function saveQwenSettingsCommand(context: vscode.ExtensionContext, settings?: QwenSettingsUpdate): Promise<void> {
@@ -12,13 +12,16 @@ export async function saveQwenSettingsCommand(context: vscode.ExtensionContext, 
   vscode.window.showInformationMessage("Bank Spring Docs: Qwen ayarları kaydedildi.");
 }
 
-export async function testQwenConnectionCommand(context: vscode.ExtensionContext, settings?: QwenSettingsUpdate): Promise<void> {
+export async function testQwenConnectionCommand(
+  context: vscode.ExtensionContext,
+  settings?: QwenSettingsUpdate
+): Promise<QwenConnectionResult> {
   const service = new QwenSettingsService(context);
   if (settings) {
     await service.saveSettings(settings);
   }
 
-  await vscode.window.withProgress(
+  return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Bank Spring Docs: Qwen bağlantısı test ediliyor",
@@ -31,6 +34,7 @@ export async function testQwenConnectionCommand(context: vscode.ExtensionContext
       } else {
         vscode.window.showErrorMessage(`Bank Spring Docs: ${result.message}`);
       }
+      return result;
     }
   );
 }

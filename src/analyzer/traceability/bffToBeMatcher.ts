@@ -4,9 +4,14 @@ import { normalizeHttpPath, normalizeMethod, pathSuffixMatches } from "./pathNor
 export interface BffOutboundCallForTrace {
   client: string;
   method: string;
+  sourceMethod?: string;
   httpMethod: string;
   targetPath: string;
   sourceEndpoint?: string;
+  sourceController?: string;
+  sourceHandler?: string;
+  headers?: string[];
+  bodyExpression?: string;
   file: string;
 }
 
@@ -36,27 +41,12 @@ export class BffToBeMatcher {
     return bffEndpoints.map((bff) => {
       const method = normalizeMethod(bff.httpMethod);
       const path = normalizeHttpPath(bff.path);
-      const exactCandidates = beEndpoints.filter((endpoint) => normalizeMethod(endpoint.httpMethod) === method && normalizeHttpPath(endpoint.path) === path);
-      const suffixCandidates = exactCandidates.length ? [] : beEndpoints.filter((endpoint) => normalizeMethod(endpoint.httpMethod) === method && pathSuffixMatches(endpoint.path, path));
-      const exact = exactCandidates[0];
-      const suffix = suffixCandidates[0];
-
-      if (exact) {
-        return this.createMatch(bff, exact, exactCandidates.length === 1 ? "high" : "low", exactCandidates.length === 1
-          ? "HTTP method and normalized path exact match"
-          : `Ambiguous exact match: ${exactCandidates.length} BE endpoints share the normalized method/path`);
-      }
-      if (suffix) {
-        return this.createMatch(bff, suffix, suffixCandidates.length === 1 ? "medium" : "low", suffixCandidates.length === 1
-          ? "HTTP method and normalized path suffix/prefix match"
-          : `Ambiguous suffix/prefix match: ${suffixCandidates.length} BE endpoints are candidates`);
-      }
       return {
         bffEndpoint: `${method} ${path}`,
         bffController: bff.className,
         bffHandler: bff.handlerMethod,
         confidence: "unmatched",
-        matchReason: "No BE endpoint matched by method and normalized path"
+        matchReason: "No extracted BFF outbound call is available; public BFF endpoint paths are not used as BE target evidence"
       };
     });
   }
@@ -69,9 +59,9 @@ export class BffToBeMatcher {
     const exact = exactCandidates[0];
     const suffix = suffixCandidates[0];
     const base = {
-      bffEndpoint: call.sourceEndpoint ?? `${method} ${path}`,
-      bffController: call.client,
-      bffHandler: call.method,
+      bffEndpoint: normalizeEndpointKey(call.sourceEndpoint) ?? `${method} ${path}`,
+      bffController: call.sourceController ?? call.client,
+      bffHandler: call.sourceHandler ?? call.sourceMethod ?? call.method,
       bffOutboundCall: `${method} ${path}`,
       bffClient: call.client
     };
@@ -107,16 +97,9 @@ export class BffToBeMatcher {
     };
   }
 
-  private createMatch(bff: SpringEndpointForTrace, be: SpringEndpointForTrace, confidence: "high" | "medium" | "low", reason: string): BffToBeMatch {
-    return {
-      bffEndpoint: `${normalizeMethod(bff.httpMethod)} ${normalizeHttpPath(bff.path)}`,
-      bffController: bff.className,
-      bffHandler: bff.handlerMethod,
-      beEndpoint: `${normalizeMethod(be.httpMethod)} ${normalizeHttpPath(be.path)}`,
-      beController: be.className,
-      beHandler: be.handlerMethod,
-      confidence,
-      matchReason: reason
-    };
-  }
+}
+
+function normalizeEndpointKey(value: string | undefined): string | undefined {
+  const match = value?.trim().match(/^([A-Za-z]+)\s+(.+)$/);
+  return match ? `${normalizeMethod(match[1])} ${normalizeHttpPath(match[2])}` : undefined;
 }

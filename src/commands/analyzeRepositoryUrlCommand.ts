@@ -14,11 +14,13 @@ import { generateAllLocalDocs } from "../docs/localDocsBatchGenerator";
 import { parseBitbucketUrl } from "../git/bitbucketUrlParser";
 import { getDefaultBranch, resolveBranch } from "../git/branchResolver";
 import { GitService } from "../git/gitService";
-import { LocalStorageService } from "../storage/localStorageService";
+import { assertPathContainedForWrite, LocalStorageService } from "../storage/localStorageService";
 import { ManifestService } from "../storage/manifestService";
 import { AnalysisStateService } from "../storage/analysisStateService";
 import { writeJsonl } from "../storage/jsonlWriter";
+import { atomicWriteFile } from "../storage/atomicFile";
 import { Logger } from "../utils/logger";
+import { repositoryUrlForArtifact } from "../utils/repositoryUrl";
 
 export class AnalyzeRepositoryUrlCommand {
   constructor(
@@ -86,12 +88,15 @@ export class AnalyzeRepositoryUrlCommand {
         progress.report({ message: "Preparing local repository..." });
         const parsed = parseBitbucketUrl(repoUrl, branch);
         const targetDir = path.join(this.storage.getCloneRoot(), parsed.safeFolderName);
+        await fsSafeCloneRoot(this.storage.getCloneRoot(), targetDir);
 
         progress.report({ message: `Cloning or updating ${branch}...` });
         await this.gitService.cloneOrUpdate(repoUrl, branch, targetDir);
+        await fsSafeCloneRoot(this.storage.getCloneRoot(), targetDir);
 
         progress.report({ message: "Creating .ai-docs folder..." });
         const aiDocsPath = await this.storage.ensureAiDocs(targetDir);
+        await fs.rm(path.join(aiDocsPath, "manifest.json"), { force: true });
 
         progress.report({ message: "Scanning Java Spring files..." });
         const files = await this.scanner.scan(targetDir);
@@ -111,7 +116,10 @@ export class AnalyzeRepositoryUrlCommand {
           kind: file.kind,
           classification: file.classification,
           extension: file.extension,
-          size: file.size
+          size: file.size,
+          modulePath: file.modulePath,
+          sourceSet: file.sourceSet,
+          sourceRoot: file.sourceRoot
         })));
         await writeJsonl(path.join(aiDocsPath, "spring-components.jsonl"), components);
         await writeJsonl(path.join(aiDocsPath, "api-endpoints.jsonl"), endpoints);
@@ -130,7 +138,7 @@ export class AnalyzeRepositoryUrlCommand {
           endpoints,
           entities
         });
-        await fs.writeFile(path.join(aiDocsPath, "repo-map.md"), repoMap, "utf8");
+        await atomicWriteFile(path.join(aiDocsPath, "repo-map.md"), repoMap);
         await new ManifestService().write(aiDocsPath, {
           repositoryUrl: repoUrl,
           repositoryName: parsed.repo,
@@ -149,7 +157,7 @@ export class AnalyzeRepositoryUrlCommand {
         progress.report({ message: "Generating local documentation..." });
         const localDocs = await generateAllLocalDocs(aiDocsPath);
 
-        this.logger.info(`Analyzed ${repoUrl} branch ${branch}. Indexes and ${localDocs.generatedPaths.length} local docs written to ${aiDocsPath}`);
+        this.logger.info(`Analyzed ${repositoryUrlForArtifact(repoUrl)} branch ${branch}. Indexes and ${localDocs.generatedPaths.length} local docs written to ${aiDocsPath}`);
         result = { repoRoot: targetDir, aiDocsPath, indexedFiles: files.length };
         vscode.window.showInformationMessage(`Bank Spring Docs: Analiz tamamlandı. ${files.length} dosya indekslendi.`);
       }
@@ -159,4 +167,10 @@ export class AnalyzeRepositoryUrlCommand {
     }
     return result;
   }
+}
+
+async function fsSafeCloneRoot(cloneRoot: string, targetDir: string): Promise<void> {
+  await fs.mkdir(cloneRoot, { recursive: true });
+  await assertPathContainedForWrite(cloneRoot, targetDir);
+  await assertPathContainedForWrite(cloneRoot, path.join(targetDir, ".git"));
 }

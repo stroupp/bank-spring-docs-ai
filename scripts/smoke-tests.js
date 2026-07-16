@@ -31,6 +31,7 @@ const { normalizeHttpPath } = require("../dist/analyzer/traceability/pathNormali
 const { UiToBffMatcher } = require("../dist/analyzer/traceability/uiToBffMatcher");
 
 async function main() {
+  await testAiProviderConfigurationAndUi();
   testBeServiceFlowUsesMethodCalls();
   await testFocusedSourceUsesStructuredSnippets();
   testEvidenceSelectionSkipsLowConfidenceEntities();
@@ -41,6 +42,36 @@ async function main() {
   testQwenPromptVersion();
   testTraceabilityPathNormalizationAndAmbiguity();
   console.log("Smoke tests passed.");
+}
+
+async function testAiProviderConfigurationAndUi() {
+  const packageJson = JSON.parse(await fs.readFile(path.join(__dirname, "..", "package.json"), "utf8"));
+  const properties = packageJson.contributes.configuration.properties;
+  assert.strictEqual(properties["bankSpringDocs.ai.provider"].default, "copilot");
+  assert.deepStrictEqual(properties["bankSpringDocs.ai.provider"].enum, ["copilot", "qwen"]);
+  assert.strictEqual(properties["bankSpringDocs.qwen.generationTimeoutSeconds"].default, 600);
+  assert.strictEqual(properties["bankSpringDocs.qwen.generationMaxTokens"].default, 16384);
+  assert.strictEqual(properties["bankSpringDocs.qwen.contextWindowTokens"].default, 131072);
+  assert.strictEqual(properties["bankSpringDocs.qwen.bankingEnvironment"].default, false);
+  assert.strictEqual(properties["bankSpringDocs.qwen.endpoint"].scope, "machine");
+  assert.deepStrictEqual(properties["bankSpringDocs.qwen.allowedHosts"].default, ["localhost", "127.0.0.1", "::1"]);
+
+  for (const relativePath of [
+    "src/views/bankSpringDocsViewProvider.ts",
+    "src/views/bankSpringDocsPanel.ts"
+  ]) {
+    const source = await fs.readFile(path.join(__dirname, "..", relativePath), "utf8");
+    assert.match(source, /id="aiProviderSelect"/);
+    assert.match(source, /saveAiProvider/);
+    assert.match(source, /Qwen \(Yapılandırılmış Endpoint\)/);
+    assert.match(source, /id="qwenBankingEnvironment"[^>]*type="checkbox"/);
+    assert.match(source, /Banking environment \(ONIKS \/ internal vLLM\)/);
+    assert.match(source, /bankingEnvironment: qwenBankingEnvironment\.checked/);
+    assert.match(source, /qwenBankingEnvironment\.checked = Boolean\(message\.qwen\.bankingEnvironment\)/);
+    assert.match(source, /qwenModel\.value = "ONIKS"/);
+    assert.match(source, /qwenEnabled\.checked = true/);
+    assert.match(source, /qwenUseApiKey\.checked = false/);
+  }
 }
 
 function testBeServiceFlowUsesMethodCalls() {
@@ -330,7 +361,7 @@ async function testQualityScorerUnknownData() {
 }
 
 function testQwenPromptVersion() {
-  assert.strictEqual(pageSemanticPromptVersion, "page-analysis-semantic-v2");
+  assert.strictEqual(pageSemanticPromptVersion, "page-analysis-semantic-v3");
 }
 
 function testTraceabilityPathNormalizationAndAmbiguity() {

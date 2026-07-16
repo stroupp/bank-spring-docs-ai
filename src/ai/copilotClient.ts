@@ -1,48 +1,25 @@
 import * as vscode from "vscode";
+import {
+  DocumentationModelInfo,
+  DocumentationModelProgressHandler,
+  DocumentationModelRequest,
+  DocumentationModelResponse,
+  DocumentationModelUsage,
+  IDocumentationModelClient
+} from "./documentationModelClient";
 
-export interface CopilotUsageEstimate {
-  inputCharacters: number;
-  outputCharacters: number;
-  estimatedInputTokens: number;
-  estimatedOutputTokens: number;
-  estimatedTotalTokens: number;
-  modelCountedInputTokens?: number;
-}
-
-export interface CopilotResponseWithUsage {
-  text: string;
-  usage: CopilotUsageEstimate;
-  model: CopilotModelInfo;
-}
-
-export interface CopilotModelInfo {
-  id: string;
-  name: string;
-  vendor: string;
-  family: string;
-  version: string;
-  maxInputTokens: number;
-}
-
-export type CopilotProgressHandler = (usage: CopilotUsageEstimate) => void;
-
-export interface CopilotChatRequest {
-  instructions?: string;
-  userPrompt: string;
-  combinedText?: string;
-}
+export type CopilotUsageEstimate = DocumentationModelUsage;
+export type CopilotResponseWithUsage = DocumentationModelResponse;
+export type CopilotModelInfo = DocumentationModelInfo;
+export type CopilotProgressHandler = DocumentationModelProgressHandler;
+export type CopilotChatRequest = DocumentationModelRequest;
 
 /** Boundary around the VS Code Language Model API. */
-export interface ICopilotClient {
-  send(
-    prompt: string | CopilotChatRequest,
-    token: vscode.CancellationToken,
-    onProgress?: CopilotProgressHandler
-  ): Promise<CopilotResponseWithUsage>;
-}
+export interface ICopilotClient extends IDocumentationModelClient {}
 
 /** Production adapter. Automated tests inject ICopilotClient and never load vscode.lm. */
 export class RealCopilotClient implements ICopilotClient {
+  readonly provider = "copilot" as const;
   private pinnedModelPromise: Promise<vscode.LanguageModelChat> | undefined;
 
   async send(
@@ -130,7 +107,7 @@ async function sendWithVsCodeLanguageModel(
     }
     const usage = buildUsage(usageText.length, output.length, modelCountedInputTokens);
     onProgress?.(usage);
-    return { text: output, usage, model: modelInfo };
+    return { text: output, usage, model: modelInfo, provider: "copilot" };
   } catch (error) {
     if (token.isCancellationRequested) {
       throw new Error("Copilot request was cancelled.");

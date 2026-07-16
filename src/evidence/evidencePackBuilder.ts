@@ -6,6 +6,7 @@ import { sourceContextFromFiles } from "../docs/focusedSourceContext";
 import { buildPageArtifactMetadata } from "../pageanalysis/pageArtifactMetadata";
 import { selectPageEvidenceFiles } from "./pageEvidenceSelector";
 import { buildPageEvidenceSnippets, EvidenceSnippet, EvidenceSnippetGroup } from "./sourceSnippetExtractors";
+import { atomicWriteFile } from "../storage/atomicFile";
 
 export interface EvidencePackResult {
   evidencePackPath: string;
@@ -25,7 +26,7 @@ export class EvidencePackBuilder {
 
     if (!includeSourceEvidence) {
       const metadata = await buildPageArtifactMetadata(pageRoot, ["page-flow.json", "page-context-pack.md"]);
-      await fs.writeFile(evidencePackPath, `# Page Evidence Pack\n\n## Metadata\n\n\`\`\`json\n${JSON.stringify(metadata, null, 2)}\n\`\`\`\n\nKaynak kaniti ayarlardan kapali.\n`, "utf8");
+      await atomicWriteFile(evidencePackPath, `# Page Evidence Pack\n\n## Metadata\n\n\`\`\`json\n${JSON.stringify(metadata, null, 2)}\n\`\`\`\n\nKaynak kaniti ayarlardan kapali.\n`);
       return { evidencePackPath, includedFiles: [] };
     }
 
@@ -111,7 +112,7 @@ export class EvidencePackBuilder {
     sections.push("", "## Uncertainties");
     sections.push(...(uncertainties.length ? uncertainties.map((note) => `- ${note}`) : ["- No exact-snippet uncertainty recorded."]));
 
-    await fs.writeFile(evidencePackPath, sections.join("\n"), "utf8");
+    await atomicWriteFile(evidencePackPath, sections.join("\n"));
     return { evidencePackPath, includedFiles };
   }
 }

@@ -1,12 +1,17 @@
 import * as vscode from "vscode";
+import type { QwenConnectionResult } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
 import { AnalyzeRepositoryUrlCommand } from "../commands/analyzeRepositoryUrlCommand";
 import { getDefaultBranch } from "../git/branchResolver";
 import { MultiRepoInput, MultiRepoManifest, MultiRepoManifestService } from "../multirepo/multiRepoManifestService";
 import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
 
+type AiProvider = "copilot" | "qwen";
+type AiProviderUiValue = AiProvider | "invalid";
+
 type QwenUiSettings = {
   enabled: boolean;
+  bankingEnvironment: boolean;
   endpoint: string;
   model: string;
   temperature: number;
@@ -23,8 +28,11 @@ type WebviewMessage =
   | { type: "ready" }
   | { type: "analyze"; repoUrl: string; branch: string }
   | { type: "command"; command: string }
+  | { type: "saveAiProvider"; provider: AiProvider }
   | { type: "saveCopilotModel"; modelId: string }
   | { type: "saveMultiRepoAgenticQwenFlag"; enabled: boolean }
+  | { type: "savePageAnalysisQwenOnly"; enabled: boolean }
+  | { type: "runFullSelectedPageAnalysis"; qwenOnly: boolean }
   | { type: "saveMultiRepoManifest"; input: MultiRepoInput }
   | { type: "cloneOrUpdateMultiRepos"; input: MultiRepoInput }
   | { type: "analyzeMultiReposLocally" }
@@ -37,13 +45,24 @@ type WebviewMessage =
 
 export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "bankSpringDocs.dashboard";
+  private webviewView: vscode.WebviewView | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly analyzeCommand: AnalyzeRepositoryUrlCommand
-  ) {}
+  ) {
+    this.context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+      if ((
+        event.affectsConfiguration("bankSpringDocs.ai.provider")
+        || event.affectsConfiguration("bankSpringDocs.pageAnalysis.qwenOnly")
+      ) && this.webviewView) {
+        this.postSettings(this.webviewView);
+      }
+    }));
+  }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.webviewView = webviewView;
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.context.extensionUri]
@@ -51,6 +70,11 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.getHtml();
     webviewView.webview.onDidReceiveMessage((message: WebviewMessage) => this.handleMessage(webviewView, message));
+    webviewView.onDidDispose(() => {
+      if (this.webviewView === webviewView) {
+        this.webviewView = undefined;
+      }
+    });
   }
 
   private async handleMessage(webviewView: vscode.WebviewView, message: WebviewMessage): Promise<void> {
@@ -146,9 +170,54 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (message.type === "command") {
-      await vscode.commands.executeCommand(message.command);
-      if (message.command === "bankSpringDocs.buildPageList") {
-        this.postSelectedPage(webviewView);
+      try {
+        await vscode.commands.executeCommand(message.command);
+        if (message.command === "bankSpringDocs.buildPageList") {
+          this.postSelectedPage(webviewView);
+        }
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "error",
+          message: `Komut tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+      return;
+    }
+
+    if (message.type === "runFullSelectedPageAnalysis") {
+      webviewView.webview.postMessage({ type: "pageAnalysisRunState", running: true });
+      try {
+        await vscode.commands.executeCommand("bankSpringDocs.runFullSelectedPageAnalysis", {
+          qwenOnly: Boolean(message.qwenOnly)
+        });
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "error",
+          message: `Komut tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`
+        });
+      } finally {
+        webviewView.webview.postMessage({ type: "pageAnalysisRunState", running: false });
+      }
+      return;
+    }
+
+    if (message.type === "saveAiProvider") {
+      if (message.provider !== "copilot" && message.provider !== "qwen") {
+        webviewView.webview.postMessage({ type: "error", message: "Geçersiz AI doküman sağlayıcısı seçildi." });
+        return;
+      }
+      try {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update("ai.provider", message.provider, vscode.ConfigurationTarget.Global);
+        this.postSettings(webviewView);
+        webviewView.webview.postMessage({
+          type: "aiProviderSaved",
+          message: `AI doküman sağlayıcısı ${message.provider === "qwen" ? "Qwen" : "GitHub Copilot"} olarak kaydedildi.`
+        });
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "error",
+          message: `AI doküman sağlayıcısı kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
       }
       return;
     }
@@ -166,6 +235,19 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (message.type === "savePageAnalysisQwenOnly") {
+      try {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update("pageAnalysis.qwenOnly", Boolean(message.enabled), vscode.ConfigurationTarget.Global);
+        this.postSettings(webviewView);
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "error",
+          message: `Qwen3-only sayfa ayari kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+      return;
+    }
+
     if (message.type === "saveQwenSettings") {
       await vscode.commands.executeCommand("bankSpringDocs.saveQwenSettings", message.settings);
       this.postSettings(webviewView);
@@ -173,7 +255,29 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (message.type === "testQwenConnection") {
-      await vscode.commands.executeCommand("bankSpringDocs.testQwenConnection", message.settings);
+      webviewView.webview.postMessage({
+        type: "qwenTestResult",
+        testing: true,
+        message: "Qwen endpoint'ine kısa test isteği gönderiliyor..."
+      });
+      try {
+        const result = await vscode.commands.executeCommand<QwenConnectionResult>("bankSpringDocs.testQwenConnection", message.settings);
+        webviewView.webview.postMessage({
+          type: "qwenTestResult",
+          testing: false,
+          ok: result?.ok ?? false,
+          message: result?.message ?? "Qwen bağlantı testi sonuç döndürmedi.",
+          model: result?.model,
+          endpoint: result?.endpoint
+        });
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "qwenTestResult",
+          testing: false,
+          ok: false,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
       this.postSettings(webviewView);
       return;
     }
@@ -201,7 +305,9 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
   private postSettings(webviewView: vscode.WebviewView): void {
     const config = vscode.workspace.getConfiguration("bankSpringDocs");
-    this.getCopilotModels().then((models) => {
+    const provider = normalizeAiProvider(config.get<string>("ai.provider", "copilot"));
+    const modelsPromise = provider === "copilot" ? this.getCopilotModels() : Promise.resolve([]);
+    modelsPromise.then((models) => {
       webviewView.webview.postMessage({
         type: "copilotModels",
         selectedModelId: config.get<string>("copilot.modelId", ""),
@@ -211,6 +317,9 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.postMessage({
       type: "settings",
       defaultBranch: getDefaultBranch(),
+      ai: {
+        provider
+      },
       qwen: new QwenSettingsService(this.context).getSettings(),
       semantic: {
         cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
@@ -219,6 +328,9 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       },
       multiRepo: {
         agenticRunQwenSemantics: config.get<boolean>("multiRepo.agenticRunQwenSemantics", true)
+      },
+      pageAnalysis: {
+        qwenOnly: config.get<boolean>("pageAnalysis.qwenOnly", false)
       }
     });
   }
@@ -550,6 +662,18 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       </div>
     </section>
 
+    <section class="section">
+      <label>
+        AI Doküman Sağlayıcısı
+        <select id="aiProviderSelect">
+          <option value="invalid" disabled>Geçersiz sağlayıcı ayarı</option>
+          <option value="copilot">GitHub Copilot</option>
+          <option value="qwen">Qwen (Yapılandırılmış Endpoint)</option>
+        </select>
+      </label>
+      <div class="muted">Seçim, tüm AI destekli doküman üretim adımlarında kullanılır. Yerel analiz adımları değişmez.</div>
+    </section>
+
     <nav class="tabs" aria-label="Analiz sekmeleri">
       <button class="tabButton active" data-tab="springTab" type="button">Spring Repo</button>
       <button class="tabButton" data-tab="multiRepoTab" type="button">UI - BFF - BE</button>
@@ -599,19 +723,19 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
       <div class="scenario">
         <div class="scenarioHeader">
-          <h2>Copilot</h2>
-          <div class="muted">Kompakt context ile AI doküman üretir.</div>
+          <h2>AI Dokümantasyon</h2>
+          <div class="muted">Kompakt context ile seçili sağlayıcı üzerinden AI dokümanı üretir.</div>
         </div>
         <label>
-          Model
+          Copilot Modeli (yalnızca Copilot seçiliyken)
           <select id="copilotModelSelect">
             <option value="">Varsayılan kullanılacak</option>
           </select>
         </label>
         <div class="buttonGrid">
           <button data-command="bankSpringDocs.generateAgenticCopilotBackendDocs">Agentic Backend Analizi Başlat</button>
-          <button data-command="bankSpringDocs.generateAllCopilotDocs">Tüm Copilot Dokümanları</button>
-          <button class="secondary" data-command="bankSpringDocs.runCopilotDiagnostics">Tanılama Testi</button>
+          <button data-command="bankSpringDocs.generateAllCopilotDocs">Tüm AI Dokümanları</button>
+          <button class="secondary" data-command="bankSpringDocs.runCopilotDiagnostics">Copilot Tanılama Testi</button>
           <button class="secondary" data-command="bankSpringDocs.openLastCopilotContext">Son Context'i Aç</button>
           <button class="secondary" data-command="bankSpringDocs.openLastCopilotPrompt">Son Prompt'u Aç</button>
         </div>
@@ -686,19 +810,24 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
             <span id="selectedPageStatus">Henüz sayfa seçilmedi</span>
           </div>
         </div>
+        <label class="checkLabel">
+          <input id="pageAnalysisQwenOnly" type="checkbox">
+          Bu sayfanın tüm AI adımlarını yalnızca Qwen3 ile çalıştır
+        </label>
+        <div class="muted">Yalnızca tam sayfa analizi için geçerlidir; global AI sağlayıcısı ve Copilot akışı değişmez.</div>
         <div class="buttonGrid">
           <button class="secondary" data-command="bankSpringDocs.buildPageList">Sayfa Listesini Yenile</button>
           <button class="secondary" data-command="bankSpringDocs.analyzeSelectedPage">Seçili Sayfayı Analiz Et</button>
           <button class="secondary" data-command="bankSpringDocs.openSelectedPageContextPack">Context Paketini Aç</button>
           <button class="secondary" data-command="bankSpringDocs.openSelectedPageEvidencePack">Evidence Paketini Aç</button>
           <button class="secondary" data-command="bankSpringDocs.generateSelectedPageQwenSemantics">Qwen Semantiği Oluştur</button>
-          <button class="secondary" data-command="bankSpringDocs.generateSelectedPageCopilotDraft">Copilot Taslak Oluştur</button>
+          <button class="secondary" data-command="bankSpringDocs.generateSelectedPageCopilotDraft">AI Taslak Oluştur</button>
           <button class="secondary" data-command="bankSpringDocs.detectSelectedPageDocumentGaps">Gap Analizi Yap</button>
           <button class="secondary" data-command="bankSpringDocs.repairSelectedPageDocumentGaps">Gap Repair Çalıştır</button>
           <button class="secondary" data-command="bankSpringDocs.buildFinalSelectedPageDocument">Final Dokümanı Oluştur</button>
           <button class="secondary" data-command="bankSpringDocs.scoreSelectedPageDocument">Kalite Skoru Oluştur</button>
           <button class="secondary" data-command="bankSpringDocs.openFinalSelectedPageDocument">Final Dokümanı Aç</button>
-          <button data-command="bankSpringDocs.runFullSelectedPageAnalysis">Tüm Sayfa Analizini Çalıştır</button>
+          <button id="runFullSelectedPageAnalysisButton" type="button">Tüm Sayfa Analizini Çalıştır</button>
         </div>
       </section>
 
@@ -719,15 +848,20 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       <div class="modalHeader">
         <div>
           <h2>Qwen Ayarları</h2>
-          <div class="muted">Endpoint, API key ve cache ayarları.</div>
+          <div class="muted">Endpoint, API key ve semantik cache ayarları. Onaylı host listesi ile uzun AI doküman üretim limitleri VS Code makine ayarlarındadır.</div>
         </div>
         <button class="iconButton ghost" id="closeQwenSettingsButton" type="button">×</button>
       </div>
       <div class="modalBody">
         <label class="checkLabel">
           <input id="qwenEnabled" type="checkbox">
-          Qwen semantik analiz aktif
+          Qwen entegrasyonu aktif (semantik analiz ve AI doküman üretimi)
         </label>
+        <label class="checkLabel">
+          <input id="qwenBankingEnvironment" type="checkbox">
+          Banking environment (ONIKS / internal vLLM)
+        </label>
+        <div class="muted">Bu mod model adını ONIKS yapar ve API key kullanımını kapatır. Aşağıdaki alana bankanın tam OpenAI-compatible <code>/v1/chat/completions</code> URL'sini yapıştırabilirsin.</div>
         <label>
           Qwen Endpoint
           <input id="qwenEndpoint" type="text" placeholder="https://dashscope-intl.aliyuncs.com/compatible-mode/v1">
@@ -741,11 +875,11 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
           <input id="qwenTemperature" type="number" min="0" max="2" step="0.1">
         </label>
         <label>
-          Max Token
+          Semantik Max Token
           <input id="qwenMaxTokens" type="number" min="256" step="256">
         </label>
         <label>
-          Timeout
+          Semantik Timeout
           <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
         </label>
         <label class="checkLabel">
@@ -768,6 +902,8 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
           Dosya başına maksimum karakter
           <input id="semanticMaxCharactersPerFile" type="number" min="1000" step="1000">
         </label>
+        <div class="muted">Bağlantı testi, bu formdaki ayarlarla Qwen'e gerçek ve kısa bir OpenAI-compatible istek gönderir; sonucu başarı veya hata olarak gösterir.</div>
+        <div class="muted" id="qwenTestResult" role="status" aria-live="polite">Henüz bağlantı testi çalıştırılmadı.</div>
       </div>
       <div class="modalFooter">
         <button class="secondary" id="testQwenButton" type="button">Qwen Bağlantısını Test Et</button>
@@ -783,6 +919,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     const branch = document.getElementById("branch");
     const analyzeButton = document.getElementById("analyzeButton");
     const status = document.getElementById("status");
+    const aiProviderSelect = document.getElementById("aiProviderSelect");
     const copilotModelSelect = document.getElementById("copilotModelSelect");
     const multiProjectName = document.getElementById("multiProjectName");
     const multiBranch = document.getElementById("multiBranch");
@@ -803,12 +940,15 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     const multiBeStatus = document.getElementById("multiBeStatus");
     const multiTraceabilityStatus = document.getElementById("multiTraceabilityStatus");
     const selectedPageStatus = document.getElementById("selectedPageStatus");
+    const pageAnalysisQwenOnly = document.getElementById("pageAnalysisQwenOnly");
+    const runFullSelectedPageAnalysisButton = document.getElementById("runFullSelectedPageAnalysisButton");
     const defaultBranch = document.getElementById("defaultBranch");
     const qwenModal = document.getElementById("qwenModal");
     const openQwenSettingsButton = document.getElementById("openQwenSettingsButton");
     const closeQwenSettingsButton = document.getElementById("closeQwenSettingsButton");
     const quickTestQwenButton = document.getElementById("quickTestQwenButton");
     const qwenEnabled = document.getElementById("qwenEnabled");
+    const qwenBankingEnvironment = document.getElementById("qwenBankingEnvironment");
     const qwenEndpoint = document.getElementById("qwenEndpoint");
     const qwenModel = document.getElementById("qwenModel");
     const qwenTemperature = document.getElementById("qwenTemperature");
@@ -819,6 +959,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     const semanticCacheEnabled = document.getElementById("semanticCacheEnabled");
     const semanticMaxFilesPerRun = document.getElementById("semanticMaxFilesPerRun");
     const semanticMaxCharactersPerFile = document.getElementById("semanticMaxCharactersPerFile");
+    const qwenTestResult = document.getElementById("qwenTestResult");
     const testQwenButton = document.getElementById("testQwenButton");
     const saveQwenButton = document.getElementById("saveQwenButton");
 
@@ -918,9 +1059,34 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       qwenModal.classList.toggle("open", open);
     }
 
+    function applyBankingEnvironmentState(enabled, applyDefaults = false) {
+      if (enabled) {
+        qwenEnabled.checked = true;
+        qwenModel.value = "ONIKS";
+        qwenUseApiKey.checked = false;
+        qwenApiKey.value = "";
+        if (applyDefaults) {
+          qwenTemperature.value = "0.6";
+          qwenMaxTokens.value = "163849";
+        }
+      }
+      qwenModel.disabled = enabled;
+      qwenUseApiKey.disabled = enabled;
+      qwenApiKey.disabled = enabled;
+    }
+
+    function renderQwenTestResult(testing, ok, message, model, endpoint) {
+      testQwenButton.disabled = Boolean(testing);
+      quickTestQwenButton.disabled = Boolean(testing);
+      const prefix = testing ? "Test ediliyor: " : ok ? "Başarılı: " : "Başarısız: ";
+      const details = [model, endpoint].filter(Boolean).join(" · ");
+      qwenTestResult.textContent = prefix + message + (details ? " (" + details + ")" : "");
+    }
+
     function readQwenSettings() {
       return {
         enabled: qwenEnabled.checked,
+        bankingEnvironment: qwenBankingEnvironment.checked,
         endpoint: qwenEndpoint.value,
         model: qwenModel.value,
         temperature: Number(qwenTemperature.value || "0.1"),
@@ -940,12 +1106,25 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: "analyze", repoUrl: repoUrl.value, branch: branch.value });
     });
 
+    aiProviderSelect.addEventListener("change", () => {
+      vscode.postMessage({ type: "saveAiProvider", provider: aiProviderSelect.value });
+    });
+
     copilotModelSelect.addEventListener("change", () => {
       vscode.postMessage({ type: "saveCopilotModel", modelId: copilotModelSelect.value });
     });
 
     agenticRunQwenSemantics.addEventListener("change", () => {
       vscode.postMessage({ type: "saveMultiRepoAgenticQwenFlag", enabled: agenticRunQwenSemantics.checked });
+    });
+
+    pageAnalysisQwenOnly.addEventListener("change", () => {
+      vscode.postMessage({ type: "savePageAnalysisQwenOnly", enabled: pageAnalysisQwenOnly.checked });
+    });
+
+    runFullSelectedPageAnalysisButton.addEventListener("click", () => {
+      runFullSelectedPageAnalysisButton.disabled = true;
+      vscode.postMessage({ type: "runFullSelectedPageAnalysis", qwenOnly: pageAnalysisQwenOnly.checked });
     });
 
     tabButtons.forEach((button) => {
@@ -1002,11 +1181,18 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    qwenBankingEnvironment.addEventListener("change", () => {
+      applyBankingEnvironmentState(qwenBankingEnvironment.checked, true);
+    });
+
     quickTestQwenButton.addEventListener("click", () => {
+      setModalOpen(true);
+      renderQwenTestResult(true, false, "Qwen endpoint'ine kısa istek gönderiliyor.");
       vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
     });
 
     testQwenButton.addEventListener("click", () => {
+      renderQwenTestResult(true, false, "Qwen endpoint'ine kısa istek gönderiliyor.");
       vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
     });
 
@@ -1027,17 +1213,26 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       if (message.type === "settings") {
         defaultBranch.textContent = message.defaultBranch;
         branch.placeholder = "Boş bırakılırsa " + message.defaultBranch;
+        aiProviderSelect.value = message.ai?.provider === "qwen"
+          ? "qwen"
+          : message.ai?.provider === "copilot" ? "copilot" : "invalid";
+        copilotModelSelect.disabled = aiProviderSelect.value === "qwen";
+        if (aiProviderSelect.value === "invalid") {
+          setStatus("Ayar Hatası", "bankSpringDocs.ai.provider değeri copilot veya qwen olmalıdır.");
+        }
         if (!multiBranch.value) {
           multiBranch.value = message.defaultBranch;
         }
         if (message.qwen) {
           qwenEnabled.checked = Boolean(message.qwen.enabled);
+          qwenBankingEnvironment.checked = Boolean(message.qwen.bankingEnvironment);
           qwenEndpoint.value = message.qwen.endpoint || "";
           qwenModel.value = message.qwen.model || "";
           qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
           qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
           qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
           qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
+          applyBankingEnvironmentState(qwenBankingEnvironment.checked);
         }
         if (message.semantic) {
           semanticCacheEnabled.checked = Boolean(message.semantic.cacheEnabled);
@@ -1047,12 +1242,21 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         if (message.multiRepo) {
           agenticRunQwenSemantics.checked = Boolean(message.multiRepo.agenticRunQwenSemantics);
         }
+        if (message.pageAnalysis) {
+          pageAnalysisQwenOnly.checked = Boolean(message.pageAnalysis.qwenOnly);
+        }
       }
       if (message.type === "copilotModels") {
         renderCopilotModels(message.models || [], message.selectedModelId || "");
       }
       if (message.type === "copilotModelSaved") {
         setStatus("Copilot", message.message);
+      }
+      if (message.type === "aiProviderSaved") {
+        setStatus("AI Sağlayıcısı", message.message);
+      }
+      if (message.type === "qwenTestResult") {
+        renderQwenTestResult(message.testing, message.ok, message.message, message.model, message.endpoint);
       }
       if (message.type === "busy") {
         analyzeButton.disabled = true;
@@ -1071,6 +1275,12 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       }
       if (message.type === "selectedPage") {
         applySelectedPage(message.page);
+      }
+      if (message.type === "pageAnalysisRunState") {
+        runFullSelectedPageAnalysisButton.disabled = Boolean(message.running);
+        runFullSelectedPageAnalysisButton.textContent = message.running
+          ? "Tüm Sayfa Analizi Çalışıyor..."
+          : "Tüm Sayfa Analizini Çalıştır";
       }
       if (message.type === "multiRepoBusy") {
         saveMultiManifestButton.disabled = true;
@@ -1121,4 +1331,8 @@ function createNonce(): string {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return text;
+}
+
+function normalizeAiProvider(value: unknown): AiProviderUiValue {
+  return value === "copilot" || value === "qwen" ? value : "invalid";
 }

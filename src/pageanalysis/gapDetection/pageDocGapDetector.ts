@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { writeJsonl } from "../../storage/jsonlWriter";
+import { readJsonl, writeJsonl } from "../../storage/jsonlWriter";
+import { atomicWriteJson } from "../../storage/atomicFile";
 import { sha256 } from "../../utils/hash";
 
 export type PageDocGap = {
@@ -74,7 +75,7 @@ export class PageDocGapDetector {
     }
 
     const deduped = dedupeGaps(gaps);
-    await fs.writeFile(path.join(pageRoot, "detected-gaps.json"), `${JSON.stringify(deduped, null, 2)}\n`, "utf8");
+    await atomicWriteJson(path.join(pageRoot, "detected-gaps.json"), deduped);
     await appendGapAudit(multiRepoRoot, deduped);
     return deduped;
   }
@@ -153,8 +154,11 @@ function sourceReferenceCount(markdown: string): number {
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {};
+    }
+    throw error;
   }
 }
 
@@ -165,11 +169,7 @@ async function appendGapAudit(multiRepoRoot: string, gaps: PageDocGap[]): Promis
 }
 
 async function readExistingJsonl(filePath: string): Promise<unknown[]> {
-  try {
-    return (await fs.readFile(filePath, "utf8")).split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-  } catch {
-    return [];
-  }
+  return readJsonl(filePath);
 }
 
 function normalizeHeading(value: string): string {

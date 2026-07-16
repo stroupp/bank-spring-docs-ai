@@ -57,6 +57,7 @@ function fixturePageFlow() {
 }
 
 async function writeReport(content) {
+  if (process.env.BANK_SPRING_DOCS_WRITE_TEST_REPORTS === "0") return;
   const file = path.join(root, ".ai-docs", "dev-audits", "evidence-fixture-report.md");
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, content, "utf8");

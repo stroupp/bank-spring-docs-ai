@@ -4,7 +4,13 @@ import * as path from "path";
 import { ContextPackBuilder } from "../analyzer/contextPackBuilder";
 import { buildCopilotDocumentationRequest } from "../ai/prompts";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
-import { askCopilotWithUsage, CopilotModelInfo, CopilotUsageEstimate } from "../ai/copilotClient";
+import { RealCopilotClient } from "../ai/copilotClient";
+import {
+  DocumentationModelInfo,
+  DocumentationModelProvider,
+  DocumentationModelUsage,
+  IDocumentationModelClient
+} from "../ai/documentationModelClient";
 import { LocalDocumentKind } from "./localDocumentationGenerator";
 import { MarkdownWriter } from "./markdownWriter";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
@@ -25,7 +31,8 @@ const documentMeta: Record<LocalDocumentKind, { fileName: string; title: string 
 export class CopilotDocumentationGenerator {
   constructor(
     private readonly contextPackBuilder = new ContextPackBuilder(),
-    private readonly markdownWriter = new MarkdownWriter()
+    private readonly markdownWriter = new MarkdownWriter(),
+    private readonly client: IDocumentationModelClient = new RealCopilotClient()
   ) {}
 
   async generate(
@@ -34,7 +41,7 @@ export class CopilotDocumentationGenerator {
     branch: string,
     kind: LocalDocumentKind,
     token: vscode.CancellationToken,
-    onProgress?: (message: string, usage: CopilotUsageEstimate) => void
+    onProgress?: (message: string, usage: DocumentationModelUsage) => void
   ): Promise<string> {
     const meta = documentMeta[kind];
     const rawContext = await this.contextPackBuilder.buildForDocumentWithMetadata(aiDocsPath, kind);
@@ -44,17 +51,22 @@ export class CopilotDocumentationGenerator {
     const shouldContinue = await this.confirmContextPreview(aiDocsPath, kind, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, contextPackPath);
     if (!shouldContinue) {
       await this.audit(aiDocsPath, kind, repositoryName, branch, contextPackPath, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, "cancelled", undefined, undefined, undefined, undefined, false, false, undefined, undefined, undefined, undefined, contextSelectionPath);
-      throw new Error("Copilot isteği kullanıcı tarafından iptal edildi.");
+      throw new Error(`${providerDisplayName(this.client.provider)} isteği kullanıcı tarafından iptal edildi.`);
     }
 
     const prompt = buildCopilotDocumentationRequest(meta.title, safe.text);
     const promptPackPath = await this.writePromptPack(aiDocsPath, kind, prompt.combinedText);
     const startedAt = Date.now();
+    let responseReceived = false;
     try {
-      onProgress?.(`Copilot isteği başladı (${prompt.profile})`, estimateUsage(prompt.combinedText.length, 0));
-      const response = await askCopilotWithUsage(prompt, token, (usage) => {
+      onProgress?.(`${providerDisplayName(this.client.provider)} isteği başladı (${prompt.profile})`, estimateUsage(prompt.combinedText.length, 0));
+      const response = await this.client.send(prompt, token, (usage) => {
         onProgress?.(formatUsageProgress(kind, usage), usage);
       });
+      responseReceived = true;
+      if (!response.text.trim()) {
+        throw new Error(`${providerDisplayName(response.provider ?? this.client.provider ?? "copilot")} boş doküman yanıtı döndürdü.`);
+      }
       const output = await this.markdownWriter.write(
         aiDocsPath,
         meta.fileName,
@@ -63,12 +75,16 @@ export class CopilotDocumentationGenerator {
         branch,
         response.text,
         "copiloted-generated-docs",
-        "Bank Spring Docs AI via GitHub Copilot Language Model API"
+        modelAttribution(response.provider ?? this.client.provider ?? "copilot", response.model.name)
       );
-      await this.audit(aiDocsPath, kind, repositoryName, branch, contextPackPath, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, "success", undefined, response.usage, response.model, startedAt, true, true, prompt.profile, prompt.instructions.length, prompt.userPrompt.length, promptPackPath, contextSelectionPath);
+      await this.audit(aiDocsPath, kind, repositoryName, branch, contextPackPath, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, "success", undefined, response.usage, response.model, startedAt, true, true, prompt.profile, prompt.instructions.length, prompt.userPrompt.length, promptPackPath, contextSelectionPath, resolveProvider(response.provider, this.client.provider), response.finishReason, response.requestId);
       return output;
     } catch (error) {
-      await this.audit(aiDocsPath, kind, repositoryName, branch, contextPackPath, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, "failed", error instanceof Error ? error.message : String(error), undefined, undefined, startedAt, true, false, prompt.profile, prompt.instructions.length, prompt.userPrompt.length, promptPackPath, contextSelectionPath);
+      try {
+        await this.audit(aiDocsPath, kind, repositoryName, branch, contextPackPath, safe.text.length, rawContext.includedIndexes, safe.maskedSecrets, token.isCancellationRequested ? "cancelled" : "failed", error instanceof Error ? error.message : String(error), undefined, undefined, startedAt, true, responseReceived, prompt.profile, prompt.instructions.length, prompt.userPrompt.length, promptPackPath, contextSelectionPath);
+      } catch {
+        // Preserve the original generation failure if best-effort auditing fails.
+      }
       throw error;
     }
   }
@@ -115,20 +131,22 @@ export class CopilotDocumentationGenerator {
       return true;
     }
     const relativePath = path.relative(aiDocsPath, contextPackPath);
+    const providerName = providerDisplayName(this.client.provider);
+    const sendAction = `${providerName}'a Gönder`;
     const answer = await vscode.window.showInformationMessage(
-      `Copilot context hazır: ${kind}, ${characters} karakter, ${includedIndexes.length} indeks, maskelenen gizli değer: ${maskedSecrets}. Dosya: ${relativePath}`,
+      `${providerName} context hazır: ${kind}, ${characters} karakter, ${includedIndexes.length} indeks, maskelenen gizli değer: ${maskedSecrets}. Dosya: ${relativePath}`,
       { modal: true },
-      "Copilot'a Gönder",
+      sendAction,
       "Context'i Aç",
       "İptal"
     );
     if (answer === "Context'i Aç") {
       const document = await vscode.workspace.openTextDocument(contextPackPath);
       await vscode.window.showTextDocument(document, { preview: false });
-      const secondAnswer = await vscode.window.showInformationMessage("Context incelendi. Copilot'a gönderilsin mi?", { modal: true }, "Copilot'a Gönder", "İptal");
-      return secondAnswer === "Copilot'a Gönder";
+      const secondAnswer = await vscode.window.showInformationMessage(`Context incelendi. ${providerName}'a gönderilsin mi?`, { modal: true }, sendAction, "İptal");
+      return secondAnswer === sendAction;
     }
-    return answer === "Copilot'a Gönder";
+    return answer === sendAction;
   }
 
   private async audit(
@@ -142,8 +160,8 @@ export class CopilotDocumentationGenerator {
     maskedSecrets: number,
     status: "success" | "cancelled" | "failed",
     error?: string,
-    usage?: CopilotUsageEstimate,
-    model?: CopilotModelInfo,
+    usage?: DocumentationModelUsage,
+    model?: DocumentationModelInfo,
     startedAt?: number,
     copilotRequestStarted = false,
     copilotResponseReceived = false,
@@ -151,7 +169,10 @@ export class CopilotDocumentationGenerator {
     instructionCharacters?: number,
     userPromptCharacters?: number,
     promptPackPath?: string,
-    contextSelectionPath?: string
+    contextSelectionPath?: string,
+    provider: DocumentationModelProvider = resolveProvider(undefined, this.client.provider),
+    finishReason?: string,
+    requestId?: string
   ): Promise<void> {
     const enabled = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("copilot.auditLogEnabled", true);
     if (!enabled) {
@@ -175,6 +196,9 @@ export class CopilotDocumentationGenerator {
       estimatedOutputTokens: usage?.estimatedOutputTokens,
       estimatedTotalTokens: usage?.estimatedTotalTokens,
       modelCountedInputTokens: usage?.modelCountedInputTokens,
+      promptTokens: usage?.promptTokens,
+      completionTokens: usage?.completionTokens,
+      totalTokens: usage?.totalTokens,
       outputCharacters: usage?.outputCharacters,
       durationMs: startedAt ? Date.now() - startedAt : undefined,
       copilotRequestStarted,
@@ -185,14 +209,17 @@ export class CopilotDocumentationGenerator {
       selectedModelFamily: model?.family,
       selectedModelVersion: model?.version,
       selectedModelMaxInputTokens: model?.maxInputTokens,
-      modelFamily: "copilot",
+      provider,
+      finishReason,
+      requestId,
+      modelFamily: provider,
       status,
       error
     });
   }
 }
 
-function estimateUsage(inputCharacters: number, outputCharacters: number): CopilotUsageEstimate {
+function estimateUsage(inputCharacters: number, outputCharacters: number): DocumentationModelUsage {
   const estimatedInputTokens = Math.ceil(inputCharacters / 4);
   const estimatedOutputTokens = Math.ceil(outputCharacters / 4);
   return {
@@ -204,6 +231,23 @@ function estimateUsage(inputCharacters: number, outputCharacters: number): Copil
   };
 }
 
-function formatUsageProgress(kind: LocalDocumentKind, usage: CopilotUsageEstimate): string {
+function formatUsageProgress(kind: LocalDocumentKind, usage: DocumentationModelUsage): string {
   return `${kind}: ~${usage.estimatedInputTokens} input, ~${usage.estimatedOutputTokens} output, toplam ~${usage.estimatedTotalTokens} token`;
+}
+
+function providerDisplayName(provider: DocumentationModelProvider): string {
+  return provider === "qwen" ? "Qwen" : "Copilot";
+}
+
+function resolveProvider(
+  responseProvider?: DocumentationModelProvider,
+  clientProvider?: DocumentationModelProvider
+): DocumentationModelProvider {
+  return responseProvider ?? clientProvider ?? "copilot";
+}
+
+function modelAttribution(provider: DocumentationModelProvider, modelName: string): string {
+  return provider === "qwen"
+    ? `Bank Spring Docs AI via configured Qwen endpoint (${modelName})`
+    : `Bank Spring Docs AI via GitHub Copilot Language Model API (${modelName})`;
 }

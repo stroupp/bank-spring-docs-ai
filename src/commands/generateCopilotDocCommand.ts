@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { createDocumentationModelClient } from "../ai/documentationModelClientFactory";
 import { CopilotDocumentationGenerator } from "../docs/copilotDocumentationGenerator";
 import { LocalDocumentKind } from "../docs/localDocumentationGenerator";
 import { AnalysisStateService } from "../storage/analysisStateService";
@@ -13,12 +14,14 @@ export async function generateCopilotDocCommand(context: vscode.ExtensionContext
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: Copilot dokümanı oluşturuluyor",
+      title: "Bank Spring Docs: AI dokümanı oluşturuluyor",
       cancellable: true
     },
     async (progress, token) => {
       try {
-        const generatedPath = await new CopilotDocumentationGenerator().generate(
+        const modelClient = createDocumentationModelClient(context);
+        const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+        const generatedPath = await new CopilotDocumentationGenerator(undefined, undefined, modelClient).generate(
           lastAnalysis.aiDocsPath,
           lastAnalysis.repositoryName,
           lastAnalysis.branch,
@@ -28,9 +31,9 @@ export async function generateCopilotDocCommand(context: vscode.ExtensionContext
         );
         const document = await vscode.workspace.openTextDocument(generatedPath);
         await vscode.window.showTextDocument(document, { preview: false });
-        vscode.window.showInformationMessage(`Bank Spring Docs: Copilot dokümanı oluşturuldu: ${generatedPath}`);
+        vscode.window.showInformationMessage(`Bank Spring Docs: ${providerName} dokümanı oluşturuldu: ${generatedPath}`);
       } catch (error) {
-        vscode.window.showErrorMessage(`Bank Spring Docs: Copilot dokümanı oluşturulamadı. ${error instanceof Error ? error.message : String(error)}`);
+        vscode.window.showErrorMessage(`Bank Spring Docs: AI dokümanı oluşturulamadı. ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );

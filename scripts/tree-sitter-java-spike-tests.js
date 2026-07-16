@@ -81,6 +81,9 @@ function benchmarkProviders(ast, regex, fixtures, iterations) {
 }
 
 async function compareCachedRepositories(ast, regex) {
+  if (process.env.BANK_SPRING_DOCS_SKIP_REAL_REPO_CACHE === "1") {
+    return { repositories: [], controllerFiles: 0, astEndpoints: 0, regexEndpoints: 0, shared: 0, astOnly: 0, regexOnly: 0, fallbackFiles: 0 };
+  }
   const cacheRoot = path.join(root, ".tmp", "real-repo-validation");
   const result = { repositories: [], controllerFiles: 0, astEndpoints: 0, regexEndpoints: 0, shared: 0, astOnly: 0, regexOnly: 0, fallbackFiles: 0 };
   let config;
@@ -140,6 +143,7 @@ async function readSource(relative) {
   return { file: relative.replace(/^test-fixtures\//, "src/"), source: await fs.readFile(path.join(root, relative), "utf8") };
 }
 async function writeReport(name, content) {
+  if (process.env.BANK_SPRING_DOCS_WRITE_TEST_REPORTS === "0") return;
   const file = path.join(root, ".ai-docs", "dev-audits", name);
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, content, "utf8");

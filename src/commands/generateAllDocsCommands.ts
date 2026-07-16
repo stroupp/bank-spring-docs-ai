@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
+import { createDocumentationModelClient } from "../ai/documentationModelClientFactory";
 import { AnalysisQualityReportGenerator } from "../analyzer/analysisQualityReportGenerator";
 import { CopilotAgenticDocumentationGenerator } from "../docs/copilotAgenticDocumentationGenerator";
 import { CopilotDocumentationGenerator } from "../docs/copilotDocumentationGenerator";
@@ -64,14 +65,23 @@ export async function generateAllCopilotDocsCommand(context: vscode.ExtensionCon
     return;
   }
 
+  let modelClient: ReturnType<typeof createDocumentationModelClient>;
+  try {
+    modelClient = createDocumentationModelClient(context);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: AI sağlayıcısı hazırlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: Tüm Copilot dokümanları oluşturuluyor",
+      title: "Bank Spring Docs: Tüm AI dokümanları oluşturuluyor",
       cancellable: true
     },
     async (progress, token) => {
-      const generator = new CopilotDocumentationGenerator();
+      const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+      const generator = new CopilotDocumentationGenerator(undefined, undefined, modelClient);
       const failures: string[] = [];
       for (let index = 0; index < copilotKinds.length; index += 1) {
         if (token.isCancellationRequested) {
@@ -94,10 +104,10 @@ export async function generateAllCopilotDocsCommand(context: vscode.ExtensionCon
         }
       }
       if (failures.length) {
-        vscode.window.showWarningMessage(`Bank Spring Docs: Copilot doküman üretimi tamamlandı, ${failures.length} doküman başarısız. Context limitini düşürmeyi deneyin.`);
+        vscode.window.showWarningMessage(`Bank Spring Docs: ${providerName} doküman üretimi tamamlandı, ${failures.length} doküman başarısız. Context limitini düşürmeyi deneyin.`);
         return;
       }
-      vscode.window.showInformationMessage("Bank Spring Docs: Copilot doküman üretimi tamamlandı.");
+      vscode.window.showInformationMessage(`Bank Spring Docs: ${providerName} doküman üretimi tamamlandı.`);
     }
   );
 }
@@ -109,43 +119,59 @@ export async function generateAgenticCopilotBackendDocsCommand(context: vscode.E
     return;
   }
 
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: Agentic Copilot analizi çalışıyor",
-      cancellable: true
-    },
-    async (progress, token) => {
-      const result = await new CopilotAgenticDocumentationGenerator().generate(
-        lastAnalysis.aiDocsPath,
-        lastAnalysis.repositoryName,
-        lastAnalysis.branch,
-        token,
-        (event) => progress.report({
-          message: event.message,
-          increment: event.phase === "started" ? 100 / 6 : 0
-        })
-      );
-      const document = await vscode.workspace.openTextDocument(result.finalDocumentPath);
-      await vscode.window.showTextDocument(document, { preview: false });
-      const action = await vscode.window.showInformationMessage(
-        `Bank Spring Docs: Agentic Copilot tamamlandi. ${result.requestCount} istek, yaklasik ${result.estimatedTotalTokens} token.`,
-        "Final Dokumani Ac",
-        "Ara Ciktilari Ac",
-        "Audit Log Ac"
-      );
-      if (action === "Final Dokumani Ac") {
-        const finalDocument = await vscode.workspace.openTextDocument(result.finalDocumentPath);
-        await vscode.window.showTextDocument(finalDocument, { preview: false });
+
+  let modelClient: ReturnType<typeof createDocumentationModelClient>;
+  try {
+    modelClient = createDocumentationModelClient(context);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: AI sağlayıcısı hazırlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Bank Spring Docs: Agentic AI analizi çalışıyor",
+        cancellable: true
+      },
+      async (progress, token) => {
+        const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+        const result = await new CopilotAgenticDocumentationGenerator(undefined, modelClient).generate(
+          lastAnalysis.aiDocsPath,
+          lastAnalysis.repositoryName,
+          lastAnalysis.branch,
+          token,
+          (event) => progress.report({
+            message: event.message,
+            increment: event.phase === "started" ? 100 / 6 : 0
+          })
+        );
+        const document = await vscode.workspace.openTextDocument(result.finalDocumentPath);
+        await vscode.window.showTextDocument(document, { preview: false });
+        const action = await vscode.window.showInformationMessage(
+          `Bank Spring Docs: Agentic ${providerName} tamamlandı. ${result.requestCount} istek, yaklaşık ${result.estimatedTotalTokens} token.`,
+          "Final Dokumani Ac",
+          "Ara Ciktilari Ac",
+          "Audit Log Ac"
+        );
+        if (action === "Final Dokumani Ac") {
+          const finalDocument = await vscode.workspace.openTextDocument(result.finalDocumentPath);
+          await vscode.window.showTextDocument(finalDocument, { preview: false });
+        }
+        if (action === "Ara Ciktilari Ac") {
+          await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(result.workspaceRoot));
+        }
+        if (action === "Audit Log Ac") {
+          await openCopilotAuditLogCommand(context);
+        }
       }
-      if (action === "Ara Ciktilari Ac") {
-        await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(result.workspaceRoot));
-      }
-      if (action === "Audit Log Ac") {
-        await openCopilotAuditLogCommand(context);
-      }
-    }
-  );
+    );
+  } catch (error) {
+    vscode.window.showErrorMessage(
+      `Bank Spring Docs: Agentic AI analizi tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 export async function openLastCopilotContextCommand(context: vscode.ExtensionContext): Promise<void> {

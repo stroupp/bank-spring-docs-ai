@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
+import type { DocumentationModelProvider } from "../ai/documentationModelClient";
 
 export type AgenticRunState = "running" | "completed" | "failed" | "cancelled";
 export type AgenticPhaseState = "pending" | "running" | "completed" | "skipped" | "failed" | "cancelled";
@@ -49,6 +50,13 @@ export interface MultiRepoAgenticRunStatus {
   runId: string;
   projectName: string;
   branch: string;
+  /** Deterministic UI/BFF/BE repository and branch selection used by this run. */
+  pipelineIdentity?: string;
+  /** Provider/model snapshot used by the generated-document phases. */
+  generationProvider?: DocumentationModelProvider;
+  generationModel?: string;
+  /** Secret-free hash of deployment and generation settings for safe resume. */
+  generationConfigurationFingerprint?: string;
   status: AgenticRunState;
   startedAt: string;
   updatedAt: string;
@@ -68,6 +76,12 @@ export interface MultiRepoAgenticRunStatus {
   resumedAt?: string;
   history?: AgenticRunAttempt[];
   phases: AgenticRunPhase[];
+}
+
+export interface AgenticGenerationIdentity {
+  provider: DocumentationModelProvider;
+  model?: string;
+  configurationFingerprint?: string;
 }
 
 export interface PhaseCompletion {
@@ -95,13 +109,13 @@ const phaseDefinitions: Array<Pick<AgenticRunPhase, "id" | "label" | "category">
   { id: "knowledge-graph", label: "Local knowledge graph", category: "local" },
   { id: "quality-report", label: "Multi-repository quality report", category: "local" },
   { id: "manifest-update", label: "Multi-repository manifest update", category: "local" },
-  { id: "copilot-cross-layer-plan", label: "Copilot cross-layer plan", category: "copilot" },
-  { id: "copilot-ui-analysis", label: "Copilot React UI analysis", category: "copilot" },
-  { id: "copilot-bff-analysis", label: "Copilot Spring BFF analysis", category: "copilot" },
-  { id: "copilot-be-analysis", label: "Copilot Spring BE analysis", category: "copilot" },
-  { id: "copilot-traceability-analysis", label: "Copilot traceability analysis", category: "copilot" },
-  { id: "copilot-cross-layer-diagrams", label: "Copilot cross-layer diagrams", category: "copilot" },
-  { id: "copilot-final-cross-layer-synthesis", label: "Copilot final cross-layer synthesis", category: "copilot" },
+  { id: "copilot-cross-layer-plan", label: "AI cross-layer plan", category: "copilot" },
+  { id: "copilot-ui-analysis", label: "AI React UI analysis", category: "copilot" },
+  { id: "copilot-bff-analysis", label: "AI Spring BFF analysis", category: "copilot" },
+  { id: "copilot-be-analysis", label: "AI Spring BE analysis", category: "copilot" },
+  { id: "copilot-traceability-analysis", label: "AI traceability analysis", category: "copilot" },
+  { id: "copilot-cross-layer-diagrams", label: "AI cross-layer diagrams", category: "copilot" },
+  { id: "copilot-final-cross-layer-synthesis", label: "AI final cross-layer synthesis", category: "copilot" },
   { id: "final-document", label: "Final Agentic document", category: "local" },
   { id: "run-summary", label: "Run summary", category: "local" }
 ];
@@ -131,7 +145,8 @@ export class MultiRepoAgenticRunStatusWriter {
   static async create(
     multiRepoRoot: string,
     manifest: MultiRepoManifest,
-    requestedRunId?: string
+    requestedRunId?: string,
+    generation: AgenticGenerationIdentity = { provider: "copilot" }
   ): Promise<MultiRepoAgenticRunStatusWriter> {
     const statusRoot = path.join(multiRepoRoot, "copilot-workspace", "agentic-ui-bff-be");
     await fs.mkdir(statusRoot, { recursive: true });
@@ -145,6 +160,10 @@ export class MultiRepoAgenticRunStatusWriter {
       runId,
       projectName: manifest.projectName,
       branch: manifest.branch,
+      pipelineIdentity: manifest.pipelineIdentity,
+      generationProvider: generation.provider,
+      generationModel: generation.model?.trim() || undefined,
+      generationConfigurationFingerprint: generation.configurationFingerprint?.trim() || undefined,
       status: "running",
       attempt: 1,
       attemptStartedAt: now,
@@ -165,7 +184,8 @@ export class MultiRepoAgenticRunStatusWriter {
    */
   static async loadLatestResumable(
     multiRepoRoot: string,
-    manifest: MultiRepoManifest
+    manifest: MultiRepoManifest,
+    generation: AgenticGenerationIdentity = { provider: "copilot" }
   ): Promise<MultiRepoAgenticRunStatusWriter | undefined> {
     const statusRoot = path.resolve(multiRepoRoot, "copilot-workspace", "agentic-ui-bff-be");
     const latestPath = path.join(statusRoot, "latest-run-status.json");
@@ -185,7 +205,19 @@ export class MultiRepoAgenticRunStatusWriter {
       || (parsed.status !== "failed" && parsed.status !== "cancelled")
       || parsed.projectName !== manifest.projectName
       || parsed.branch !== manifest.branch
+      || (manifest.pipelineIdentity !== undefined && parsed.pipelineIdentity !== manifest.pipelineIdentity)
       || !isSafeRunId(parsed.runId)) {
+      return undefined;
+    }
+
+    const storedProvider = normalizeProvider(parsed.generationProvider);
+    const storedModel = stringValue(parsed.generationModel)?.trim() || undefined;
+    const requestedModel = generation.model?.trim() || undefined;
+    const storedFingerprint = stringValue(parsed.generationConfigurationFingerprint)?.trim() || undefined;
+    const requestedFingerprint = generation.configurationFingerprint?.trim() || undefined;
+    const fingerprintMismatch = Boolean(storedFingerprint && storedFingerprint !== requestedFingerprint)
+      || (storedProvider === "qwen" && Boolean(requestedFingerprint) && storedFingerprint !== requestedFingerprint);
+    if (storedProvider !== generation.provider || (storedModel && storedModel !== requestedModel) || fingerprintMismatch) {
       return undefined;
     }
 
@@ -400,6 +432,9 @@ function renderMarkdown(status: MultiRepoAgenticRunStatus): string {
     `- Run: ${status.runId}`,
     `- Project: ${status.projectName}`,
     `- Branch: ${status.branch}`,
+    `- Generation provider: ${status.generationProvider ?? "copilot"}`,
+    `- Generation model: ${status.generationModel ?? "provider default"}`,
+    `- Generation configuration fingerprint: ${status.generationConfigurationFingerprint ?? "legacy / unavailable"}`,
     `- Status: ${status.status}`,
     `- Attempt: ${status.attempt ?? 1}`,
     `- Resume count: ${status.resumeCount ?? 0}`,
@@ -495,6 +530,10 @@ function normalizeLoadedStatus(
     runId: String(loaded.runId),
     projectName: manifest.projectName,
     branch: manifest.branch,
+    pipelineIdentity: manifest.pipelineIdentity,
+    generationProvider: normalizeProvider(loaded.generationProvider),
+    generationModel: stringValue(loaded.generationModel)?.trim() || undefined,
+    generationConfigurationFingerprint: stringValue(loaded.generationConfigurationFingerprint)?.trim() || undefined,
     status: state,
     startedAt: stringValue(loaded.startedAt) ?? new Date().toISOString(),
     updatedAt: stringValue(loaded.updatedAt) ?? new Date().toISOString(),
@@ -728,6 +767,10 @@ function isPhaseState(value: unknown): value is AgenticPhaseState {
     || value === "failed" || value === "cancelled";
 }
 
+function normalizeProvider(value: unknown): DocumentationModelProvider {
+  return value === "qwen" ? "qwen" : "copilot";
+}
+
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
@@ -784,9 +827,47 @@ async function atomicWrite(target: string, content: string): Promise<void> {
   const temporary = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await fs.writeFile(temporary, content, "utf8");
   try {
-    await fs.rename(temporary, target);
+    await renameWithTransientRetry(temporary, target);
   } catch (error) {
-    await fs.rm(temporary, { force: true });
-    throw error;
+    if (!isTransientFileSystemError(error)) {
+      await fs.rm(temporary, { force: true });
+      throw error;
+    }
+    try {
+      // Windows antivirus/indexing can keep the destination briefly locked. A
+      // final overwrite fallback favors a current resumable status over losing
+      // the whole Agentic run after bounded atomic-rename retries.
+      await fs.copyFile(temporary, target);
+      await fs.rm(temporary, { force: true });
+    } catch (fallbackError) {
+      await fs.rm(temporary, { force: true });
+      throw fallbackError;
+    }
   }
+}
+
+async function renameWithTransientRetry(source: string, target: string): Promise<void> {
+  const retryDelaysMs = [25, 50, 100, 200, 400];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.rename(source, target);
+      return;
+    } catch (error) {
+      if (!isTransientFileSystemError(error) || attempt >= retryDelaysMs.length) {
+        throw error;
+      }
+      await delay(retryDelaysMs[attempt]);
+    }
+  }
+}
+
+function isTransientFileSystemError(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

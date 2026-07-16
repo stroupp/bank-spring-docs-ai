@@ -1,9 +1,11 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { runCommand } from "../utils/shell";
+import { assertRepositoryUrlHasNoEmbeddedCredentials, repositoryOriginIdentity } from "../utils/repositoryUrl";
 
 export class GitService {
   async cloneOrUpdate(repoUrl: string, branch: string, targetDir: string): Promise<void> {
+    assertRepositoryUrlHasNoEmbeddedCredentials(repoUrl);
     const gitDir = path.join(targetDir, ".git");
     const exists = await this.exists(gitDir);
 
@@ -18,6 +20,14 @@ export class GitService {
     }
 
     try {
+      const gitMetadata = await fs.lstat(gitDir);
+      if (!gitMetadata.isDirectory() || gitMetadata.isSymbolicLink()) {
+        throw new Error("Existing clone has unsafe redirected Git metadata.");
+      }
+      const origin = (await runCommand("git", ["remote", "get-url", "origin"], targetDir)).stdout.trim();
+      if (repositoryOriginIdentity(origin) !== repositoryOriginIdentity(repoUrl)) {
+        throw new Error("Existing clone origin does not match the requested repository.");
+      }
       await runCommand("git", ["-c", "core.longpaths=true", "fetch", "origin", branch], targetDir);
       await runCommand("git", ["-c", "core.longpaths=true", "checkout", branch], targetDir);
       await runCommand("git", ["-c", "core.longpaths=true", "pull", "origin", branch], targetDir);

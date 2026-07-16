@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { classifyJavaFile, JavaFileType } from "./javaFileClassifier";
 import { relativePosix } from "../utils/pathUtils";
+import { RepositoryScanBudget, RepositoryScanOptions } from "./repositoryScanPolicy";
 
 export interface ScannedFile {
   file: string;
@@ -11,16 +12,20 @@ export interface ScannedFile {
   classification?: JavaFileType;
   size: number;
   content: string;
+  modulePath?: string;
+  sourceSet?: "main" | "test";
+  sourceRoot?: string;
 }
 
 const ignoredFolders = new Set([".git", ".idea", ".vscode", ".ai-docs", "node_modules", "target", "build", "dist", "out", ".gradle"]);
-const configNames = new Set(["application.yml", "application.yaml", "application.properties", "bootstrap.yml", "bootstrap.properties"]);
+const springConfigName = /^(?:application|bootstrap)(?:-.+)?\.(?:properties|ya?ml)$/i;
 
 export class RepositoryScanner {
-  async scan(repoRoot: string): Promise<ScannedFile[]> {
+  async scan(repoRoot: string, options: RepositoryScanOptions = {}): Promise<ScannedFile[]> {
     const files: ScannedFile[] = [];
-    await this.walk(repoRoot, repoRoot, files);
-    return files;
+    const budget = new RepositoryScanBudget(options);
+    await this.walk(repoRoot, repoRoot, files, budget);
+    return files.sort((left, right) => left.file < right.file ? -1 : left.file > right.file ? 1 : 0);
   }
 
   detectBuildTool(files: ScannedFile[]): "Maven" | "Gradle" | "Unknown" {
@@ -33,12 +38,15 @@ export class RepositoryScanner {
     return "Unknown";
   }
 
-  private async walk(repoRoot: string, currentDir: string, files: ScannedFile[]): Promise<void> {
-    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+  private async walk(repoRoot: string, currentDir: string, files: ScannedFile[], budget: RepositoryScanBudget): Promise<void> {
+    budget.checkCancellation();
+    const entries = (await fs.readdir(currentDir, { withFileTypes: true }))
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
     for (const entry of entries) {
+      budget.checkCancellation();
       if (entry.isDirectory()) {
-        if (!ignoredFolders.has(entry.name)) {
-          await this.walk(repoRoot, path.join(currentDir, entry.name), files);
+        if (!ignoredFolders.has(entry.name.toLowerCase())) {
+          await this.walk(repoRoot, path.join(currentDir, entry.name), files, budget);
         }
         continue;
       }
@@ -53,7 +61,10 @@ export class RepositoryScanner {
         continue;
       }
 
+      const stat = await fs.stat(absolutePath);
+      budget.assertReadable(relative, stat.size);
       const buffer = await fs.readFile(absolutePath);
+      budget.commit(relative, buffer.length);
       if (buffer.includes(0)) {
         continue;
       }
@@ -61,6 +72,7 @@ export class RepositoryScanner {
       const content = buffer.toString("utf8");
       const extension = path.extname(entry.name);
       const kind = this.kindFor(relative);
+      const layout = sourceLayout(relative);
       files.push({
         file: relative,
         absolutePath,
@@ -68,7 +80,10 @@ export class RepositoryScanner {
         kind,
         classification: kind === "java" ? classifyJavaFile(relative, content) : undefined,
         size: buffer.length,
-        content
+        content,
+        modulePath: layout?.modulePath,
+        sourceSet: layout?.sourceSet,
+        sourceRoot: layout?.sourceRoot
       });
     }
   }
@@ -82,20 +97,44 @@ export class RepositoryScanner {
       name === "build.gradle.kts" ||
       name === "settings.gradle" ||
       name === "settings.gradle.kts" ||
-      normalized.startsWith("src/main/java/") && normalized.endsWith(".java") ||
-      normalized.startsWith("src/test/java/") && normalized.endsWith(".java") ||
-      normalized.startsWith("src/main/resources/") && configNames.has(name)
+      isSourcePath(normalized, "main", "java") && normalized.endsWith(".java") ||
+      isSourcePath(normalized, "test", "java") && normalized.endsWith(".java") ||
+      isSourcePath(normalized, "main", "resources") && springConfigName.test(name)
     );
   }
 
   private kindFor(relative: string): "java" | "build" | "config" {
-    const name = path.posix.basename(relative.toLowerCase());
-    if (relative.endsWith(".java")) {
+    const normalized = relative.toLowerCase();
+    const name = path.posix.basename(normalized);
+    if (normalized.endsWith(".java")) {
       return "java";
     }
-    if (configNames.has(name)) {
+    if (springConfigName.test(name)) {
       return "config";
     }
     return "build";
   }
+}
+
+function isSourcePath(normalizedPath: string, sourceSet: "main" | "test", folder: "java" | "resources"): boolean {
+  const marker = `src/${sourceSet}/${folder}/`;
+  return normalizedPath.startsWith(marker) || normalizedPath.includes(`/${marker}`);
+}
+
+function sourceLayout(relativePath: string): { modulePath: string; sourceSet: "main" | "test"; sourceRoot: string } | undefined {
+  const segments = relativePath.replaceAll("\\", "/").split("/").filter(Boolean);
+  const sourceIndex = segments.findIndex((segment, index) =>
+    segment.toLowerCase() === "src" &&
+    (segments[index + 1]?.toLowerCase() === "main" || segments[index + 1]?.toLowerCase() === "test") &&
+    (segments[index + 2]?.toLowerCase() === "java" || segments[index + 2]?.toLowerCase() === "resources")
+  );
+  if (sourceIndex < 0) {
+    return undefined;
+  }
+  const sourceSet = segments[sourceIndex + 1].toLowerCase() as "main" | "test";
+  return {
+    modulePath: segments.slice(0, sourceIndex).join("/"),
+    sourceSet,
+    sourceRoot: segments.slice(0, sourceIndex + 3).join("/")
+  };
 }

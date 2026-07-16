@@ -1,5 +1,10 @@
 ﻿import * as path from "path";
 import * as vscode from "vscode";
+import {
+  createDocumentationModelClient,
+  createQwenDocumentationModelClient,
+  getResumableQwenPageModelIdentity
+} from "../ai/documentationModelClientFactory";
 import { EvidencePackBuilder } from "../evidence/evidencePackBuilder";
 import { MultiRepoManifestService } from "../multirepo/multiRepoManifestService";
 import { CopilotPageDraftGenerator } from "../pageanalysis/copilotPageDraftGenerator";
@@ -10,12 +15,15 @@ import { PageCandidate, PageListService } from "../pageanalysis/pageListService"
 import { PageOutputFreshnessService } from "../pageanalysis/pageOutputFreshnessService";
 import { PagePipelineFreshnessService } from "../pageanalysis/pagePipelineFreshnessService";
 import { QwenPageSemanticAnalyzer } from "../pageanalysis/qwenPageSemanticAnalyzer";
-import { PageSectionRegenerator } from "../pageanalysis/gapRepair/pageSectionRegenerator";
+import { QwenIterativePageDraftGenerator, QwenIterativePageDraftResult } from "../pageanalysis/qwenIterativePageDraftGenerator";
+import { PageSectionRegenerator, Qwen3PageSectionRepairOptions } from "../pageanalysis/gapRepair/pageSectionRegenerator";
 import { PageDocumentQualityScorer } from "../pageanalysis/quality/pageDocumentQualityScorer";
 import { PageDocumentQualityReportWriter } from "../pageanalysis/quality/pageDocumentQualityReportWriter";
 import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
 import { ArtifactFreshnessService } from "../pageanalysis/artifactFreshnessService";
-import { safeName } from "../utils/pathUtils";
+import { safePathSegment } from "../utils/pathUtils";
+
+const activeFullPageAnalysisRuns = new Set<string>();
 
 export async function buildPageListCommand(context: vscode.ExtensionContext): Promise<PageCandidate | undefined> {
   const manifestService = new MultiRepoManifestService(context);
@@ -25,7 +33,7 @@ export async function buildPageListCommand(context: vscode.ExtensionContext): Pr
     return undefined;
   }
 
-  const pages = await new PageListService().list(manifestService.getMultiRepoRoot());
+  const pages = await new PageListService().list(manifestService.getMultiRepoRoot(manifest));
   if (pages.length === 0) {
     vscode.window.showWarningMessage("Bank Spring Docs: Sayfa bulunamadÄ±. Ã–nce React UI analizi oluÅŸtur.");
     return undefined;
@@ -83,10 +91,10 @@ export async function analyzeSelectedPageCommand(context: vscode.ExtensionContex
     },
     async (progress) => {
       progress.report({ message: "Sayfa context paketi oluÅŸturuluyor..." });
-      if (!await ensurePagePipelineFreshness(manifestService.getMultiRepoRoot(), manifest)) {
+      if (!await ensurePagePipelineFreshness(manifestService.getMultiRepoRoot(manifest), manifest)) {
         return;
       }
-      const result = await new PageContextPackBuilder().build(manifestService.getMultiRepoRoot(), manifest, selectedPage);
+      const result = await new PageContextPackBuilder().build(manifestService.getMultiRepoRoot(manifest), manifest, selectedPage);
       progress.report({ message: "Sayfa evidence paketi oluÅŸturuluyor..." });
       await new EvidencePackBuilder().build(result.pageRoot, manifest);
       const document = await vscode.workspace.openTextDocument(result.contextPackPath);
@@ -106,11 +114,12 @@ export async function openSelectedPageContextPackCommand(context: vscode.Extensi
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
+  const manifest = await manifestService.readManifest();
   const target = vscode.Uri.file(path.join(
-    manifestService.getMultiRepoRoot(),
+    manifestService.getMultiRepoRoot(manifest),
     "page-analysis",
     "pages",
-    safeName(selectedPage.pageName || selectedPage.route || "page"),
+    safePathSegment(selectedPage.pageName || selectedPage.route || "page", "page"),
     "page-context-pack.md"
   ));
   try {
@@ -128,11 +137,12 @@ export async function openSelectedPageEvidencePackCommand(context: vscode.Extens
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
+  const manifest = await manifestService.readManifest();
   const target = vscode.Uri.file(path.join(
-    manifestService.getMultiRepoRoot(),
+    manifestService.getMultiRepoRoot(manifest),
     "page-analysis",
     "pages",
-    safeName(selectedPage.pageName || selectedPage.route || "page"),
+    safePathSegment(selectedPage.pageName || selectedPage.route || "page", "page"),
     "page-evidence-pack.md"
   ));
   try {
@@ -155,7 +165,8 @@ export async function generateSelectedPageQwenSemanticsCommand(context: vscode.E
   }
 
   const manifestService = new MultiRepoManifestService(context);
-  const pageRoot = selectedPageRoot(manifestService.getMultiRepoRoot(), selectedPage);
+  const manifest = await manifestService.readManifest();
+  const pageRoot = selectedPageRoot(manifestService.getMultiRepoRoot(manifest), selectedPage);
   if (!await exists(path.join(pageRoot, "page-context-pack.md"))) {
     vscode.window.showWarningMessage("Bank Spring Docs: Sayfa context paketi bulunamadÄ±. Ã–nce seÃ§ili sayfayÄ± analiz et.");
     return;
@@ -185,27 +196,44 @@ export async function generateSelectedPageCopilotDraftCommand(context: vscode.Ex
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
-  const pageRoot = selectedPageRoot(manifestService.getMultiRepoRoot(), selectedPage);
+  const manifest = await manifestService.readManifest();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
+  const pageRoot = selectedPageRoot(multiRepoRoot, selectedPage);
   if (!await exists(path.join(pageRoot, "page-context-pack.md"))) {
     vscode.window.showWarningMessage("Bank Spring Docs: Sayfa context paketi bulunamadÄ±. Ã–nce seÃ§ili sayfayÄ± analiz et.");
     return;
   }
   await warnIfPageArtifactsStale(pageRoot);
 
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: Copilot sayfa taslak dokÃ¼manÄ± oluÅŸturuluyor",
-      cancellable: true
-    },
-    async (progress, token) => {
-      progress.report({ message: "Copilot taslak dokÃ¼man isteÄŸi gÃ¶nderiliyor..." });
-      const result = await new CopilotPageDraftGenerator().generate(manifestService.getMultiRepoRoot(), pageRoot, token);
-      const document = await vscode.workspace.openTextDocument(result.draftPath);
-      await vscode.window.showTextDocument(document, { preview: false });
-      vscode.window.showInformationMessage(`Bank Spring Docs: Copilot taslak dokÃ¼manÄ± oluÅŸturuldu. YaklaÅŸÄ±k token: ${result.estimatedTotalTokens}.`);
-    }
-  );
+  let modelClient: ReturnType<typeof createDocumentationModelClient>;
+  try {
+    modelClient = createDocumentationModelClient(context);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: AI sağlayıcısı hazırlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Bank Spring Docs: AI sayfa taslak dokümanı oluşturuluyor",
+        cancellable: true
+      },
+      async (progress, token) => {
+        const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+        progress.report({ message: `${providerName} taslak doküman isteği gönderiliyor...` });
+        const result = await new CopilotPageDraftGenerator(modelClient).generate(multiRepoRoot, pageRoot, token);
+        const document = await vscode.workspace.openTextDocument(result.draftPath);
+        await vscode.window.showTextDocument(document, { preview: false });
+        vscode.window.showInformationMessage(`Bank Spring Docs: ${providerName} taslak dokümanı oluşturuldu. Yaklaşık token: ${result.estimatedTotalTokens}.`);
+      }
+    );
+  } catch (error) {
+    vscode.window.showErrorMessage(
+      `Bank Spring Docs: AI sayfa taslağı oluşturulamadı: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 export async function detectSelectedPageDocumentGapsCommand(context: vscode.ExtensionContext): Promise<void> {
@@ -215,10 +243,11 @@ export async function detectSelectedPageDocumentGapsCommand(context: vscode.Exte
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const manifest = await manifestService.readManifest();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
   const pageRoot = selectedPageRoot(multiRepoRoot, selectedPage);
   if (!await exists(path.join(pageRoot, "copilot-draft.md"))) {
-    vscode.window.showWarningMessage("Bank Spring Docs: Copilot taslak dokÃ¼manÄ± bulunamadÄ±. Ã–nce taslak oluÅŸtur.");
+    vscode.window.showWarningMessage("Bank Spring Docs: AI taslak dokümanı bulunamadı. Önce taslak oluştur.");
     return;
   }
   if (await warnIfOutputStale(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"])) {
@@ -240,7 +269,8 @@ export async function repairSelectedPageDocumentGapsCommand(context: vscode.Exte
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const manifest = await manifestService.readManifest();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
   const pageRoot = selectedPageRoot(multiRepoRoot, selectedPage);
   if (!await exists(path.join(pageRoot, "detected-gaps.json"))) {
     vscode.window.showWarningMessage("Bank Spring Docs: Detected gaps bulunamadÄ±. Ã–nce gap analizi yap.");
@@ -249,20 +279,33 @@ export async function repairSelectedPageDocumentGapsCommand(context: vscode.Exte
   if (await warnIfOutputStale(pageRoot, "detected-gaps.json", ["copilot-draft.md", "page-context-pack.md", "page-evidence-pack.md"])) {
     return;
   }
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Bank Spring Docs: Sayfa gap repair Ã§alÄ±ÅŸÄ±yor",
-      cancellable: true
-    },
-    async (progress, token) => {
-      progress.report({ message: "Eksik/zayÄ±f bÃ¶lÃ¼mler iÃ§in repair context oluÅŸturuluyor..." });
-      const result = await new PageSectionRegenerator().repair(multiRepoRoot, pageRoot, token);
-      const document = await vscode.workspace.openTextDocument(result.repairedSectionsPath);
-      await vscode.window.showTextDocument(document, { preview: false });
-      vscode.window.showInformationMessage(`Bank Spring Docs: Gap repair tamamlandÄ±. Gap sayÄ±sÄ±: ${result.repairedGapCount}.`);
-    }
-  );
+  let modelClient: ReturnType<typeof createDocumentationModelClient>;
+  try {
+    modelClient = createDocumentationModelClient(context);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: AI sağlayıcısı hazırlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Bank Spring Docs: Sayfa gap repair Ã§alÄ±ÅŸÄ±yor",
+        cancellable: true
+      },
+      async (progress, token) => {
+        progress.report({ message: "Eksik/zayÄ±f bÃ¶lÃ¼mler iÃ§in repair context oluÅŸturuluyor..." });
+        const result = await new PageSectionRegenerator(modelClient).repair(multiRepoRoot, pageRoot, token);
+        const document = await vscode.workspace.openTextDocument(result.repairedSectionsPath);
+        await vscode.window.showTextDocument(document, { preview: false });
+        vscode.window.showInformationMessage(`Bank Spring Docs: Gap repair tamamlandÄ±. Gap sayÄ±sÄ±: ${result.repairedGapCount}.`);
+      }
+    );
+  } catch (error) {
+    vscode.window.showErrorMessage(
+      `Bank Spring Docs: Gap repair tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 export async function buildFinalSelectedPageDocumentCommand(context: vscode.ExtensionContext): Promise<void> {
@@ -271,9 +314,11 @@ export async function buildFinalSelectedPageDocumentCommand(context: vscode.Exte
     vscode.window.showWarningMessage("Bank Spring Docs: Ã–nce sayfa listesinden bir sayfa seÃ§.");
     return;
   }
-  const pageRoot = selectedPageRoot(new MultiRepoManifestService(context).getMultiRepoRoot(), selectedPage);
+  const manifestService = new MultiRepoManifestService(context);
+  const manifest = await manifestService.readManifest();
+  const pageRoot = selectedPageRoot(manifestService.getMultiRepoRoot(manifest), selectedPage);
   if (!await exists(path.join(pageRoot, "copilot-draft.md"))) {
-    vscode.window.showWarningMessage("Bank Spring Docs: Copilot taslak dokÃ¼manÄ± bulunamadÄ±. Ã–nce taslak oluÅŸtur.");
+    vscode.window.showWarningMessage("Bank Spring Docs: AI taslak dokümanı bulunamadı. Önce taslak oluştur.");
     return;
   }
   if (await warnIfOutputStale(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"])) {
@@ -291,7 +336,9 @@ export async function openFinalSelectedPageDocumentCommand(context: vscode.Exten
     vscode.window.showWarningMessage("Bank Spring Docs: Ã–nce sayfa listesinden bir sayfa seÃ§.");
     return;
   }
-  const pageRoot = selectedPageRoot(new MultiRepoManifestService(context).getMultiRepoRoot(), selectedPage);
+  const manifestService = new MultiRepoManifestService(context);
+  const manifest = await manifestService.readManifest();
+  const pageRoot = selectedPageRoot(manifestService.getMultiRepoRoot(manifest), selectedPage);
   const target = path.join(pageRoot, "final-page-technical-analysis.md");
   try {
     await warnIfOutputStale(pageRoot, "final-page-technical-analysis.md", ["page-context-pack.md", "page-evidence-pack.md", "copilot-draft.md", "repaired-sections.md"]);
@@ -309,7 +356,8 @@ export async function scoreSelectedPageDocumentCommand(context: vscode.Extension
     return;
   }
   const manifestService = new MultiRepoManifestService(context);
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const manifest = await manifestService.readManifest();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
   const pageRoot = selectedPageRoot(multiRepoRoot, selectedPage);
   if (!await exists(path.join(pageRoot, "final-page-technical-analysis.md")) && !await exists(path.join(pageRoot, "copilot-draft.md"))) {
     vscode.window.showWarningMessage("Bank Spring Docs: Skorlanacak sayfa dokÃ¼manÄ± bulunamadÄ±. Ã–nce taslak veya final dokÃ¼man oluÅŸtur.");
@@ -325,7 +373,14 @@ export async function scoreSelectedPageDocumentCommand(context: vscode.Extension
   vscode.window.showInformationMessage(`Bank Spring Docs: Sayfa kalite skoru oluÅŸturuldu. Skor: ${score.score} (${score.grade}).`);
 }
 
-export async function runFullSelectedPageAnalysisCommand(context: vscode.ExtensionContext): Promise<void> {
+export interface FullSelectedPageAnalysisOptions {
+  qwenOnly?: boolean;
+}
+
+export async function runFullSelectedPageAnalysisCommand(
+  context: vscode.ExtensionContext,
+  options?: FullSelectedPageAnalysisOptions
+): Promise<void> {
   const manifestService = new MultiRepoManifestService(context);
   const manifest = await manifestService.readManifest();
   if (!manifest) {
@@ -341,8 +396,28 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
     }
   }
 
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
+  const qwenOnly = options?.qwenOnly
+    ?? vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("pageAnalysis.qwenOnly", false);
+  const runKey = fullPageAnalysisRunKey(selectedPageRoot(multiRepoRoot, selectedPage));
+  if (activeFullPageAnalysisRuns.has(runKey)) {
+    vscode.window.showWarningMessage("Bank Spring Docs: Bu sayfa icin tam analiz zaten calisiyor. Mevcut calismanin tamamlanmasini bekleyin.");
+    return;
+  }
+  activeFullPageAnalysisRuns.add(runKey);
   try {
+    const modelClient = qwenOnly
+      ? createQwenDocumentationModelClient(context)
+      : createDocumentationModelClient(context);
+    const providerName = qwenOnly ? "Qwen3" : modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+    const qwenIdentity = qwenOnly ? getResumableQwenPageModelIdentity(context) : undefined;
+    const qwenDraftOptions = qwenIdentity
+      ? qwenIterativeOptions(qwenIdentity.model, qwenIdentity.configurationFingerprint, qwenIdentity.family)
+      : undefined;
+    const qwenRepairOptions: Qwen3PageSectionRepairOptions | undefined = qwenOnly
+      ? qwenRepairOptionsFrom(qwenDraftOptions)
+      : undefined;
+    let iterativeResult: QwenIterativePageDraftResult | undefined;
     await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -363,26 +438,52 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
       progress.report({ message: "3/9 Evidence paketi olusturuluyor..." });
       await new EvidencePackBuilder().build(contextResult.pageRoot, manifest);
 
-      if (vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
+      if (qwenOnly || vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
         try {
           progress.report({ message: "4/9 Qwen semantigi olusturuluyor..." });
-          await new QwenPageSemanticAnalyzer().analyze(contextResult.pageRoot, context, token);
+          const semanticAnalyzer = qwenOnly
+            ? new QwenPageSemanticAnalyzer(undefined, qwenIdentity?.model, undefined, {
+              client: modelClient,
+              cacheIdentity: qwenDraftOptions?.modelIdentity ?? qwenIdentity?.model ?? "qwen3",
+              expectedModelMarker: "qwen3"
+            })
+            : new QwenPageSemanticAnalyzer();
+          await semanticAnalyzer.analyze(contextResult.pageRoot, context, token);
         } catch (error) {
+          if (
+            token.isCancellationRequested ||
+            (qwenOnly && error instanceof Error && error.name === "Qwen3PageSemanticBoundaryError")
+          ) {
+            throw error;
+          }
           vscode.window.showWarningMessage(`Bank Spring Docs: Qwen sayfa semantiÄŸi atlandÄ±: ${error instanceof Error ? error.message : String(error)}`);
         }
       } else {
         progress.report({ message: "4/9 Qwen kapali, semantik adimi atlaniyor..." });
       }
 
-      progress.report({ message: "5/9 Copilot taslak dokumani olusturuluyor..." });
-      await new CopilotPageDraftGenerator().generate(multiRepoRoot, contextResult.pageRoot, token);
+      progress.report({ message: `5/9 ${providerName} taslak dokümanı oluşturuluyor...` });
+      if (qwenOnly) {
+        iterativeResult = await new QwenIterativePageDraftGenerator(
+          modelClient,
+          qwenDraftOptions
+        ).generate({
+          multiRepoRoot,
+          pageRoot: contextResult.pageRoot,
+          manifest,
+          token,
+          onProgress: (update) => progress.report({ message: `5/9 ${update.message}` })
+        });
+      } else {
+        await new CopilotPageDraftGenerator(modelClient).generate(multiRepoRoot, contextResult.pageRoot, token);
+      }
 
       progress.report({ message: "6/9 Gap analizi yapiliyor..." });
       const gaps = await new PageDocGapDetector().detect(contextResult.pageRoot, multiRepoRoot);
 
       if (gaps.length) {
         progress.report({ message: "7/9 Gap repair calistiriliyor..." });
-        await new PageSectionRegenerator().repair(multiRepoRoot, contextResult.pageRoot, token);
+        await new PageSectionRegenerator(modelClient, qwenRepairOptions).repair(multiRepoRoot, contextResult.pageRoot, token);
       } else {
         progress.report({ message: "7/9 Gap bulunmadi, repair atlaniyor..." });
       }
@@ -398,7 +499,10 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
 
       const document = await vscode.workspace.openTextDocument(finalResult.finalDocumentPath);
       await vscode.window.showTextDocument(document, { preview: false });
-      vscode.window.showInformationMessage(`Bank Spring Docs: TÃ¼m sayfa analizi tamamlandÄ±. Skor: ${score.score} (${score.grade}).`);
+      const iterationSummary = iterativeResult
+        ? ` Qwen3 chunk: ${iterativeResult.chunkCount}, yeni istek: ${iterativeResult.newModelCallCount}, yeniden kullanilan adim: ${iterativeResult.reusedStepCount}, coverage uyarisi: ${iterativeResult.warnings?.length ?? 0}.${iterativeResult.runManifestPath ? ` Resume manifesti: ${iterativeResult.runManifestPath}.` : ""}`
+        : "";
+      vscode.window.showInformationMessage(`Bank Spring Docs: TÃ¼m sayfa analizi tamamlandÄ±. Skor: ${score.score} (${score.grade}).${iterationSummary}`);
     }
     );
   } catch (error) {
@@ -408,11 +512,86 @@ export async function runFullSelectedPageAnalysisCommand(context: vscode.Extensi
       return;
     }
     vscode.window.showErrorMessage(`Bank Spring Docs: Tum sayfa analizi tamamlanamadi. Olusan ara dosyalar korundu. Detay: ${message}`);
+  } finally {
+    activeFullPageAnalysisRuns.delete(runKey);
   }
 }
 
 function selectedPageRoot(multiRepoRoot: string, selectedPage: PageCandidate): string {
-  return path.join(multiRepoRoot, "page-analysis", "pages", safeName(selectedPage.pageName || selectedPage.route || "page"));
+  return path.join(
+    multiRepoRoot,
+    "page-analysis",
+    "pages",
+    safePathSegment(selectedPage.pageName || selectedPage.route || "page", "page")
+  );
+}
+
+function fullPageAnalysisRunKey(pageRoot: string): string {
+  const resolved = path.resolve(pageRoot);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function qwenIterativeOptions(
+  model?: string,
+  configurationFingerprint?: string,
+  modelFamily?: string
+): ConstructorParameters<typeof QwenIterativePageDraftGenerator>[1] {
+  const config = vscode.workspace.getConfiguration("bankSpringDocs");
+  const contextWindowTokens = config.get<number>("qwen.contextWindowTokens", 131072);
+  const generationMaxTokens = config.get<number>("qwen.generationMaxTokens", 16384);
+  const reservedTokens = 2048;
+  const safeInputTokens = Math.floor(contextWindowTokens - generationMaxTokens - reservedTokens);
+  const maxInputCharacters = Math.min(60000, safeInputTokens * 3);
+  if (!Number.isSafeInteger(maxInputCharacters) || maxInputCharacters < 8001) {
+    throw new Error(
+      "Qwen3 iteratif sayfa analizi icin context penceresi yetersiz. " +
+      "qwen.contextWindowTokens degerini veya qwen.generationMaxTokens ayarini duzeltin."
+    );
+  }
+  // Banking deployments expose Qwen3 through the wire alias ONIKS. The
+  // factory adds the family only after validating the exact HTTPS bank
+  // endpoint, allowing the iterative boundary to retain its Qwen3 guarantee
+  // without changing the model value sent to the server.
+  const attestedModel = [modelFamily, model].filter(Boolean).join("/");
+  const modelIdentity = [attestedModel, configurationFingerprint].filter(Boolean).join("@");
+  return {
+    maxInputCharacters,
+    maxChunkCharacters: Math.min(42000, maxInputCharacters - 7000),
+    maxSourceFileCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxSourceFileCharacters", 180000, 12000, 1000000),
+    maxTotalSourceCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxTotalSourceCharacters", 720000, 30000, 5000000),
+    maxModelCalls: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxModelCalls", 48, 2, 200),
+    maxReduceLevels: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxReduceLevels", 5, 1, 10),
+    modelIdentity: modelIdentity || "qwen3",
+    expectedModelMarker: "qwen3"
+  };
+}
+
+function qwenRepairOptionsFrom(
+  draftOptions: ConstructorParameters<typeof QwenIterativePageDraftGenerator>[1]
+): Qwen3PageSectionRepairOptions {
+  const maxInputCharacters = draftOptions?.maxInputCharacters;
+  if (!Number.isSafeInteger(maxInputCharacters) || !maxInputCharacters) {
+    throw new Error("Qwen3 gap repair icin provider-derived input butcesi olusturulamadi.");
+  }
+  return {
+    mode: "qwen3",
+    maxInputCharacters,
+    expectedModelMarker: draftOptions?.expectedModelMarker ?? "qwen3"
+  };
+}
+
+function readBoundedIntegerSetting(
+  config: vscode.WorkspaceConfiguration,
+  key: string,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number {
+  const value = config.get<number>(key, fallback);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`bankSpringDocs.${key} ayari ${minimum}-${maximum} araliginda bir tam sayi olmalidir.`);
+  }
+  return value;
 }
 
 async function ensurePagePipelineFreshness(multiRepoRoot: string, manifest: NonNullable<Awaited<ReturnType<MultiRepoManifestService["readManifest"]>>>): Promise<boolean> {

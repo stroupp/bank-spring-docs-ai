@@ -1,9 +1,10 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
+import { DocumentationModelResponse, IDocumentationModelClient } from "../ai/documentationModelClient";
 import { IQwenClient, QwenClient } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
-import { maskSecrets } from "../ai/safeContextFilter";
+import { maskSecrets, maskSecretsWithStats } from "../ai/safeContextFilter";
 import { writeJsonl } from "../storage/jsonlWriter";
 import { sha256 } from "../utils/hash";
 import { safeName } from "../utils/pathUtils";
@@ -19,18 +20,41 @@ export interface QwenPageSemanticResult {
   failures: number;
 }
 
+export interface Qwen3OnlyPageSemanticOptions {
+  client: IDocumentationModelClient;
+  /** Secret-free client/configuration snapshot used to isolate verified cache entries. */
+  cacheIdentity: string;
+  expectedModelMarker?: string;
+}
+
+export class Qwen3PageSemanticBoundaryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "Qwen3PageSemanticBoundaryError";
+  }
+}
+
 export class QwenPageSemanticAnalyzer {
   constructor(
     private readonly injectedClient?: IQwenClient,
     private readonly modelOverride?: string,
-    private readonly maxContextCharactersOverride?: number
+    private readonly maxContextCharactersOverride?: number,
+    private readonly qwen3Only?: Qwen3OnlyPageSemanticOptions
   ) {}
 
   async analyze(pageRoot: string, context: vscode.ExtensionContext, token?: vscode.CancellationToken): Promise<QwenPageSemanticResult> {
     await fs.mkdir(pageRoot, { recursive: true });
     const settings = new QwenSettingsService(context);
-    const client = this.injectedClient ?? new QwenClient(settings);
-    const model = this.modelOverride ?? settings.getSettings().model;
+    if (this.qwen3Only && this.qwen3Only.client.provider !== "qwen") {
+      throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic analysis requires provider=qwen.");
+    }
+    if (this.qwen3Only && !this.qwen3Only.cacheIdentity.trim()) {
+      throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic cache identity cannot be empty.");
+    }
+    const client = this.qwen3Only ? undefined : this.injectedClient ?? new QwenClient(settings);
+    const model = this.qwen3Only?.cacheIdentity.trim()
+      ?? this.modelOverride
+      ?? settings.getSettings().model;
     const pageContext = await readOptional(path.join(pageRoot, "page-context-pack.md"));
     const evidence = await readOptional(path.join(pageRoot, "page-evidence-pack.md"));
     const pageFlow = await readJson(path.join(pageRoot, "page-flow.json"));
@@ -41,7 +65,7 @@ export class QwenPageSemanticAnalyzer {
       maxContextCharacters
     );
 
-    const pageIdentity = String((pageFlow.selectedPage as Record<string, unknown> | undefined)?.pageName ?? path.basename(pageRoot));
+    const pageIdentity = maskSecrets(String((pageFlow.selectedPage as Record<string, unknown> | undefined)?.pageName ?? path.basename(pageRoot)));
     const pageSemanticsPath = path.join(pageRoot, "qwen-page-semantics.json");
     const interactionSemanticsPath = path.join(pageRoot, "qwen-interaction-semantics.jsonl");
     const cacheRoot = path.join(pageRoot, ".cache", "qwen");
@@ -55,10 +79,14 @@ export class QwenPageSemanticAnalyzer {
     } else {
       let rawOutput = "";
       try {
-        rawOutput = await client.ask(pagePrompt, token);
+        rawOutput = await this.askSemantic(client, pagePrompt, token);
         pageSemantics = parseStrictJson(rawOutput);
         await writeCache(pageCache.path, pageSemantics);
       } catch (error) {
+        ensureNotCancelled(token);
+        if (error instanceof Qwen3PageSemanticBoundaryError) {
+          throw error;
+        }
         failures += 1;
         if (rawOutput) {
           await writeDebug(cacheRoot, `page-${pageIdentity}`, rawOutput);
@@ -73,9 +101,7 @@ export class QwenPageSemanticAnalyzer {
     const interactionRecords = importantInteractions(pageFlow);
     const interactionSemantics: unknown[] = [];
     for (const interaction of interactionRecords) {
-      if (token?.isCancellationRequested) {
-        break;
-      }
+      ensureNotCancelled(token);
       let rawOutput = "";
       try {
         const prompt = buildInteractionSemanticPrompt(prepareQwenContext(JSON.stringify({
@@ -94,11 +120,15 @@ export class QwenPageSemanticAnalyzer {
           cacheHits += 1;
           continue;
         }
-        rawOutput = await client.ask(prompt, token);
+        rawOutput = await this.askSemantic(client, prompt, token);
         const parsed = parseStrictJson(rawOutput);
         await writeCache(cached.path, parsed);
         interactionSemantics.push(parsed);
-      } catch {
+      } catch (error) {
+        ensureNotCancelled(token);
+        if (error instanceof Qwen3PageSemanticBoundaryError) {
+          throw error;
+        }
         failures += 1;
         if (rawOutput) {
           await writeDebug(cacheRoot, `interaction-${pageIdentity}`, rawOutput);
@@ -114,6 +144,70 @@ export class QwenPageSemanticAnalyzer {
       cacheHits,
       failures
     };
+  }
+
+  private async askSemantic(
+    legacyClient: IQwenClient | undefined,
+    prompt: string,
+    token?: vscode.CancellationToken
+  ): Promise<string> {
+    if (!this.qwen3Only) {
+      if (!legacyClient) {
+        throw new Error("Qwen semantic client is unavailable.");
+      }
+      return legacyClient.ask(prompt, token);
+    }
+    if (!token) {
+      throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic analysis requires a cancellation token.");
+    }
+    const response = await this.qwen3Only.client.send(prompt, token);
+    validateQwen3SemanticResponse(response, this.qwen3Only.expectedModelMarker ?? "qwen3");
+    return cleanAndMaskQwen3SemanticOutput(response.text);
+  }
+}
+
+function validateQwen3SemanticResponse(response: DocumentationModelResponse, expectedMarker: string): void {
+  if (response.provider !== "qwen") {
+    throw new Qwen3PageSemanticBoundaryError(`Qwen3-only semantic analysis rejected provider '${response.provider}'.`);
+  }
+  const identity = `${response.model.id} ${response.model.name} ${response.model.family}`;
+  if (!containsIdentitySegment(identity, expectedMarker)) {
+    throw new Qwen3PageSemanticBoundaryError(
+      `Qwen3-only semantic analysis rejected unexpected model '${response.model.id}'.`
+    );
+  }
+  if (!response.text.trim()) {
+    throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic analysis received an empty response.");
+  }
+}
+
+function cleanAndMaskQwen3SemanticOutput(value: string): string {
+  const withoutThinking = value
+    .replace(/^\uFEFF?\s*(?:<think>[\s\S]*?<\/think>\s*)+/i, "")
+    .trim();
+  if (/^<think>/i.test(withoutThinking)) {
+    throw new Qwen3PageSemanticBoundaryError("Qwen3 semantic response contained an unterminated reasoning block.");
+  }
+  const outerFence = withoutThinking.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/i);
+  const clean = maskSecretsWithStats(outerFence?.[1] ?? withoutThinking).text.trim();
+  if (!clean) {
+    throw new Qwen3PageSemanticBoundaryError("Qwen3 semantic response became empty after sanitation.");
+  }
+  return clean;
+}
+
+function containsIdentitySegment(identity: string, expectedMarker: string): boolean {
+  const marker = expectedMarker.trim().toLowerCase();
+  if (!marker) {
+    return false;
+  }
+  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "i").test(identity);
+}
+
+function ensureNotCancelled(token?: vscode.CancellationToken): void {
+  if (token?.isCancellationRequested) {
+    throw new Error("Qwen isteği kullanıcı tarafından iptal edildi.");
   }
 }
 
@@ -185,7 +279,17 @@ async function writeCache(cachePath: string, value: unknown): Promise<void> {
 async function writeDebug(root: string, identity: string, rawOutput: string): Promise<void> {
   const target = path.join(root, "debug", `${safeName(identity)}-${Date.now()}.txt`);
   await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, rawOutput, "utf8");
+  await fs.writeFile(target, safeSemanticDebugOutput(rawOutput), "utf8");
+}
+
+function safeSemanticDebugOutput(value: string): string {
+  const withoutThinking = value
+    .replace(/^\uFEFF?\s*(?:<think>[\s\S]*?<\/think>\s*)+/i, "")
+    .trim();
+  if (/^<think>/i.test(withoutThinking)) {
+    return "[QWEN_REASONING_BLOCK_OMITTED]";
+  }
+  return maskSecretsWithStats(withoutThinking).text;
 }
 
 function failedSemanticRecord(pageIdentity: string, error: unknown): Record<string, unknown> {
@@ -193,6 +297,6 @@ function failedSemanticRecord(pageIdentity: string, error: unknown): Record<stri
     page: pageIdentity,
     confidence: "low",
     uncertainties: ["Qwen semantik analizi tamamlanamadı; yerel context ve evidence artefaktları kullanılmaya devam edilebilir."],
-    error: error instanceof Error ? error.message : String(error)
+    error: maskSecretsWithStats(error instanceof Error ? error.message : String(error)).text
   };
 }

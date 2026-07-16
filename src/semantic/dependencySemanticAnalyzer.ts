@@ -2,6 +2,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { QwenClient } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
+import { maskSecrets } from "../ai/safeContextFilter";
 import { readJsonl, writeJsonl } from "../storage/jsonlWriter";
 import { sha256 } from "../utils/hash";
 import { buildDependencySemanticPrompt } from "./qwenSemanticPrompts";
@@ -25,7 +26,8 @@ export class DependencySemanticAnalyzer {
     for (const dependency of dependencies) {
       const identity = `${dependency.from}:${dependency.to}:${dependency.relation}:${dependency.file}`;
       try {
-        const contextPayload = JSON.stringify({ dependency }, null, 2);
+        ensureNotCancelled(token);
+        const contextPayload = maskSecrets(JSON.stringify({ dependency }, null, 2));
         const cacheKey = cache.buildCacheKey(identity, sha256(contextPayload));
         const cached = cacheEnabled ? await cache.read("dependencies", identity, cacheKey) : undefined;
         if (cached) {
@@ -39,6 +41,7 @@ export class DependencySemanticAnalyzer {
         enriched.push(parsed);
         stats.analyzed += 1;
       } catch (error) {
+        ensureNotCancelled(token);
         stats.failures += 1;
         await cache.writeDebug(identity, error instanceof Error ? error.message : String(error));
       }
@@ -46,5 +49,11 @@ export class DependencySemanticAnalyzer {
 
     await writeJsonl(path.join(aiDocsPath, "enriched", "enriched-dependencies.jsonl"), enriched);
     return stats;
+  }
+}
+
+function ensureNotCancelled(token?: vscode.CancellationToken): void {
+  if (token?.isCancellationRequested) {
+    throw new Error("Qwen isteği kullanıcı tarafından iptal edildi.");
   }
 }

@@ -1,5 +1,9 @@
 import * as vscode from "vscode";
-import { QwenSettingsService } from "./qwenSettingsService";
+import {
+  BANKING_QWEN_MODEL_ALIAS,
+  normalizeBankingQwenEndpoint,
+  QwenSettings
+} from "./qwenSettingsService";
 
 export type QwenConnectionResult = {
   ok: boolean;
@@ -14,34 +18,122 @@ export interface IQwenClient {
   testConnection?(): Promise<QwenConnectionResult>;
 }
 
+export interface QwenSettingsProvider {
+  getSettings(): QwenSettings;
+  getApiKey(): Promise<string | undefined>;
+}
+
 type QwenResponse = {
+  id?: string;
+  model?: string;
   choices?: Array<{
-    message?: { content?: string };
+    message?: { content?: string | null; reasoning_content?: string | null };
     text?: string;
+    finish_reason?: string | null;
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
 };
 
+export type QwenChatRole = "system" | "user" | "assistant";
+
+export interface QwenChatMessage {
+  role: QwenChatRole;
+  content: string;
+}
+
+export interface QwenCompletionOptions {
+  temperature?: number;
+  maxTokens?: number;
+  timeoutSeconds?: number;
+}
+
+export interface QwenCompletionUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
+export interface QwenCompletionResult {
+  content: string;
+  finishReason?: string;
+  model: string;
+  requestId?: string;
+  usage: QwenCompletionUsage;
+}
+
+export class QwenRequestCancelledError extends Error {
+  constructor() {
+    super("Qwen isteği kullanıcı tarafından iptal edildi.");
+    this.name = "QwenRequestCancelledError";
+  }
+}
+
+export class QwenRequestTimeoutError extends Error {
+  constructor(timeoutSeconds: number) {
+    super(`Qwen isteği ${timeoutSeconds} saniye içinde tamamlanamadı ve zaman aşımına uğradı.`);
+    this.name = "QwenRequestTimeoutError";
+  }
+}
+
 export class QwenClient implements IQwenClient {
-  constructor(private readonly settingsService: QwenSettingsService) {}
+  constructor(private readonly settingsService: QwenSettingsProvider) {}
 
   async ask(prompt: string, token?: vscode.CancellationToken): Promise<string> {
+    const result = await this.complete([{ role: "user", content: prompt }], {}, token);
+    if (result.finishReason?.toLowerCase() === "length") {
+      throw new Error("Qwen yanıtı maksimum token sınırında kesildi. qwen.maxTokens ayarını artırın veya bağlamı küçültün.");
+    }
+    return result.content;
+  }
+
+  async complete(
+    messages: QwenChatMessage[],
+    options: QwenCompletionOptions = {},
+    token?: vscode.CancellationToken
+  ): Promise<QwenCompletionResult> {
+    if (vscode.workspace.isTrusted === false) {
+      throw new Error("Qwen çağrısı için VS Code çalışma alanına güvenilmelidir.");
+    }
     const settings = this.settingsService.getSettings();
-    if (!settings.model.trim()) {
+    const requestModel = settings.bankingEnvironment ? BANKING_QWEN_MODEL_ALIAS : settings.model.trim();
+    if (!requestModel) {
       throw new Error("Qwen model adı boş olamaz.");
     }
     if (!settings.endpoint.trim()) {
       throw new Error("Qwen endpoint adresi boş olamaz.");
     }
+    if (!messages.length || messages.some((message) => !message.content.trim())) {
+      throw new Error("Qwen isteği en az bir boş olmayan mesaj içermelidir.");
+    }
+
+    const timeoutSeconds = positiveNumber(options.timeoutSeconds ?? settings.timeoutSeconds, "Qwen timeout");
+    const maxTokens = positiveNumber(options.maxTokens ?? settings.maxTokens, "Qwen max token");
+    const temperature = finiteNumber(options.temperature ?? settings.temperature, "Qwen temperature");
+    if (token?.isCancellationRequested) {
+      throw new QwenRequestCancelledError();
+    }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error("Qwen isteği zaman aşımına uğradı.")), settings.timeoutSeconds * 1000);
-    const cancellation = token?.onCancellationRequested(() => controller.abort(new Error("Qwen isteği iptal edildi.")));
+    let timedOut = false;
+    let cancelled = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutSeconds * 1000);
+    const cancellation = token?.onCancellationRequested(() => {
+      cancelled = true;
+      controller.abort();
+    });
 
     try {
       const headers: Record<string, string> = {
         "Content-Type": "application/json"
       };
-      if (settings.useApiKey) {
+      if (!settings.bankingEnvironment && settings.useApiKey) {
         const apiKey = await this.settingsService.getApiKey();
         if (!apiKey) {
           throw new Error("API Key kullanımı açık ancak SecretStorage içinde API key bulunamadı.");
@@ -49,35 +141,68 @@ export class QwenClient implements IQwenClient {
         headers.Authorization = `Bearer ${apiKey}`;
       }
 
+      if (settings.bankingEnvironment) {
+        assertBankingQwenEndpoint(settings.endpoint);
+      }
       const endpoint = normalizeChatCompletionsEndpoint(settings.endpoint);
+      assertQwenEndpointAllowed(endpoint, settings.bankingEnvironment);
       const response = await fetch(endpoint, {
         method: "POST",
+        redirect: "error",
         headers,
         body: JSON.stringify({
-          model: settings.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: settings.temperature,
-          max_tokens: settings.maxTokens
+          model: requestModel,
+          messages,
+          temperature,
+          max_tokens: Math.floor(maxTokens),
+          stream: false
         }),
         signal: controller.signal
       });
 
       if (response.status === 401 || response.status === 403) {
-        throw new Error("Qwen isteği yetkisiz döndü. API key ayarını kontrol et.");
+        throw new Error("Qwen isteği yetkisiz döndü. API key ayarını kontrol edin.");
       }
       if (!response.ok) {
-        const detail = await readErrorDetail(response);
-        throw new Error(`Qwen HTTP hatası: ${response.status} ${response.statusText}. Endpoint: ${endpoint}${detail ? `. Detay: ${detail}` : ""}`);
+        throw new Error(`Qwen HTTP hatası: ${response.status} ${response.statusText}. Sunucu hata gövdesi güvenlik nedeniyle kaydedilmedi.`);
       }
 
-      const data = (await response.json()) as QwenResponse;
-      const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text;
-      if (!content) {
-        throw new Error("Qwen yanıtı geçersiz: choices[0].message.content veya choices[0].text bulunamadı.");
+      let data: QwenResponse;
+      try {
+        data = (await response.json()) as QwenResponse;
+      } catch {
+        throw new Error("Qwen yanıtı geçerli JSON içermiyor.");
       }
-      return content;
+      if (token?.isCancellationRequested || cancelled) {
+        throw new QwenRequestCancelledError();
+      }
+
+      const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text;
+      if (typeof content !== "string" || !content.trim()) {
+        throw new Error("Qwen yanıtı geçersiz veya boş: choices[0].message.content ya da choices[0].text bulunamadı.");
+      }
+      const responseModel = data.model?.trim() || requestModel;
+      if (settings.bankingEnvironment && !isApprovedBankingResponseModel(responseModel)) {
+        throw new Error(`Banking environment rejected unexpected Qwen model response '${responseModel}'.`);
+      }
+
+      return {
+        content,
+        finishReason: data.choices?.[0]?.finish_reason ?? undefined,
+        model: responseModel,
+        requestId: data.id,
+        usage: {
+          promptTokens: finiteOptionalNumber(data.usage?.prompt_tokens),
+          completionTokens: finiteOptionalNumber(data.usage?.completion_tokens),
+          totalTokens: finiteOptionalNumber(data.usage?.total_tokens)
+        }
+      };
     } catch (error) {
-      throw normalizeQwenError(error);
+      throw normalizeQwenError(error, {
+        cancelled: cancelled || Boolean(token?.isCancellationRequested),
+        timedOut,
+        timeoutSeconds
+      });
     } finally {
       clearTimeout(timeout);
       cancellation?.dispose();
@@ -86,56 +211,150 @@ export class QwenClient implements IQwenClient {
 
   async testConnection(): Promise<QwenConnectionResult> {
     const settings = this.settingsService.getSettings();
+    const endpoint = endpointForDisplay(settings.endpoint);
+    const model = settings.bankingEnvironment ? BANKING_QWEN_MODEL_ALIAS : settings.model;
     try {
-      const output = await this.ask("Return exactly this JSON: {\"ok\":true}");
+      const result = await this.complete([
+        {
+          role: "system",
+          content: "You are a Qwen connection test. Return only the exact JSON requested by the user, without explanation."
+        },
+        { role: "user", content: "Return exactly this JSON: {\"ok\":true}" }
+      ]);
+      const output = result.content;
+      if (!/\{\s*"ok"\s*:\s*true\s*\}/i.test(output)) {
+        throw new Error("Qwen connection test did not return the expected {\"ok\":true} JSON response.");
+      }
       return {
         ok: true,
         message: `Qwen bağlantısı başarılı. Yanıt alındı (${Math.min(output.length, 80)} karakter).`,
-        model: settings.model,
-        endpoint: normalizeChatCompletionsEndpoint(settings.endpoint)
+        model,
+        endpoint
       };
     } catch (error) {
       return {
         ok: false,
         message: error instanceof Error ? error.message : String(error),
-        model: settings.model,
-        endpoint: normalizeChatCompletionsEndpoint(settings.endpoint)
+        model,
+        endpoint
       };
     }
   }
 }
 
-function normalizeChatCompletionsEndpoint(endpoint: string): string {
+export function normalizeChatCompletionsEndpoint(endpoint: string): string {
   const trimmed = endpoint.trim().replace(/\/+$/, "");
-  if (/\/chat\/completions$/i.test(trimmed)) {
-    return trimmed;
-  }
-  if (/\/compatible-mode\/v1$/i.test(trimmed) || /\/v1$/i.test(trimmed)) {
-    return `${trimmed}/chat/completions`;
-  }
-  if (/dashscope-intl\.aliyuncs\.com$/i.test(trimmed) || /dashscope\.aliyuncs\.com$/i.test(trimmed)) {
-    return `${trimmed}/compatible-mode/v1/chat/completions`;
-  }
-  return trimmed;
-}
-
-async function readErrorDetail(response: Response): Promise<string> {
+  let parsed: URL;
   try {
-    return (await response.text()).slice(0, 500);
+    parsed = new URL(trimmed);
   } catch {
-    return "";
+    throw new Error("Qwen endpoint adresi geçerli bir HTTP(S) URL olmalıdır.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Qwen endpoint adresi yalnızca HTTP veya HTTPS protokolü kullanabilir.");
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error("Qwen endpoint adresinde kullanıcı adı veya parola bulunamaz. API key için SecretStorage kullanın.");
+  }
+
+  const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+  if (/\/chat\/completions$/i.test(normalizedPath)) {
+    parsed.pathname = normalizedPath;
+  } else if (/\/compatible-mode\/v1$/i.test(normalizedPath) || /\/v1$/i.test(normalizedPath)) {
+    parsed.pathname = `${normalizedPath}/chat/completions`;
+  } else if (/^(dashscope-intl|dashscope)\.aliyuncs\.com$/i.test(parsed.hostname)) {
+    parsed.pathname = `${normalizedPath}/compatible-mode/v1/chat/completions`.replace(/\/+/g, "/");
+  } else if (!normalizedPath) {
+    parsed.pathname = "/v1/chat/completions";
+  }
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+export function assertQwenEndpointAllowed(endpoint: string, bankingEnvironment = false): void {
+  if (bankingEnvironment) {
+    assertBankingQwenEndpoint(endpoint);
+  }
+  const parsed = new URL(endpoint);
+  const configured = vscode.workspace
+    .getConfiguration("bankSpringDocs")
+    .get<string[]>("qwen.allowedHosts", ["localhost", "127.0.0.1", "::1"]);
+  const allowedHosts = configured.map(normalizeHost).filter(Boolean);
+  const hostname = normalizeHost(parsed.hostname);
+  if (!allowedHosts.includes(hostname)) {
+    throw new Error(
+      `Qwen endpoint hostu '${hostname}' izin listesinde değil. ` +
+      "Makine ayarındaki bankSpringDocs.qwen.allowedHosts listesine onaylı hostu ekleyin."
+    );
   }
 }
 
-function normalizeQwenError(error: unknown): Error {
+/**
+ * Banking mode narrows the accepted URL shape. Host approval remains an
+ * independent, machine-scoped allowlist check performed by
+ * assertQwenEndpointAllowed.
+ */
+export function assertBankingQwenEndpoint(endpoint: string): void {
+  normalizeBankingQwenEndpoint(endpoint);
+}
+
+function normalizeHost(value: string): string {
+  return value.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+}
+
+function isApprovedBankingResponseModel(model: string): boolean {
+  const normalized = model.trim();
+  return normalized.toUpperCase() === BANKING_QWEN_MODEL_ALIAS
+    || /(?:^|[\/:._-])qwen3(?:$|[\/:._-])/i.test(normalized);
+}
+
+function endpointForDisplay(endpoint: string): string {
+  try {
+    const parsed = new URL(normalizeChatCompletionsEndpoint(endpoint));
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "[geçersiz endpoint]";
+  }
+}
+
+function normalizeQwenError(
+  error: unknown,
+  state: { cancelled: boolean; timedOut: boolean; timeoutSeconds: number }
+): Error {
+  if (state.cancelled || error instanceof QwenRequestCancelledError) {
+    return new QwenRequestCancelledError();
+  }
+  if (state.timedOut || error instanceof QwenRequestTimeoutError) {
+    return new QwenRequestTimeoutError(state.timeoutSeconds);
+  }
   if (error instanceof Error) {
-    if (error.name === "AbortError" || /abort|timeout|zaman aşımı/i.test(error.message)) {
-      return new Error("Qwen bağlantısı zaman aşımına uğradı veya iptal edildi.");
-    }
     if (/ECONNREFUSED|fetch failed|Failed to fetch|connection refused/i.test(error.message)) {
-      return new Error("Qwen bağlantısı kurulamadı. Endpoint çalışıyor mu kontrol et.");
+      return new Error("Qwen bağlantısı kurulamadı. Endpoint çalışıyor mu kontrol edin.");
     }
     return error;
   }
   return new Error(String(error));
+}
+
+function finiteNumber(value: number, label: string): number {
+  if (!Number.isFinite(value)) {
+    throw new Error(`${label} ayarı geçerli bir sayı olmalıdır.`);
+  }
+  return value;
+}
+
+function positiveNumber(value: number, label: string): number {
+  const finite = finiteNumber(value, label);
+  if (finite <= 0) {
+    throw new Error(`${label} ayarı sıfırdan büyük olmalıdır.`);
+  }
+  return finite;
+}
+
+function finiteOptionalNumber(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) ? value : undefined;
 }

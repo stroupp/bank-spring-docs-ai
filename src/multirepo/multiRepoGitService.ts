@@ -1,4 +1,6 @@
+import * as path from "path";
 import { GitService } from "../git/gitService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 import { MultiRepoManifest, MultiRepoRole } from "./multiRepoManifestService";
 
 export interface MultiRepoCloneResult {
@@ -9,6 +11,8 @@ export interface MultiRepoCloneResult {
 
 export class MultiRepoGitService {
   private readonly gitService = new GitService();
+
+  constructor(private readonly cloneRoot: string) {}
 
   async cloneOrUpdateAll(manifest: MultiRepoManifest): Promise<MultiRepoCloneResult> {
     const cloned: MultiRepoRole[] = [];
@@ -25,7 +29,11 @@ export class MultiRepoGitService {
       }
 
       try {
+        await assertPathContainedForWrite(this.cloneRoot, repo.localPath);
+        await assertPathContainedForWrite(this.cloneRoot, path.join(repo.localPath, ".git"));
         await this.gitService.cloneOrUpdate(repo.url, manifest.branch, repo.localPath);
+        await assertPathContainedForWrite(this.cloneRoot, repo.localPath);
+        await assertPathContainedForWrite(this.cloneRoot, path.join(repo.localPath, ".git"));
         repo.status = "ready";
         repo.error = undefined;
         cloned.push(role);

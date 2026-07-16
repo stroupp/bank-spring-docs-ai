@@ -37,7 +37,7 @@ export class TraceabilityReportGenerator {
       ...asBullets(input.bffToBe.map((match) => `${match.bffEndpoint} -> ${match.beEndpoint ?? "Eslesmedi"} (${match.confidence}) - ${match.matchReason}`)),
       "",
       "## Sayfa Akislari",
-      ...asBullets(input.pageFlows.map((flow) => `${flow.page}${flow.route ? ` (${flow.route})` : ""}: ${flow.uiApiCall} -> ${flow.bffEndpoint ?? "BFF yok"} -> ${flow.beEndpoint ?? "BE yok"} (${flow.confidence})`)),
+      ...asBullets(input.pageFlows.map((flow) => `${flow.page}${flow.route ? ` (${flow.route})` : ""}: ${flow.uiApiCall} -> ${flow.bffEndpoint ?? "BFF yok"} -> ${flow.beEndpoint ?? "BE yok"} (${flow.confidence})${flowEvidenceSummary(flow)}`)),
       "",
       "## Kismi Eslesmeler",
       ...asBullets(input.pageFlows.filter((flow) => flow.confidence === "partial").map((flow) => `${flow.page}: ${flow.uncertainties.join("; ")}`)),
@@ -52,9 +52,7 @@ export class TraceabilityReportGenerator {
       "- unmatched: Lokal indekslerden eslesme bulunamadi.",
       "",
       "## Onerilen Aksiyonlar",
-      "- BFF outbound-call indeksleri eklendiginde BFF -> BE eslesmeleri daha guclu hale gelir.",
-      "- UI API client fonksiyon adlari ve endpoint path sabitleri netlestikce confidence artar.",
-      "- Kismi akislari Qwen semantik fazinda dusuk confidence fallback olarak islemek uygun olur."
+      ...asBullets(recommendedActions(input))
     ].join("\n");
   }
 
@@ -75,6 +73,43 @@ export class TraceabilityReportGenerator {
       unresolved: input.unresolved
     };
   }
+}
+
+function flowEvidenceSummary(flow: PageFlowRecord): string {
+  const evidence: string[] = [];
+  if (flow.beFlow.length) {
+    evidence.push(`BE kaniti: ${summarize(flow.beFlow)}`);
+  }
+  if (flow.entities.length) {
+    evidence.push(`entity: ${summarize(flow.entities)}`);
+  }
+  if (flow.tables.length) {
+    evidence.push(`table: ${summarize(flow.tables)}`);
+  }
+  return evidence.length ? `; ${evidence.join("; ")}` : "";
+}
+
+function summarize(values: string[], limit = 4): string {
+  const unique = [...new Set(values)];
+  const visible = unique.slice(0, limit).join(", ");
+  return unique.length > limit ? `${visible} (+${unique.length - limit})` : visible;
+}
+
+function recommendedActions(input: TraceabilityReportInput): string[] {
+  const actions: string[] = [];
+  if (input.uiToBff.some((match) => match.confidence === "unmatched" || match.confidence === "low")) {
+    actions.push("Eslesmeyen UI cagrilari icin API client path sabitlerini ve cagri sahipligini netlestirin.");
+  }
+  if (input.bffToBe.some((match) => match.confidence === "unmatched" || match.confidence === "low")) {
+    actions.push("Eslesmeyen BFF akislari icin outbound client hedeflerini ve method/path kanitini gozden gecirin.");
+  }
+  if (input.pageFlows.some((flow) => flow.confidence === "partial" || flow.uncertainties.length > 0)) {
+    actions.push("Kismi sayfa akislarinda listelenen belirsizlikleri kaynak veya semantik analiz kanitiyla kapatin.");
+  }
+  if (!actions.length) {
+    actions.push("Lokal deterministik eslemeler tamamlandi; yayinlamadan once is kurali ve yetki davranislarini alan sahibiyle dogrulayin.");
+  }
+  return actions;
 }
 
 function asBullets(values: string[]): string[] {

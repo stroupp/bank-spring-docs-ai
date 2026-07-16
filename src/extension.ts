@@ -105,7 +105,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bankSpringDocs.buildFinalSelectedPageDocument", () => buildFinalSelectedPageDocumentCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.openFinalSelectedPageDocument", () => openFinalSelectedPageDocumentCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.scoreSelectedPageDocument", () => scoreSelectedPageDocumentCommand(context)),
-    vscode.commands.registerCommand("bankSpringDocs.runFullSelectedPageAnalysis", () => runFullSelectedPageAnalysisCommand(context)),
+    vscode.commands.registerCommand("bankSpringDocs.runFullSelectedPageAnalysis", (options) => runFullSelectedPageAnalysisCommand(context, options)),
     vscode.commands.registerCommand("bankSpringDocs.generatePageTechnicalAnalysis", () => analyzeSelectedPageCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.openUnresolvedMultiRepoMatches", () => openUnresolvedMultiRepoMatchesCommand(context)),
     vscode.commands.registerCommand("bankSpringDocs.openMultiRepoOutputFolder", () => openMultiRepoOutputFolderCommand(context)),

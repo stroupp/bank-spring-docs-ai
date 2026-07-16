@@ -4,6 +4,9 @@ import { LocalKnowledgeGraphBuilder } from "../graph/localKnowledgeGraphBuilder"
 import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
 import { MultiRepoQualityReportGenerator } from "../multirepo/multiRepoQualityReportGenerator";
 import { MultiRepoTraceabilityService } from "../multirepo/multiRepoTraceabilityService";
+import { MultiRepoArtifactIdentityService } from "../multirepo/multiRepoArtifactIdentityService";
+import { atomicWriteJson } from "../storage/atomicFile";
+import { PipelineArtifactReceiptService } from "../multirepo/pipelineArtifactReceiptService";
 
 export interface PagePipelineFreshnessIssue {
   artifact: string;
@@ -46,6 +49,7 @@ const derivedArtifacts = [
   "traceability/ui-to-bff.jsonl",
   "traceability/bff-to-be.jsonl",
   "traceability/page-flows.jsonl",
+  "traceability/pipeline-manifest.json",
   "graph/nodes.jsonl",
   "graph/edges.jsonl",
   "quality/multi-repo-quality-report.json"
@@ -53,7 +57,25 @@ const derivedArtifacts = [
 
 export class PagePipelineFreshnessService {
   async ensure(multiRepoRoot: string, manifest: MultiRepoManifest): Promise<PagePipelineFreshnessResult> {
+    const identityIssues = await new MultiRepoArtifactIdentityService().inspect(multiRepoRoot, manifest);
     const firstCheck = await this.inspect(multiRepoRoot);
+    firstCheck.issues.unshift(...identityIssues.map((issue) => ({
+      artifact: `${issue.role}/manifest.json`,
+      severity: "high" as const,
+      problem: "stale" as const,
+      message: issue.message
+    })));
+    try {
+      await new PipelineArtifactReceiptService()
+        .assertTraceabilityCompatible(multiRepoRoot, manifest, { allowMissing: true });
+    } catch (error) {
+      firstCheck.issues.push({
+        artifact: "traceability/pipeline-manifest.json",
+        severity: "medium",
+        problem: "stale",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
     const missingBase = firstCheck.issues.filter((issue) => issue.severity === "high");
     const derivedNeedsRefresh = firstCheck.issues.some((issue) => derivedArtifacts.includes(issue.artifact));
     let regeneratedDerivedArtifacts = false;
@@ -74,7 +96,7 @@ export class PagePipelineFreshnessService {
       reportPath: path.join(multiRepoRoot, "audit", "page-pipeline-freshness.json")
     };
     await fs.mkdir(path.dirname(result.reportPath), { recursive: true });
-    await fs.writeFile(result.reportPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    await atomicWriteJson(result.reportPath, result);
     return result;
   }
 
@@ -138,7 +160,10 @@ async function statArtifact(root: string, artifact: string): Promise<{ artifact:
   try {
     const stat = await fs.stat(path.join(root, artifact));
     return { artifact, mtimeMs: stat.mtimeMs, mtimeIso: stat.mtime.toISOString() };
-  } catch {
-    return { artifact };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { artifact };
+    }
+    throw error;
   }
 }

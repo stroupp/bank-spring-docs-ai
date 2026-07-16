@@ -1,8 +1,15 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { CopilotResponseWithUsage, CopilotUsageEstimate, ICopilotClient, RealCopilotClient } from "../ai/copilotClient";
+import { RealCopilotClient } from "../ai/copilotClient";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
+import {
+  DocumentationModelInfo,
+  DocumentationModelProvider,
+  DocumentationModelResponse,
+  DocumentationModelUsage,
+  IDocumentationModelClient
+} from "../ai/documentationModelClient";
 import { buildCopilotMultiRepoAgenticPrompt, CopilotMultiRepoAgenticStep } from "../ai/prompts";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
 import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
@@ -18,7 +25,7 @@ export interface MultiRepoCopilotAgenticProgress {
   stepLabel: string;
   phase: "started" | "streaming" | "completed";
   message: string;
-  usage?: CopilotUsageEstimate;
+  usage?: DocumentationModelUsage;
 }
 
 export interface MultiRepoCopilotAgenticResult {
@@ -66,7 +73,7 @@ const statusPhaseByStep: Record<CopilotMultiRepoAgenticStep, string> = {
 export class MultiRepoCopilotAgenticDocumentationGenerator {
   constructor(
     private readonly markdownWriter = new MarkdownWriter(),
-    private readonly copilotClient: ICopilotClient = new RealCopilotClient()
+    private readonly modelClient: IDocumentationModelClient = new RealCopilotClient()
   ) {}
 
   async generate(
@@ -76,7 +83,12 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
     onProgress?: (progress: MultiRepoCopilotAgenticProgress) => void,
     existingRunStatus?: MultiRepoAgenticRunStatusWriter
   ): Promise<MultiRepoCopilotAgenticResult> {
-    const runStatus = existingRunStatus ?? await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
+    const runStatus = existingRunStatus ?? await MultiRepoAgenticRunStatusWriter.create(
+      multiRepoRoot,
+      manifest,
+      undefined,
+      { provider: resolveProvider(undefined, this.modelClient.provider) }
+    );
     const runId = runStatus.runId;
     const workspaceRoot = runStatus.workspaceRoot;
 
@@ -88,6 +100,8 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
     let requestCount = priorUsage.requestCount;
     let newRequestCount = 0;
     let reusedStepCount = 0;
+    let finalProvider = resolveProvider(undefined, this.modelClient.provider);
+    let finalModel: DocumentationModelInfo | undefined;
 
     try {
     for (let index = 0; index < steps.length; index += 1) {
@@ -96,17 +110,22 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
       const stepIndex = index + 1;
       const stepLabel = stepLabels[step];
       if (token.isCancellationRequested) {
-        throw new Error("Multi-repo Copilot agentic analysis was cancelled.");
+        throw new Error(`Multi-repo ${providerDisplayName(finalProvider)} agentic analysis was cancelled.`);
       }
 
       if (runStatus.isPhaseReusable(statusPhase)) {
+        const reusablePhase = runStatus.phaseSnapshot(statusPhase);
+        const reusableProvider = providerFromDetails(reusablePhase.details);
+        const reusableModel = modelFromDetails(reusablePhase.details);
+        finalProvider = reusableProvider ?? finalProvider;
+        finalModel = reusableModel ?? finalModel;
         const validation = await runStatus.validatePhaseArtifacts(statusPhase);
         if (!validation.valid || !validation.copilotOutputArtifact) {
-          throw new Error(`Reusable Copilot output is unavailable for multi-repo agentic step: ${step}.`);
+          throw new Error(`Reusable model output is unavailable for multi-repo agentic step: ${step}.`);
         }
         const reusedOutput = await fs.readFile(validation.copilotOutputArtifact, "utf8");
         if (!reusedOutput.trim()) {
-          throw new Error(`Reusable Copilot output is empty for multi-repo agentic step: ${step}.`);
+          throw new Error(`Reusable model output is empty for multi-repo agentic step: ${step}.`);
         }
         stepArtifacts.push(validation.copilotOutputArtifact);
         previousOutputs.push(`# ${step}\n\n${reusedOutput}`);
@@ -150,16 +169,17 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
           charactersSent: context.safeText.length,
           maskedSecrets: context.maskedSecrets,
           includedIndexes: context.includedIndexes,
+          provider: resolveProvider(undefined, this.modelClient.provider),
           attempt
         }
       });
 
       const requestStartedAt = Date.now();
-      let response: CopilotResponseWithUsage | undefined;
+      let response: DocumentationModelResponse | undefined;
       try {
         requestCount += 1;
         newRequestCount += 1;
-        response = await this.copilotClient.send(promptRequest, token, (usage) => {
+        response = await this.modelClient.send(promptRequest, token, (usage) => {
           onProgress?.({
             step,
             stepIndex,
@@ -170,6 +190,8 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
             usage
           });
         });
+        finalProvider = resolveProvider(response.provider, this.modelClient.provider);
+        finalModel = response.model;
         await runStatus.updatePhase(statusPhase, {
           details: {
             responseReceived: true,
@@ -178,6 +200,11 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
             estimatedOutputTokens: response.usage.estimatedOutputTokens,
             estimatedTotalTokens: response.usage.estimatedTotalTokens,
             modelCountedInputTokens: response.usage.modelCountedInputTokens,
+            promptTokens: response.usage.promptTokens,
+            completionTokens: response.usage.completionTokens,
+            totalTokens: response.usage.totalTokens,
+            provider: finalProvider,
+            finishReason: response.finishReason,
             selectedModelId: response.model.id,
             selectedModelName: response.model.name,
             selectedModelVendor: response.model.vendor,
@@ -188,7 +215,7 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
           }
         });
         if (!response.text.trim()) {
-          throw new Error(`Copilot returned an empty response for multi-repo agentic step: ${step}.`);
+          throw new Error(`${providerDisplayName(finalProvider)} returned an empty response for multi-repo agentic step: ${step}.`);
         }
 
         estimatedTotalTokens += response.usage.estimatedTotalTokens;
@@ -227,6 +254,9 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
           estimatedOutputTokens: response.usage.estimatedOutputTokens,
           estimatedTotalTokens: response.usage.estimatedTotalTokens,
           modelCountedInputTokens: response.usage.modelCountedInputTokens,
+          promptTokens: response.usage.promptTokens,
+          completionTokens: response.usage.completionTokens,
+          totalTokens: response.usage.totalTokens,
           outputCharacters: response.usage.outputCharacters,
           durationMs: Date.now() - requestStartedAt,
           copilotRequestStarted: true,
@@ -237,7 +267,10 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
           selectedModelFamily: response.model.family,
           selectedModelVersion: response.model.version,
           selectedModelMaxInputTokens: response.model.maxInputTokens,
-          modelFamily: "copilot",
+          provider: finalProvider,
+          finishReason: response.finishReason,
+          requestId: response.requestId,
+          modelFamily: finalProvider,
           status: "success"
         });
         await runStatus.completePhase(statusPhase, {
@@ -267,7 +300,7 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         manifest.branch,
         finalBody || previousOutputs.join("\n\n---\n\n"),
         path.join("generated-docs", "agentic"),
-        "Bank Spring Docs AI via multi-step GitHub Copilot Language Model API"
+        modelAttribution(finalProvider, finalModel?.name)
       );
       await runStatus.updatePhase("final-document", { artifacts: [finalDocumentPath] });
       await runStatus.completePhase("final-document", { artifacts: [finalDocumentPath] });
@@ -284,7 +317,9 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         estimatedTotalTokens,
         requestCount,
         newRequestCount,
-        reusedStepCount
+        reusedStepCount,
+        finalProvider,
+        finalModel?.name
       );
       const summaryArtifacts = [path.join(workspaceRoot, "run-summary.json"), path.join(workspaceRoot, "run-summary.md")];
       await runStatus.completePhase("run-summary", { artifacts: summaryArtifacts });
@@ -321,7 +356,7 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
     context: { safeText: string; includedIndexes: string[]; maskedSecrets: number },
     contextPath: string,
     promptPath: string,
-    response: CopilotResponseWithUsage | undefined,
+    response: DocumentationModelResponse | undefined,
     requestStartedAt: number,
     token: vscode.CancellationToken,
     error: unknown
@@ -345,6 +380,9 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         estimatedOutputTokens: response?.usage.estimatedOutputTokens,
         estimatedTotalTokens: response?.usage.estimatedTotalTokens,
         modelCountedInputTokens: response?.usage.modelCountedInputTokens,
+        promptTokens: response?.usage.promptTokens,
+        completionTokens: response?.usage.completionTokens,
+        totalTokens: response?.usage.totalTokens,
         outputCharacters: response?.usage.outputCharacters ?? 0,
         durationMs: Date.now() - requestStartedAt,
         copilotRequestStarted: true,
@@ -355,12 +393,15 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
         selectedModelFamily: response?.model.family,
         selectedModelVersion: response?.model.version,
         selectedModelMaxInputTokens: response?.model.maxInputTokens,
-        modelFamily: "copilot",
+        provider: resolveProvider(response?.provider, this.modelClient.provider),
+        finishReason: response?.finishReason,
+        requestId: response?.requestId,
+        modelFamily: resolveProvider(response?.provider, this.modelClient.provider),
         status: token.isCancellationRequested || /cancel/i.test(message) ? "cancelled" : "failed",
         error: message
       });
     } catch {
-      // Failure auditing is best-effort and must not hide the original Copilot error.
+      // Failure auditing is best-effort and must not hide the original model error.
     }
   }
 
@@ -583,7 +624,9 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
     estimatedTotalTokens: number,
     requestCount: number,
     newRequestCount: number,
-    reusedStepCount: number
+    reusedStepCount: number,
+    provider: DocumentationModelProvider,
+    modelName?: string
   ): Promise<void> {
     await fs.writeFile(path.join(workspaceRoot, "run-summary.json"), `${JSON.stringify({
       projectName: manifest.projectName,
@@ -595,18 +638,22 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
       requestCount,
       newRequestCount,
       reusedStepCount,
+      provider,
+      modelName,
       runStatusPath: path.join(workspaceRoot, "run-status.json")
     }, null, 2)}\n`, "utf8");
     await fs.writeFile(path.join(workspaceRoot, "run-summary.md"), [
-      "# Multi-Repo Copilot Agentic Run Summary",
+      `# Multi-Repo ${providerDisplayName(provider)} Agentic Run Summary`,
       "",
       `Project: ${manifest.projectName}`,
       `Branch: ${manifest.branch}`,
       `Run: ${runId}`,
+      `Provider: ${provider}`,
+      `Model: ${modelName ?? "unknown"}`,
       `Estimated tokens: ${estimatedTotalTokens}`,
       `Request attempts: ${requestCount}`,
       `New requests in this invocation: ${newRequestCount}`,
-      `Reused Copilot steps: ${reusedStepCount}`,
+      `Reused generation steps: ${reusedStepCount}`,
       `Final document: ${finalDocumentPath}`,
       `Run status: ${path.join(workspaceRoot, "run-status.json")}`,
       "",
@@ -615,6 +662,46 @@ export class MultiRepoCopilotAgenticDocumentationGenerator {
       ""
     ].join("\n"), "utf8");
   }
+}
+
+function providerDisplayName(provider: DocumentationModelProvider): string {
+  return provider === "qwen" ? "Qwen" : "Copilot";
+}
+
+function resolveProvider(
+  responseProvider?: DocumentationModelProvider,
+  clientProvider?: DocumentationModelProvider
+): DocumentationModelProvider {
+  return responseProvider ?? clientProvider ?? "copilot";
+}
+
+function providerFromDetails(details: Record<string, unknown> | undefined): DocumentationModelProvider | undefined {
+  const provider = details?.provider;
+  if (provider === "copilot" || provider === "qwen") {
+    return provider;
+  }
+  return details?.selectedModelVendor === "qwen" ? "qwen" : details?.selectedModelVendor === "copilot" ? "copilot" : undefined;
+}
+
+function modelFromDetails(details: Record<string, unknown> | undefined): DocumentationModelInfo | undefined {
+  if (!details || typeof details.selectedModelId !== "string" || typeof details.selectedModelName !== "string") {
+    return undefined;
+  }
+  return {
+    id: details.selectedModelId,
+    name: details.selectedModelName,
+    vendor: typeof details.selectedModelVendor === "string" ? details.selectedModelVendor : "unknown",
+    family: typeof details.selectedModelFamily === "string" ? details.selectedModelFamily : "unknown",
+    version: typeof details.selectedModelVersion === "string" ? details.selectedModelVersion : "unknown",
+    maxInputTokens: typeof details.selectedModelMaxInputTokens === "number" ? details.selectedModelMaxInputTokens : 0
+  };
+}
+
+function modelAttribution(provider: DocumentationModelProvider, modelName?: string): string {
+  const model = modelName ? ` (${modelName})` : "";
+  return provider === "qwen"
+    ? `Bank Spring Docs AI via multi-step configured Qwen endpoint${model}`
+    : `Bank Spring Docs AI via multi-step GitHub Copilot Language Model API${model}`;
 }
 
 function truncate(value: string, maxCharacters: number): string {

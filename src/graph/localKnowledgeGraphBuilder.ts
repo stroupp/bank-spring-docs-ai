@@ -1,9 +1,14 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { readJsonl, writeJsonl } from "../storage/jsonlWriter";
+import { readRequiredJsonl, writeJsonl } from "../storage/jsonlWriter";
 import { sha256 } from "../utils/hash";
 import { safeName } from "../utils/pathUtils";
 import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
+import { MultiRepoArtifactIdentityService } from "../multirepo/multiRepoArtifactIdentityService";
+import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
+import { repositoryUrlForArtifact } from "../utils/repositoryUrl";
+import { PipelineArtifactReceiptService } from "../multirepo/pipelineArtifactReceiptService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 
 export type KnowledgeNodeType =
   | "Repo"
@@ -53,8 +58,13 @@ export interface KnowledgeGraphResult {
 
 export class LocalKnowledgeGraphBuilder {
   async build(multiRepoRoot: string, manifest: MultiRepoManifest): Promise<KnowledgeGraphResult> {
+    await new MultiRepoArtifactIdentityService().assertCompatible(multiRepoRoot, manifest);
+    const hasTraceability = await new PipelineArtifactReceiptService()
+      .assertTraceabilityCompatible(multiRepoRoot, manifest, { allowMissing: true });
     const graphRoot = path.join(multiRepoRoot, "graph");
+    await assertPathContainedForWrite(multiRepoRoot, graphRoot);
     await fs.mkdir(graphRoot, { recursive: true });
+    await assertPathContainedForWrite(multiRepoRoot, graphRoot);
 
     const nodes: KnowledgeNode[] = [];
     const edges: KnowledgeEdge[] = [];
@@ -76,9 +86,9 @@ export class LocalKnowledgeGraphBuilder {
     };
 
     const systemId = addNode(node("system", "Repo", manifest.projectName, "system", { branch: manifest.branch }));
-    const uiRepoId = addNode(node("repo:ui", "Repo", "UI", "ui", { url: manifest.repos.ui.url, localPath: manifest.repos.ui.localPath }));
-    const bffRepoId = addNode(node("repo:bff", "Repo", "BFF", "bff", { url: manifest.repos.bff.url, localPath: manifest.repos.bff.localPath }));
-    const beRepoId = addNode(node("repo:be", "Repo", "BE", "be", { url: manifest.repos.be.url, localPath: manifest.repos.be.localPath }));
+    const uiRepoId = addNode(node("repo:ui", "Repo", "UI", "ui", { url: repositoryUrlForArtifact(manifest.repos.ui.url), localPath: manifest.repos.ui.localPath }));
+    const bffRepoId = addNode(node("repo:bff", "Repo", "BFF", "bff", { url: repositoryUrlForArtifact(manifest.repos.bff.url), localPath: manifest.repos.bff.localPath }));
+    const beRepoId = addNode(node("repo:be", "Repo", "BE", "be", { url: repositoryUrlForArtifact(manifest.repos.be.url), localPath: manifest.repos.be.localPath }));
     addEdge(edge("CONTAINS_REPO", systemId, uiRepoId));
     addEdge(edge("CONTAINS_REPO", systemId, bffRepoId));
     addEdge(edge("CONTAINS_REPO", systemId, beRepoId));
@@ -86,21 +96,24 @@ export class LocalKnowledgeGraphBuilder {
     await this.addUiGraph(multiRepoRoot, addNode, addEdge, uiRepoId);
     await this.addBffGraph(multiRepoRoot, addNode, addEdge, bffRepoId);
     await this.addBeGraph(multiRepoRoot, addNode, addEdge, beRepoId);
-    await this.addTraceabilityGraph(multiRepoRoot, addNode, addEdge);
+    if (hasTraceability) {
+      await this.addTraceabilityGraph(multiRepoRoot, addNode, addEdge);
+    }
 
     await writeJsonl(path.join(graphRoot, "nodes.jsonl"), nodes);
     await writeJsonl(path.join(graphRoot, "edges.jsonl"), edges);
     const summaryPath = path.join(graphRoot, "graph-summary.md");
-    await fs.writeFile(summaryPath, this.buildSummary(manifest, nodes, edges), "utf8");
-    await fs.writeFile(path.join(graphRoot, "graph-summary.json"), JSON.stringify({
+    await atomicWriteFile(summaryPath, this.buildSummary(manifest, nodes, edges));
+    await atomicWriteJson(path.join(graphRoot, "graph-summary.json"), {
       projectName: manifest.projectName,
       branch: manifest.branch,
+      pipelineIdentity: manifest.pipelineIdentity,
       generatedAt: new Date().toISOString(),
       nodeCount: nodes.length,
       edgeCount: edges.length,
       nodesByType: countBy(nodes, (item) => item.type),
       edgesByType: countBy(edges, (item) => item.type)
-    }, null, 2), "utf8");
+    });
 
     return { graphRoot, nodes: nodes.length, edges: edges.length, summaryPath };
   }
@@ -111,11 +124,11 @@ export class LocalKnowledgeGraphBuilder {
     addEdge: (edge: KnowledgeEdge) => void,
     repoId: string
   ): Promise<void> {
-    const files = await readJsonl<Record<string, unknown>>(path.join(root, "ui", "file-index.jsonl"));
-    const pages = await readJsonl<Record<string, unknown>>(path.join(root, "ui", "page-index.jsonl"));
-    const components = await readJsonl<Record<string, unknown>>(path.join(root, "ui", "component-index.jsonl"));
-    const interactions = await readJsonl<Record<string, unknown>>(path.join(root, "ui", "interaction-index.jsonl"));
-    const apiCalls = await readJsonl<Record<string, unknown>>(path.join(root, "ui", "api-call-index.jsonl"));
+    const files = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "ui", "file-index.jsonl"));
+    const pages = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "ui", "page-index.jsonl"));
+    const components = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "ui", "component-index.jsonl"));
+    const interactions = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "ui", "interaction-index.jsonl"));
+    const apiCalls = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "ui", "api-call-index.jsonl"));
 
     for (const file of files) {
       const fileId = addNode(fileNode("ui", String(file.file), file));
@@ -160,8 +173,8 @@ export class LocalKnowledgeGraphBuilder {
 
   private async addBffGraph(root: string, addNode: (node: KnowledgeNode) => string, addEdge: (edge: KnowledgeEdge) => void, repoId: string): Promise<void> {
     await this.addSpringCommon(root, "bff", addNode, addEdge, repoId, "BffEndpoint");
-    const outbound = await readJsonl<Record<string, unknown>>(path.join(root, "bff", "outbound-calls.jsonl"));
-    const dtos = await readJsonl<Record<string, unknown>>(path.join(root, "bff", "dto-index.jsonl"));
+    const outbound = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "bff", "outbound-calls.jsonl"));
+    const dtos = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "bff", "dto-index.jsonl"));
     for (const call of outbound) {
       const id = addNode(node(`bff:client-call:${hashLabel(call)}`, "BffClient", `${call.client ?? "client"}.${call.method ?? "method"}`, "bff", call));
       addEdge(edge("HAS_OUTBOUND_CALL", repoId, id, confidenceOf(call.confidence)));
@@ -176,12 +189,12 @@ export class LocalKnowledgeGraphBuilder {
 
   private async addBeGraph(root: string, addNode: (node: KnowledgeNode) => string, addEdge: (edge: KnowledgeEdge) => void, repoId: string): Promise<void> {
     await this.addSpringCommon(root, "be", addNode, addEdge, repoId, "BeEndpoint");
-    const repositoryMethods = await readJsonl<Record<string, unknown>>(path.join(root, "be", "repository-method-index.jsonl"));
-    const validations = await readJsonl<Record<string, unknown>>(path.join(root, "be", "validation-index.jsonl"));
-    const exceptions = await readJsonl<Record<string, unknown>>(path.join(root, "be", "exception-flow-index.jsonl"));
-    const serviceFlows = await readJsonl<Record<string, unknown>>(path.join(root, "be", "service-flow-index.jsonl"));
-    const dtos = await readJsonl<Record<string, unknown>>(path.join(root, "be", "dto-index.jsonl"));
-    const methodCalls = await readJsonl<Record<string, unknown>>(path.join(root, "be", "java-method-call-index.jsonl"));
+    const repositoryMethods = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "repository-method-index.jsonl"));
+    const validations = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "validation-index.jsonl"));
+    const exceptions = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "exception-flow-index.jsonl"));
+    const serviceFlows = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "service-flow-index.jsonl"));
+    const dtos = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "dto-index.jsonl"));
+    const methodCalls = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "be", "java-method-call-index.jsonl"));
     for (const item of repositoryMethods) {
       const id = addNode(node(`be:repo-method:${item.repository}.${item.method}`, "RepositoryMethod", `${item.repository}.${item.method}`, "be", item));
       if (item.file) {
@@ -222,9 +235,9 @@ export class LocalKnowledgeGraphBuilder {
     repoId: string,
     endpointType: "BffEndpoint" | "BeEndpoint"
   ): Promise<void> {
-    const files = await readJsonl<Record<string, unknown>>(path.join(root, layer, "file-index.jsonl"));
-    const endpoints = await readJsonl<Record<string, unknown>>(path.join(root, layer, "api-endpoints.jsonl"));
-    const entities = await readJsonl<Record<string, unknown>>(path.join(root, layer, "entity-index.jsonl"));
+    const files = await readRequiredJsonl<Record<string, unknown>>(path.join(root, layer, "file-index.jsonl"));
+    const endpoints = await readRequiredJsonl<Record<string, unknown>>(path.join(root, layer, "api-endpoints.jsonl"));
+    const entities = await readRequiredJsonl<Record<string, unknown>>(path.join(root, layer, "entity-index.jsonl"));
     for (const file of files) {
       const fileId = addNode(fileNode(layer, String(file.file), file));
       addEdge(edge("HAS_FILE", repoId, fileId));
@@ -235,7 +248,7 @@ export class LocalKnowledgeGraphBuilder {
         addEdge(edge("DEFINED_IN", id, fileNodeId(layer, String(endpoint.file))));
       }
     }
-    const components = await readJsonl<Record<string, unknown>>(path.join(root, layer, "spring-components.jsonl"));
+    const components = await readRequiredJsonl<Record<string, unknown>>(path.join(root, layer, "spring-components.jsonl"));
     for (const component of components) {
       const id = addNode(node(`${layer}:component:${component.className}`, "SpringComponent", String(component.className), layer, component));
       if (component.file) {
@@ -251,9 +264,9 @@ export class LocalKnowledgeGraphBuilder {
   }
 
   private async addTraceabilityGraph(root: string, addNode: (node: KnowledgeNode) => string, addEdge: (edge: KnowledgeEdge) => void): Promise<void> {
-    const uiToBff = await readJsonl<Record<string, unknown>>(path.join(root, "traceability", "ui-to-bff.jsonl"));
-    const bffToBe = await readJsonl<Record<string, unknown>>(path.join(root, "traceability", "bff-to-be.jsonl"));
-    const pageFlows = await readJsonl<Record<string, unknown>>(path.join(root, "traceability", "page-flows.jsonl"));
+    const uiToBff = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "traceability", "ui-to-bff.jsonl"));
+    const bffToBe = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "traceability", "bff-to-be.jsonl"));
+    const pageFlows = await readRequiredJsonl<Record<string, unknown>>(path.join(root, "traceability", "page-flows.jsonl"));
     for (const match of uiToBff) {
       const apiId = addNode(node(`trace:ui-api:${hashValue(match.uiApiCall)}`, "ApiCall", String(match.uiApiCall), "traceability", match));
       if (match.bffEndpoint) {

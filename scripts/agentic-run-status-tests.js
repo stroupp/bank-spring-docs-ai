@@ -5,8 +5,15 @@ const path = require("path");
 
 const renameCalls = [];
 const originalRename = fs.rename;
+let transientRenameFailures = 0;
 fs.rename = async function trackedRename(source, target) {
   renameCalls.push({ source: String(source), target: String(target) });
+  if (transientRenameFailures > 0) {
+    transientRenameFailures -= 1;
+    const error = new Error("simulated Windows file lock");
+    error.code = "EBUSY";
+    throw error;
+  }
   return originalRename.call(this, source, target);
 };
 
@@ -22,10 +29,93 @@ async function main() {
     await testCopilotReuseRequiresGeneratedOutput();
     await testSkippedPhaseAndArtifactBoundaries();
     await testLegacyStatusLoadsSafelyAndWorkspaceIsRecomputed();
-    console.log("Agentic run-status tests passed (lifecycle, atomic mirrors, resumable attempts, artifact validation, legacy compatibility).");
+    await testGenerationProviderAndModelArePinnedForResume();
+    await testPipelineIdentityIsPinnedForResume();
+    await testTransientWindowsRenameIsRetried();
+    console.log("Agentic run-status tests passed (lifecycle, atomic mirrors, resumable attempts, provider pinning, artifact validation, legacy compatibility).");
   } finally {
     fs.rename = originalRename;
   }
+}
+
+async function testPipelineIdentityIsPinnedForResume() {
+  const multiRepoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bank-agentic-pipeline-identity-"));
+  const selected = manifest();
+  const writer = await MultiRepoAgenticRunStatusWriter.create(
+    multiRepoRoot,
+    selected,
+    "20260711T220900Z"
+  );
+  await writer.startPhase("local-ui-analysis");
+  await writer.finishFailure(new Error("identity fixture"), false);
+  assert.strictEqual(writer.snapshot().pipelineIdentity, selected.pipelineIdentity);
+  assert.ok(await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, selected));
+  assert.strictEqual(
+    await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, {
+      ...selected,
+      pipelineIdentity: "b".repeat(64)
+    }),
+    undefined,
+    "a run must not resume for a different UI/BFF/BE repository selection"
+  );
+}
+
+async function testTransientWindowsRenameIsRetried() {
+  const multiRepoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bank-agentic-status-rename-retry-"));
+  transientRenameFailures = 1;
+  const writer = await MultiRepoAgenticRunStatusWriter.create(
+    multiRepoRoot,
+    manifest(),
+    "20260711T220800Z"
+  );
+  const status = await assertState(writer, multiRepoRoot, "running");
+  assert.strictEqual(status.runId, "20260711T220800Z");
+  assert.ok(renameCalls.length >= 3, "a transient rename failure must be retried before status creation fails");
+  await assertNoTemporaryStatusFiles(multiRepoRoot);
+}
+
+async function testGenerationProviderAndModelArePinnedForResume() {
+  const multiRepoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bank-agentic-provider-pin-"));
+  const generation = {
+    provider: "qwen",
+    model: "qwen3-30b-a3b-instruct",
+    configurationFingerprint: "fixture-qwen-deployment-fingerprint"
+  };
+  const writer = await MultiRepoAgenticRunStatusWriter.create(
+    multiRepoRoot,
+    manifest(),
+    "20260711T220700Z",
+    generation
+  );
+  await writer.startPhase("copilot-cross-layer-plan");
+  await writer.finishFailure(new Error("deterministic provider pin fixture"), false);
+
+  const status = writer.snapshot();
+  assert.strictEqual(status.generationProvider, "qwen");
+  assert.strictEqual(status.generationModel, generation.model);
+  assert.strictEqual(status.generationConfigurationFingerprint, generation.configurationFingerprint);
+  assert.match(await fs.readFile(writer.runStatusMarkdownPath, "utf8"), /Generation provider: qwen/);
+
+  assert.ok(await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest(), generation));
+  assert.strictEqual(
+    await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest(), { provider: "copilot" }),
+    undefined,
+    "a Qwen run must not silently resume with Copilot"
+  );
+  assert.strictEqual(
+    await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest(), { provider: "qwen", model: "different-qwen" }),
+    undefined,
+    "a Qwen run must not silently resume with a different model"
+  );
+  assert.strictEqual(
+    await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest(), {
+      provider: "qwen",
+      model: generation.model,
+      configurationFingerprint: "different-deployment-fingerprint"
+    }),
+    undefined,
+    "a Qwen run must not silently resume with a different endpoint or generation configuration"
+  );
 }
 
 async function testRunningCompletedAndAtomicMirrors() {
@@ -385,6 +475,8 @@ function errorText(value) {
 
 function manifest() {
   return {
+    schemaVersion: 3,
+    pipelineIdentity: "a".repeat(64),
     projectName: "boundary-project",
     branch: "test",
     updatedAt: "2026-07-11T22:00:00.000Z",

@@ -1,4 +1,6 @@
 import { safeName } from "../utils/pathUtils";
+import { sha256 } from "../utils/hash";
+import { assertRepositoryUrlHasNoEmbeddedCredentials, repositoryOriginIdentity } from "../utils/repositoryUrl";
 
 export interface ParsedBitbucketUrl {
   host: string;
@@ -16,6 +18,7 @@ export function parseBitbucketUrl(repoUrl: string, branch: string): ParsedBitbuc
   if (!trimmed) {
     throw new Error("Repository URL is required.");
   }
+  assertRepositoryUrlHasNoEmbeddedCredentials(trimmed);
 
   let host = "";
   let parts: string[] = [];
@@ -46,12 +49,13 @@ export function parseBitbucketUrl(repoUrl: string, branch: string): ParsedBitbuc
 
   const project = parts[parts.length - 2];
   const repo = stripGit(parts[parts.length - 1]);
-  const safeFolderName = [
+  const slug = [
     safeName(host).replaceAll("-", "-"),
     safeName(project),
     safeName(repo),
     safeName(branch).replaceAll("/", "-")
   ].join("_");
+  const safeFolderName = `${slug.slice(0, 96)}_${sha256(`${repositoryOriginIdentity(trimmed)}:${branch}`).slice(0, 12)}`;
 
   return { host, project, repo, safeFolderName };
 }

@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { relativePosix } from "../../utils/pathUtils";
 import { classifyReactFile, ReactFileClassification } from "./reactFileClassifier";
+import { RepositoryScanBudget, RepositoryScanOptions } from "../repositoryScanPolicy";
 
 export interface ReactScannedFile {
   file: string;
@@ -12,21 +13,22 @@ export interface ReactScannedFile {
   content: string;
 }
 
-const ignoredFolders = new Set([".git", ".idea", ".vscode", ".ai-docs", "node_modules", "dist", "build", "coverage", "out"]);
+const ignoredFolders = new Set([".git", ".idea", ".vscode", ".ai-docs", "node_modules", "dist", "build", "coverage", "out", ".next", ".turbo"]);
 const relevantConfigPatterns = [/^package\.json$/i, /^vite\.config\./i, /^webpack\.config\./i, /^next\.config\./i];
 const relevantExtensions = new Set([".tsx", ".ts", ".jsx", ".js"]);
 
 export class ReactRepositoryScanner {
-  async scan(repoRoot: string): Promise<ReactScannedFile[]> {
+  async scan(repoRoot: string, options: RepositoryScanOptions = {}): Promise<ReactScannedFile[]> {
     const files: ReactScannedFile[] = [];
-    await this.walk(repoRoot, repoRoot, files);
-    return files;
+    const budget = new RepositoryScanBudget(options);
+    await this.walk(repoRoot, repoRoot, files, budget);
+    return files.sort((left, right) => left.file < right.file ? -1 : left.file > right.file ? 1 : 0);
   }
 
   detectIndicators(files: ReactScannedFile[]): string[] {
     const indicators: string[] = [];
-    const packageJson = files.find((file) => file.file === "package.json");
-    if (packageJson && /"react"\s*:/.test(packageJson.content)) {
+    const packageJson = files.find((file) => path.posix.basename(file.file).toLowerCase() === "package.json" && /"react"\s*:/.test(file.content));
+    if (packageJson) {
       indicators.push("package.json react dependency");
     }
     if (files.some((file) => /^vite\.config\./i.test(path.posix.basename(file.file)))) {
@@ -35,18 +37,21 @@ export class ReactRepositoryScanner {
     if (files.some((file) => /^next\.config\./i.test(path.posix.basename(file.file)))) {
       indicators.push("Next.js config");
     }
-    if (files.some((file) => ["src/App.tsx", "src/App.jsx", "src/main.tsx", "src/index.tsx"].includes(file.file))) {
+    if (files.some((file) => /(?:^|\/)src\/(?:App\.(?:tsx|jsx)|main\.tsx|index\.tsx)$/i.test(file.file))) {
       indicators.push("React entry files");
     }
     return indicators;
   }
 
-  private async walk(repoRoot: string, currentDir: string, files: ReactScannedFile[]): Promise<void> {
-    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+  private async walk(repoRoot: string, currentDir: string, files: ReactScannedFile[], budget: RepositoryScanBudget): Promise<void> {
+    budget.checkCancellation();
+    const entries = (await fs.readdir(currentDir, { withFileTypes: true }))
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
     for (const entry of entries) {
+      budget.checkCancellation();
       if (entry.isDirectory()) {
-        if (!ignoredFolders.has(entry.name)) {
-          await this.walk(repoRoot, path.join(currentDir, entry.name), files);
+        if (!ignoredFolders.has(entry.name.toLowerCase())) {
+          await this.walk(repoRoot, path.join(currentDir, entry.name), files, budget);
         }
         continue;
       }
@@ -61,7 +66,10 @@ export class ReactRepositoryScanner {
         continue;
       }
 
+      const stat = await fs.stat(absolutePath);
+      budget.assertReadable(relative, stat.size);
       const buffer = await fs.readFile(absolutePath);
+      budget.commit(relative, buffer.length);
       if (buffer.includes(0)) {
         continue;
       }

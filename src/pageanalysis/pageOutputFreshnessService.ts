@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { atomicWriteJson } from "../storage/atomicFile";
 
 export interface PageOutputFreshnessIssue {
   target: string;
@@ -24,7 +25,7 @@ export class PageOutputFreshnessService {
     const issues = (await Promise.all(checks.map((check) => inspectTarget(pageRoot, check.target, check.dependencies)))).flat();
     const reportPath = path.join(pageRoot, "output-freshness.json");
     const result = { checkedAt: new Date().toISOString(), issues, reportPath };
-    await fs.writeFile(reportPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    await atomicWriteJson(reportPath, result);
     return result;
   }
 }

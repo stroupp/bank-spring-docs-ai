@@ -2,10 +2,12 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { MultiRepoManifest } from "../multirepo/multiRepoManifestService";
 import { readJsonl } from "../storage/jsonlWriter";
+import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
 import { sha256 } from "../utils/hash";
-import { safeName } from "../utils/pathUtils";
+import { safePathSegment } from "../utils/pathUtils";
 import { pagePipelineVersion } from "./pageArtifactMetadata";
 import { PageCandidate } from "./pageListService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -18,20 +20,29 @@ export interface PageContextPackResult {
 
 export class PageContextPackBuilder {
   async build(multiRepoRoot: string, manifest: MultiRepoManifest, selectedPage: PageCandidate): Promise<PageContextPackResult> {
-    const pageRoot = path.join(multiRepoRoot, "page-analysis", "pages", safeName(selectedPage.pageName || selectedPage.route || "page"));
+    const pageRoot = path.join(
+      multiRepoRoot,
+      "page-analysis",
+      "pages",
+      safePathSegment(selectedPage.pageName || selectedPage.route || "page", "page")
+    );
+    await assertPathContainedForWrite(multiRepoRoot, pageRoot);
     await fs.mkdir(pageRoot, { recursive: true });
+    await assertPathContainedForWrite(multiRepoRoot, pageRoot);
 
     const data = await this.loadRelevantData(multiRepoRoot, selectedPage);
     const sourceArtifacts = await collectSourceArtifacts(multiRepoRoot);
     const inputHash = sha256(JSON.stringify({
       projectName: manifest.projectName,
       branch: manifest.branch,
+      pipelineIdentity: manifest.pipelineIdentity,
       selectedPage,
       sourceArtifacts
     }));
     const pageFlow = {
       projectName: manifest.projectName,
       branch: manifest.branch,
+      pipelineIdentity: manifest.pipelineIdentity,
       generatedAt: new Date().toISOString(),
       sourceArtifacts,
       sourceArtifactModifiedTimes: sourceArtifacts,
@@ -43,8 +54,8 @@ export class PageContextPackBuilder {
 
     const pageFlowPath = path.join(pageRoot, "page-flow.json");
     const contextPackPath = path.join(pageRoot, "page-context-pack.md");
-    await fs.writeFile(pageFlowPath, `${JSON.stringify(pageFlow, null, 2)}\n`, "utf8");
-    await fs.writeFile(contextPackPath, this.toMarkdown(manifest, selectedPage, data, sourceArtifacts, inputHash), "utf8");
+    await atomicWriteJson(pageFlowPath, pageFlow);
+    await atomicWriteFile(contextPackPath, this.toMarkdown(manifest, selectedPage, data, sourceArtifacts, inputHash));
 
     return {
       pageRoot,

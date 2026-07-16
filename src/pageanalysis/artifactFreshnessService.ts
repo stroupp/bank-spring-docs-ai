@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { atomicWriteJson } from "../storage/atomicFile";
 
 export interface ArtifactFreshnessWarning {
   artifact: string;
@@ -68,7 +69,7 @@ export class ArtifactFreshnessService {
       warnings,
       reportPath
     };
-    await fs.writeFile(reportPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    await atomicWriteJson(reportPath, result);
     return result;
   }
 }
@@ -76,8 +77,11 @@ export class ArtifactFreshnessService {
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {};
+    }
+    throw error;
   }
 }
 
@@ -85,8 +89,11 @@ async function statOptional(filePath: string): Promise<{ mtimeMs: number } | und
   try {
     const stat = await fs.stat(filePath);
     return { mtimeMs: stat.mtimeMs };
-  } catch {
-    return undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
   }
 }
 

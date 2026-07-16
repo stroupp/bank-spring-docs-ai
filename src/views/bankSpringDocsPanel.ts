@@ -1,10 +1,15 @@
 import * as vscode from "vscode";
+import type { QwenConnectionResult } from "../ai/qwenClient";
 import { QwenSettingsService } from "../ai/qwenSettingsService";
 import { AnalyzeRepositoryUrlCommand } from "../commands/analyzeRepositoryUrlCommand";
 import { getDefaultBranch } from "../git/branchResolver";
 
+type AiProvider = "copilot" | "qwen";
+type AiProviderUiValue = AiProvider | "invalid";
+
 type QwenUiSettings = {
   enabled: boolean;
+  bankingEnvironment: boolean;
   endpoint: string;
   model: string;
   temperature: number;
@@ -22,18 +27,26 @@ type PanelMessage =
   | { type: "selectWorkspace" }
   | { type: "analyze"; repoUrl: string; branch: string }
   | { type: "command"; command: string }
+  | { type: "saveAiProvider"; provider: AiProvider }
   | { type: "saveQwenSettings"; settings: QwenUiSettings }
   | { type: "testQwenConnection"; settings: QwenUiSettings };
 
 export class BankSpringDocsPanel {
   static currentPanel: BankSpringDocsPanel | undefined;
+  private readonly configurationListener: vscode.Disposable;
 
   private constructor(
     private readonly panel: vscode.WebviewPanel,
     private readonly context: vscode.ExtensionContext,
     private readonly analyzeCommand: AnalyzeRepositoryUrlCommand
   ) {
+    this.configurationListener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("bankSpringDocs.ai.provider")) {
+        this.postSettings();
+      }
+    });
     this.panel.onDidDispose(() => {
+      this.configurationListener.dispose();
       BankSpringDocsPanel.currentPanel = undefined;
     });
 
@@ -43,6 +56,7 @@ export class BankSpringDocsPanel {
   static open(context: vscode.ExtensionContext, analyzeCommand: AnalyzeRepositoryUrlCommand): void {
     if (BankSpringDocsPanel.currentPanel) {
       BankSpringDocsPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
+      BankSpringDocsPanel.currentPanel.postSettings();
       return;
     }
 
@@ -79,7 +93,35 @@ export class BankSpringDocsPanel {
     }
 
     if (message.type === "command") {
-      await vscode.commands.executeCommand(message.command);
+      try {
+        await vscode.commands.executeCommand(message.command);
+      } catch (error) {
+        this.panel.webview.postMessage({
+          type: "error",
+          message: `Komut tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+      return;
+    }
+
+    if (message.type === "saveAiProvider") {
+      if (message.provider !== "copilot" && message.provider !== "qwen") {
+        this.panel.webview.postMessage({ type: "error", message: "Geçersiz AI doküman sağlayıcısı seçildi." });
+        return;
+      }
+      try {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update("ai.provider", message.provider, vscode.ConfigurationTarget.Global);
+        this.postSettings();
+        this.panel.webview.postMessage({
+          type: "aiProviderSaved",
+          message: `AI doküman sağlayıcısı ${message.provider === "qwen" ? "Qwen" : "GitHub Copilot"} olarak kaydedildi.`
+        });
+      } catch (error) {
+        this.panel.webview.postMessage({
+          type: "error",
+          message: `AI doküman sağlayıcısı kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
       return;
     }
 
@@ -90,7 +132,29 @@ export class BankSpringDocsPanel {
     }
 
     if (message.type === "testQwenConnection") {
-      await vscode.commands.executeCommand("bankSpringDocs.testQwenConnection", message.settings);
+      this.panel.webview.postMessage({
+        type: "qwenTestResult",
+        testing: true,
+        message: "Qwen endpoint'ine kısa test isteği gönderiliyor..."
+      });
+      try {
+        const result = await vscode.commands.executeCommand<QwenConnectionResult>("bankSpringDocs.testQwenConnection", message.settings);
+        this.panel.webview.postMessage({
+          type: "qwenTestResult",
+          testing: false,
+          ok: result?.ok ?? false,
+          message: result?.message ?? "Qwen bağlantı testi sonuç döndürmedi.",
+          model: result?.model,
+          endpoint: result?.endpoint
+        });
+      } catch (error) {
+        this.panel.webview.postMessage({
+          type: "qwenTestResult",
+          testing: false,
+          ok: false,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
       this.postSettings();
       return;
     }
@@ -122,6 +186,9 @@ export class BankSpringDocsPanel {
       type: "settings",
       defaultBranch: getDefaultBranch(),
       workspaceFolder: config.get<string>("workspaceFolder", ""),
+      ai: {
+        provider: normalizeAiProvider(config.get<string>("ai.provider", "copilot"))
+      },
       qwen: new QwenSettingsService(this.context).getSettings(),
       semantic: {
         cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
@@ -246,7 +313,7 @@ export class BankSpringDocsPanel {
       font-weight: 650;
     }
 
-    input {
+    input, select {
       box-sizing: border-box;
       width: 100%;
       min-height: 36px;
@@ -258,7 +325,12 @@ export class BankSpringDocsPanel {
       font-family: var(--vscode-font-family);
     }
 
-    input:focus {
+    select {
+      color: var(--vscode-dropdown-foreground);
+      background: var(--vscode-dropdown-background);
+    }
+
+    input:focus, select:focus {
       outline: 1px solid var(--vscode-focusBorder);
       outline-offset: -1px;
     }
@@ -400,7 +472,7 @@ export class BankSpringDocsPanel {
     <header>
       <div>
         <h1>Bank Spring Docs AI</h1>
-        <div class="muted">Java Spring Boot repository'lerini yerelde analiz eder, semantik olarak zenginleştirir ve kompakt Copilot context paketleri üretir.</div>
+        <div class="muted">Java Spring Boot repository'lerini yerelde analiz eder, semantik olarak zenginleştirir ve kompakt AI context paketleri üretir.</div>
         <div class="muted">Varsayılan branch: <strong id="defaultBranch">release/liv</strong></div>
       </div>
       <div class="headerActions">
@@ -408,6 +480,18 @@ export class BankSpringDocsPanel {
         <button class="ghost" data-command="bankSpringDocs.openGeneratedDocs" type="button">Çıktı Klasörü</button>
       </div>
     </header>
+
+    <section class="panel">
+      <label>
+        AI Doküman Sağlayıcısı
+        <select id="aiProviderSelect">
+          <option value="invalid" disabled>Geçersiz sağlayıcı ayarı</option>
+          <option value="copilot">GitHub Copilot</option>
+          <option value="qwen">Qwen (Yapılandırılmış Endpoint)</option>
+        </select>
+      </label>
+      <div class="muted">Seçim, tüm AI destekli doküman üretim adımlarında kullanılır. Yerel analiz adımları değişmez.</div>
+    </section>
 
     <section class="layout">
       <div class="panel">
@@ -430,7 +514,7 @@ export class BankSpringDocsPanel {
         <button id="analyzeButton">Repository Analiz Et</button>
         <div class="status" id="status">
           <strong>Hazır</strong>
-          Önce repository analizi çalıştır. Sonra yerel doküman, Qwen zenginleştirme veya Copilot senaryolarını seçebilirsin.
+          Önce repository analizi çalıştır. Sonra yerel doküman, Qwen zenginleştirme veya AI dokümantasyon senaryolarını seçebilirsin.
         </div>
       </div>
 
@@ -462,13 +546,13 @@ export class BankSpringDocsPanel {
 
         <section class="scenario">
           <div class="scenarioHeader">
-            <h2>3. Copilot Dokümantasyonu</h2>
-            <div class="muted">Tam repo değil, sadece kompakt ve maskelenmiş context paketleri Copilot'a gönderilir.</div>
+            <h2>3. AI Dokümantasyonu</h2>
+            <div class="muted">Tam repo değil, sadece kompakt ve maskelenmiş context paketleri seçili AI sağlayıcısına gönderilir.</div>
           </div>
           <div class="buttonGrid">
-            <button data-command="bankSpringDocs.generateAllCopilotDocs">Tüm Copilot Dokümanlarını Oluştur</button>
-            <button class="secondary" data-command="bankSpringDocs.generateCopilotSpringArchitecture">Copilot Spring Mimari</button>
-            <button class="secondary" data-command="bankSpringDocs.generateCopilotApiDocumentation">Copilot API Dokümanı</button>
+            <button data-command="bankSpringDocs.generateAllCopilotDocs">Tüm AI Dokümanlarını Oluştur</button>
+            <button class="secondary" data-command="bankSpringDocs.generateCopilotSpringArchitecture">AI Spring Mimari</button>
+            <button class="secondary" data-command="bankSpringDocs.generateCopilotApiDocumentation">AI API Dokümanı</button>
             <button class="secondary" data-command="bankSpringDocs.runCopilotDiagnostics">Copilot Tanılama Testi</button>
             <button class="secondary" data-command="bankSpringDocs.openLastCopilotContext">Son Context Paketini Aç</button>
           </div>
@@ -482,7 +566,7 @@ export class BankSpringDocsPanel {
           <div class="buttonGrid">
             <button data-command="bankSpringDocs.openRepoMap">Repo Haritasını Aç</button>
             <button class="secondary" data-command="bankSpringDocs.openGeneratedDocs">Çıktı Klasörünü Aç</button>
-            <button class="secondary" data-command="bankSpringDocs.openCopilotAuditLog">Copilot Audit Log Aç</button>
+            <button class="secondary" data-command="bankSpringDocs.openCopilotAuditLog">AI Audit Log Aç</button>
             <button class="secondary" data-command="bankSpringDocs.clearLocalCache">Yerel Önbelleği Temizle</button>
           </div>
         </section>
@@ -495,15 +579,20 @@ export class BankSpringDocsPanel {
       <div class="modalHeader">
         <div>
           <h2 id="qwenModalTitle">Qwen Ayarları</h2>
-          <div class="muted">Endpoint, model, API key ve semantik cache ayarları burada yönetilir.</div>
+          <div class="muted">Endpoint, model, API key ve semantik cache ayarları burada yönetilir. Onaylı host listesi ile uzun AI doküman üretim limitleri VS Code makine ayarlarındadır.</div>
         </div>
         <button class="ghost" id="closeQwenSettingsButton" type="button">Kapat</button>
       </div>
       <div class="modalBody">
         <label class="checkLabel wide">
           <input id="qwenEnabled" type="checkbox">
-          Qwen semantik analiz aktif
+          Qwen entegrasyonu aktif (semantik analiz ve AI doküman üretimi)
         </label>
+        <label class="checkLabel wide">
+          <input id="qwenBankingEnvironment" type="checkbox">
+          Banking environment (ONIKS / internal vLLM)
+        </label>
+        <div class="muted">Bu mod model adını ONIKS yapar ve API key kullanımını kapatır. Aşağıdaki alana bankanın tam OpenAI-compatible <code>/v1/chat/completions</code> URL'sini yapıştırabilirsin.</div>
         <div class="formGrid">
           <label class="wide">
             Qwen Endpoint
@@ -518,11 +607,11 @@ export class BankSpringDocsPanel {
             <input id="qwenTemperature" type="number" min="0" max="2" step="0.1">
           </label>
           <label>
-            Max Token
+            Semantik Max Token
             <input id="qwenMaxTokens" type="number" min="256" step="256">
           </label>
           <label>
-            Timeout
+            Semantik Timeout
             <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
           </label>
           <label class="checkLabel wide">
@@ -546,6 +635,8 @@ export class BankSpringDocsPanel {
             <input id="semanticMaxCharactersPerFile" type="number" min="1000" step="1000">
           </label>
         </div>
+        <div class="muted">Bağlantı testi, bu formdaki ayarlarla Qwen'e gerçek ve kısa bir OpenAI-compatible istek gönderir; sonucu başarı veya hata olarak gösterir.</div>
+        <div class="muted" id="qwenTestResult" role="status" aria-live="polite">Henüz bağlantı testi çalıştırılmadı.</div>
       </div>
       <div class="modalFooter">
         <button class="secondary" id="testQwenButton" type="button">Qwen Bağlantısını Test Et</button>
@@ -563,11 +654,13 @@ export class BankSpringDocsPanel {
     const workspaceFolder = document.getElementById("workspaceFolder");
     const status = document.getElementById("status");
     const defaultBranch = document.getElementById("defaultBranch");
+    const aiProviderSelect = document.getElementById("aiProviderSelect");
     const qwenModal = document.getElementById("qwenModal");
     const openQwenSettingsButton = document.getElementById("openQwenSettingsButton");
     const closeQwenSettingsButton = document.getElementById("closeQwenSettingsButton");
     const quickTestQwenButton = document.getElementById("quickTestQwenButton");
     const qwenEnabled = document.getElementById("qwenEnabled");
+    const qwenBankingEnvironment = document.getElementById("qwenBankingEnvironment");
     const qwenEndpoint = document.getElementById("qwenEndpoint");
     const qwenModel = document.getElementById("qwenModel");
     const qwenTemperature = document.getElementById("qwenTemperature");
@@ -578,6 +671,7 @@ export class BankSpringDocsPanel {
     const semanticCacheEnabled = document.getElementById("semanticCacheEnabled");
     const semanticMaxFilesPerRun = document.getElementById("semanticMaxFilesPerRun");
     const semanticMaxCharactersPerFile = document.getElementById("semanticMaxCharactersPerFile");
+    const qwenTestResult = document.getElementById("qwenTestResult");
     const testQwenButton = document.getElementById("testQwenButton");
     const saveQwenButton = document.getElementById("saveQwenButton");
 
@@ -589,9 +683,34 @@ export class BankSpringDocsPanel {
       qwenModal.classList.toggle("open", open);
     }
 
+    function applyBankingEnvironmentState(enabled, applyDefaults = false) {
+      if (enabled) {
+        qwenEnabled.checked = true;
+        qwenModel.value = "ONIKS";
+        qwenUseApiKey.checked = false;
+        qwenApiKey.value = "";
+        if (applyDefaults) {
+          qwenTemperature.value = "0.6";
+          qwenMaxTokens.value = "163849";
+        }
+      }
+      qwenModel.disabled = enabled;
+      qwenUseApiKey.disabled = enabled;
+      qwenApiKey.disabled = enabled;
+    }
+
+    function renderQwenTestResult(testing, ok, message, model, endpoint) {
+      testQwenButton.disabled = Boolean(testing);
+      quickTestQwenButton.disabled = Boolean(testing);
+      const prefix = testing ? "Test ediliyor: " : ok ? "Başarılı: " : "Başarısız: ";
+      const details = [model, endpoint].filter(Boolean).join(" · ");
+      qwenTestResult.textContent = prefix + message + (details ? " (" + details + ")" : "");
+    }
+
     function readQwenSettings() {
       return {
         enabled: qwenEnabled.checked,
+        bankingEnvironment: qwenBankingEnvironment.checked,
         endpoint: qwenEndpoint.value,
         model: qwenModel.value,
         temperature: Number(qwenTemperature.value || "0.1"),
@@ -611,6 +730,10 @@ export class BankSpringDocsPanel {
       vscode.postMessage({ type: "analyze", repoUrl: repoUrl.value, branch: branch.value });
     });
 
+    aiProviderSelect.addEventListener("change", () => {
+      vscode.postMessage({ type: "saveAiProvider", provider: aiProviderSelect.value });
+    });
+
     selectWorkspaceButton.addEventListener("click", () => {
       vscode.postMessage({ type: "selectWorkspace" });
     });
@@ -623,11 +746,18 @@ export class BankSpringDocsPanel {
       }
     });
 
+    qwenBankingEnvironment.addEventListener("change", () => {
+      applyBankingEnvironmentState(qwenBankingEnvironment.checked, true);
+    });
+
     testQwenButton.addEventListener("click", () => {
+      renderQwenTestResult(true, false, "Qwen endpoint'ine kısa istek gönderiliyor.");
       vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
     });
 
     quickTestQwenButton.addEventListener("click", () => {
+      setModalOpen(true);
+      renderQwenTestResult(true, false, "Qwen endpoint'ine kısa istek gönderiliyor.");
       vscode.postMessage({ type: "testQwenConnection", settings: readQwenSettings() });
     });
 
@@ -649,14 +779,22 @@ export class BankSpringDocsPanel {
         defaultBranch.textContent = message.defaultBranch;
         workspaceFolder.value = message.workspaceFolder || "";
         branch.placeholder = "Boş bırakılırsa " + message.defaultBranch + " kullanılır";
+        aiProviderSelect.value = message.ai?.provider === "qwen"
+          ? "qwen"
+          : message.ai?.provider === "copilot" ? "copilot" : "invalid";
+        if (aiProviderSelect.value === "invalid") {
+          setStatus("Ayar Hatası", "bankSpringDocs.ai.provider değeri copilot veya qwen olmalıdır.");
+        }
         if (message.qwen) {
           qwenEnabled.checked = Boolean(message.qwen.enabled);
+          qwenBankingEnvironment.checked = Boolean(message.qwen.bankingEnvironment);
           qwenEndpoint.value = message.qwen.endpoint || "";
           qwenModel.value = message.qwen.model || "";
           qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
           qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
           qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
           qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
+          applyBankingEnvironmentState(qwenBankingEnvironment.checked);
         }
         if (message.semantic) {
           semanticCacheEnabled.checked = Boolean(message.semantic.cacheEnabled);
@@ -667,6 +805,12 @@ export class BankSpringDocsPanel {
       if (message.type === "busy") {
         analyzeButton.disabled = true;
         setStatus("Çalışıyor", message.message);
+      }
+      if (message.type === "aiProviderSaved") {
+        setStatus("AI Sağlayıcısı", message.message);
+      }
+      if (message.type === "qwenTestResult") {
+        renderQwenTestResult(message.testing, message.ok, message.message, message.model, message.endpoint);
       }
       if (message.type === "done") {
         analyzeButton.disabled = false;
@@ -692,4 +836,8 @@ function createNonce(): string {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return text;
+}
+
+function normalizeAiProvider(value: unknown): AiProviderUiValue {
+  return value === "copilot" || value === "qwen" ? value : "invalid";
 }

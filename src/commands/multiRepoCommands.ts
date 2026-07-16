@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { getDefaultBranch } from "../git/branchResolver";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
+import { createDocumentationModelClient, getConfiguredDocumentationModelIdentity } from "../ai/documentationModelClientFactory";
 import { LocalKnowledgeGraphBuilder } from "../graph/localKnowledgeGraphBuilder";
 import { MultiRepoCopilotAgenticDocumentationGenerator } from "../docs/multiRepoCopilotAgenticDocumentationGenerator";
 import { MultiRepoAgenticRunStatusWriter } from "../docs/multiRepoAgenticRunStatus";
@@ -11,6 +12,8 @@ import { MultiRepoQualityReportGenerator } from "../multirepo/multiRepoQualityRe
 import { MultiRepoReactAnalysisService } from "../multirepo/multiRepoReactAnalysisService";
 import { MultiRepoSpringAnalysisService } from "../multirepo/multiRepoSpringAnalysisService";
 import { MultiRepoTraceabilityService } from "../multirepo/multiRepoTraceabilityService";
+import { MultiRepoArtifactIdentityService } from "../multirepo/multiRepoArtifactIdentityService";
+import { PipelineArtifactReceiptService } from "../multirepo/pipelineArtifactReceiptService";
 import { PageSemanticAnalyzer } from "../semantic/multirepo/pageSemanticAnalyzer";
 import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
 
@@ -53,7 +56,7 @@ export async function cloneOrUpdateMultiReposCommand(
     },
     async (progress) => {
       progress.report({ message: "UI, BFF ve BE repolari clone/fetch ediliyor..." });
-      return new MultiRepoGitService().cloneOrUpdateAll(manifest);
+      return new MultiRepoGitService(manifestService.getCloneRoot()).cloneOrUpdateAll(manifest);
     }
   );
 
@@ -71,7 +74,8 @@ export async function cloneOrUpdateMultiReposCommand(
 
 export async function openMultiRepoOutputFolderCommand(context: vscode.ExtensionContext): Promise<void> {
   const service = new MultiRepoManifestService(context);
-  await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(service.getMultiRepoRoot()));
+  const manifest = await service.readManifest();
+  await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(service.getMultiRepoRoot(manifest)));
 }
 
 export async function analyzeMultiReposLocallyCommand(context: vscode.ExtensionContext): Promise<MultiRepoManifest | undefined> {
@@ -85,7 +89,7 @@ export async function analyzeMultiReposLocallyCommand(context: vscode.ExtensionC
   const failed: string[] = [];
   const analyzed: string[] = [];
   const springAnalyzer = new MultiRepoSpringAnalysisService();
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
 
   await vscode.window.withProgress(
     {
@@ -101,6 +105,7 @@ export async function analyzeMultiReposLocallyCommand(context: vscode.ExtensionC
           repoRoot: manifest.repos.bff.localPath,
           outputRoot: path.join(multiRepoRoot, "bff"),
           branch: manifest.branch,
+          pipelineIdentity: manifest.pipelineIdentity,
           role: "bff"
         });
         manifest.repos.bff.status = "analyzed";
@@ -119,6 +124,7 @@ export async function analyzeMultiReposLocallyCommand(context: vscode.ExtensionC
           repoRoot: manifest.repos.be.localPath,
           outputRoot: path.join(multiRepoRoot, "be"),
           branch: manifest.branch,
+          pipelineIdentity: manifest.pipelineIdentity,
           role: "be"
         });
         manifest.repos.be.status = "analyzed";
@@ -154,7 +160,7 @@ export async function generateReactUiAnalysisCommand(context: vscode.ExtensionCo
     return undefined;
   }
 
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
   try {
     const result = await vscode.window.withProgress(
       {
@@ -168,7 +174,8 @@ export async function generateReactUiAnalysisCommand(context: vscode.ExtensionCo
           repoUrl: manifest.repos.ui.url,
           repoRoot: manifest.repos.ui.localPath,
           outputRoot: path.join(multiRepoRoot, "ui"),
-          branch: manifest.branch
+          branch: manifest.branch,
+          pipelineIdentity: manifest.pipelineIdentity
         });
       }
     );
@@ -205,7 +212,7 @@ export async function generateEndToEndFlowMapCommand(context: vscode.ExtensionCo
     },
     async (progress) => {
       progress.report({ message: "UI -> BFF -> BE eslesmeleri hesaplaniyor..." });
-      return new MultiRepoTraceabilityService().build(manifestService.getMultiRepoRoot(), manifest);
+      return new MultiRepoTraceabilityService().build(manifestService.getMultiRepoRoot(manifest), manifest);
     }
   );
 
@@ -236,7 +243,10 @@ export async function generateQwenPageSemanticsCommand(context: vscode.Extension
     },
     async (progress, token) => {
       progress.report({ message: "UI interaction ve page-flow context paketleri hazirlaniyor..." });
-      return new PageSemanticAnalyzer().analyze(manifestService.getMultiRepoRoot(), context, manifest, token);
+      const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
+      await new MultiRepoArtifactIdentityService().assertCompatible(multiRepoRoot, manifest);
+      await new PipelineArtifactReceiptService().assertTraceabilityCompatible(multiRepoRoot, manifest);
+      return new PageSemanticAnalyzer().analyze(multiRepoRoot, context, manifest, token);
     }
   );
 
@@ -262,7 +272,7 @@ export async function generateLocalKnowledgeGraphCommand(context: vscode.Extensi
     },
     async (progress) => {
       progress.report({ message: "JSONL indekslerden node ve edge dosyalari uretiliyor..." });
-      return new LocalKnowledgeGraphBuilder().build(manifestService.getMultiRepoRoot(), manifest);
+      return new LocalKnowledgeGraphBuilder().build(manifestService.getMultiRepoRoot(manifest), manifest);
     }
   );
 
@@ -286,7 +296,7 @@ export async function generateMultiRepoQualityReportCommand(context: vscode.Exte
     },
     async (progress) => {
       progress.report({ message: "Yerel JSONL artifact dosyalari denetleniyor..." });
-      return new MultiRepoQualityReportGenerator().generate(manifestService.getMultiRepoRoot(), manifest);
+      return new MultiRepoQualityReportGenerator().generate(manifestService.getMultiRepoRoot(manifest), manifest);
     }
   );
 
@@ -305,15 +315,25 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
     return undefined;
   }
 
-  const multiRepoRoot = manifestService.getMultiRepoRoot();
+  const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
+  let modelClient: ReturnType<typeof createDocumentationModelClient>;
+  let generationIdentity: ReturnType<typeof getConfiguredDocumentationModelIdentity>;
+  try {
+    modelClient = createDocumentationModelClient(context);
+    generationIdentity = getConfiguredDocumentationModelIdentity(context);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Bank Spring Docs: AI sağlayıcısı hazırlanamadı: ${errorText(error)}`);
+    return manifest;
+  }
+  const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
   let runStatus: MultiRepoAgenticRunStatusWriter;
   try {
-    const resumable = await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest);
+    const resumable = await MultiRepoAgenticRunStatusWriter.loadLatestResumable(multiRepoRoot, manifest, generationIdentity);
     if (resumable) {
       const previous = resumable.snapshot();
-      const completedCopilotSteps = previous.phases.filter((phase) => phase.category === "copilot" && phase.status === "completed").length;
+      const completedGenerationSteps = previous.phases.filter((phase) => phase.category === "copilot" && phase.status === "completed").length;
       const action = await vscode.window.showWarningMessage(
-        `Bank Spring Docs: Önceki Agentic çalışma '${previous.currentPhase ?? "bilinmeyen aşama"}' aşamasında durdu. ${completedCopilotSteps} Copilot adımı yeniden kullanılabilir.`,
+        `Bank Spring Docs: Önceki Agentic çalışma '${previous.currentPhase ?? "bilinmeyen aşama"}' aşamasında durdu. ${completedGenerationSteps} ${providerName} adımı yeniden kullanılabilir.`,
         { modal: true },
         "Kaldığı Yerden Devam Et",
         "Yeni Analiz Başlat",
@@ -323,12 +343,12 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
         runStatus = resumable;
         await runStatus.prepareResume();
       } else if (action === "Yeni Analiz Başlat") {
-        runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
+        runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest, undefined, generationIdentity);
       } else {
         return manifest;
       }
     } else {
-      runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest);
+      runStatus = await MultiRepoAgenticRunStatusWriter.create(multiRepoRoot, manifest, undefined, generationIdentity);
     }
   } catch (error) {
     vscode.window.showErrorMessage(`Bank Spring Docs: Agentic çalışma durumu oluşturulamadı: ${errorText(error)}`);
@@ -341,7 +361,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
     result = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "Bank Spring Docs: UI-BFF-BE Agentic Copilot çalışıyor",
+        title: `Bank Spring Docs: UI-BFF-BE Agentic ${providerName} çalışıyor`,
         cancellable: true
       },
       async (progress, token) => {
@@ -361,7 +381,8 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
               repoUrl: manifest.repos.ui.url,
               repoRoot: manifest.repos.ui.localPath,
               outputRoot: path.join(multiRepoRoot, "ui"),
-              branch: manifest.branch
+              branch: manifest.branch,
+              pipelineIdentity: manifest.pipelineIdentity
             });
             await runStatus.completePhase("local-ui-analysis", {
               details: { ...uiResult },
@@ -381,6 +402,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
               repoRoot: manifest.repos.bff.localPath,
               outputRoot: path.join(multiRepoRoot, "bff"),
               branch: manifest.branch,
+              pipelineIdentity: manifest.pipelineIdentity,
               role: "bff"
             });
             await runStatus.completePhase("local-bff-analysis", {
@@ -400,6 +422,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
               repoRoot: manifest.repos.be.localPath,
               outputRoot: path.join(multiRepoRoot, "be"),
               branch: manifest.branch,
+              pipelineIdentity: manifest.pipelineIdentity,
               role: "be"
             });
             await runStatus.completePhase("local-be-analysis", {
@@ -490,7 +513,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
           }
 
           ensureNotCancelled();
-          return await new MultiRepoCopilotAgenticDocumentationGenerator().generate(
+          return await new MultiRepoCopilotAgenticDocumentationGenerator(undefined, modelClient).generate(
             multiRepoRoot,
             manifest,
             token,
@@ -538,7 +561,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
   const document = await vscode.workspace.openTextDocument(result.finalDocumentPath);
   await vscode.window.showTextDocument(document, { preview: false });
   const action = await vscode.window.showInformationMessage(
-    `Bank Spring Docs: UI-BFF-BE Agentic Copilot tamamlandı. ${result.newRequestCount} yeni istek, ${result.reusedStepCount} yeniden kullanılan adım, toplam ${result.requestCount} istek denemesi.`,
+    `Bank Spring Docs: UI-BFF-BE Agentic ${providerName} tamamlandı. ${result.newRequestCount} yeni istek, ${result.reusedStepCount} yeniden kullanılan adım, toplam ${result.requestCount} istek denemesi.`,
     "Final Dokumani Ac",
     "Ara Ciktilari Ac",
     "Audit Log Ac",
@@ -552,7 +575,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
     await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(result.workspaceRoot));
   }
   if (action === "Audit Log Ac") {
-    const auditPath = path.join(manifestService.getMultiRepoRoot(), "audit", "copilot-requests.jsonl");
+    const auditPath = path.join(manifestService.getMultiRepoRoot(manifest), "audit", "copilot-requests.jsonl");
     const auditDocument = await vscode.workspace.openTextDocument(auditPath);
     await vscode.window.showTextDocument(auditDocument, { preview: false });
   }
@@ -565,7 +588,8 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
 
 export async function openUnresolvedMultiRepoMatchesCommand(context: vscode.ExtensionContext): Promise<void> {
   const manifestService = new MultiRepoManifestService(context);
-  const unresolvedPath = path.join(manifestService.getMultiRepoRoot(), "traceability", "unresolved-matches.jsonl");
+  const manifest = await manifestService.readManifest();
+  const unresolvedPath = path.join(manifestService.getMultiRepoRoot(manifest), "traceability", "unresolved-matches.jsonl");
   await vscode.workspace.fs.stat(vscode.Uri.file(unresolvedPath)).then(
     async () => vscode.window.showTextDocument(vscode.Uri.file(unresolvedPath), { preview: false }),
     async () => {

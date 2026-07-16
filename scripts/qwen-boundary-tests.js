@@ -27,12 +27,20 @@ Module._load = function patchedLoad(request, parent, isMain) {
 const { QwenPageSemanticAnalyzer, prepareQwenContext } = require("../dist/pageanalysis/qwenPageSemanticAnalyzer");
 const { buildPageSemanticPrompt, buildInteractionSemanticPrompt } = require("../dist/pageanalysis/pageSemanticPrompts");
 const { parseStrictJson } = require("../dist/semantic/semanticCacheService");
+const token = {
+  isCancellationRequested: false,
+  onCancellationRequested() { return { dispose() {} }; }
+};
 
 async function main() {
   testPromptBuilders();
   testStrictJsonParsing();
   testContextBudgetAndSecretMasking();
   await testPageContextEvidenceCacheAndArtifacts();
+  await testVerifiedQwen3SemanticClientAndSanitation();
+  await testApprovedBankingAliasAcceptedViaQwen3Family();
+  await testVerifiedQwen3SemanticBoundaryRejection();
+  await testVerifiedQwen3DebugSanitation();
   await testInvalidJsonDebugAndGracefulFailure();
   await testClientFailureDoesNotCrashAnalyzer();
   assert.strictEqual(networkCalls, 0, "automated Qwen tests must not use fetch");
@@ -45,6 +53,14 @@ function testContextBudgetAndSecretMasking() {
   assert.doesNotMatch(safe, /boundary-qwen-secret/);
   assert.match(safe, /\[MASKED_SECRET\]/);
   assert.match(safe, /PAGE_CONTEXT_TRUNCATED_FOR_QWEN_TOKEN_LIMIT/);
+
+  const quoted = prepareQwenContext(
+    `password: "two \\"quoted\\" words"\napi_key='two \\'quoted\\' words'`,
+    1000
+  );
+  assert.doesNotMatch(quoted, /two|quoted|words/);
+  assert.match(quoted, /password: "\[MASKED_SECRET\]"/);
+  assert.match(quoted, /api_key='\[MASKED_SECRET\]'/);
 }
 
 function testPromptBuilders() {
@@ -113,6 +129,159 @@ async function testClientFailureDoesNotCrashAnalyzer() {
   assert.strictEqual(result.failures, 1);
   const semantics = JSON.parse(await fs.readFile(result.pageSemanticsPath, "utf8"));
   assert.match(semantics.error, /deterministic mock outage/);
+}
+
+async function testVerifiedQwen3SemanticClientAndSanitation() {
+  const pageRoot = await createPageRoot("qwen3-verified", true);
+  const responses = [
+    '<think>api_key=private-page-reasoning</think>\n```json\n{"page":"CustomerSearch","api_key":"raw-page-secret","confidence":"high","uncertainties":[]}\n```',
+    '<think>private interaction reasoning</think>\n```json\n{"interaction":"submit","client_secret":"raw-interaction-secret","confidence":"high","uncertainties":[]}\n```'
+  ];
+  let calls = 0;
+  const client = {
+    provider: "qwen",
+    async send() {
+      const text = responses[calls++];
+      return documentationResponse(text, "local/qwen3-32b", "qwen");
+    }
+  };
+  const options = {
+    client,
+    cacheIdentity: "qwen3-32b@verified-fingerprint",
+    expectedModelMarker: "qwen3"
+  };
+  const first = await new QwenPageSemanticAnalyzer(undefined, "qwen3-32b", undefined, options)
+    .analyze(pageRoot, {}, token);
+  assert.strictEqual(first.failures, 0);
+  assert.strictEqual(calls, 2);
+  const persisted = [
+    await fs.readFile(first.pageSemanticsPath, "utf8"),
+    await fs.readFile(first.interactionSemanticsPath, "utf8")
+  ].join("\n");
+  assert.doesNotMatch(persisted, /<think>|```|private-page-reasoning|raw-page-secret|raw-interaction-secret/i);
+  assert.match(persisted, /\[MASKED_SECRET\]/);
+
+  const cacheOnly = {
+    provider: "qwen",
+    async send() { throw new Error("verified cache unexpectedly missed"); }
+  };
+  const second = await new QwenPageSemanticAnalyzer(undefined, "qwen3-32b", undefined, {
+    ...options,
+    client: cacheOnly
+  }).analyze(pageRoot, {}, token);
+  assert.strictEqual(second.cacheHits, 2, "verified Qwen3 cache entries must remain reusable only under their pinned identity");
+}
+
+async function testApprovedBankingAliasAcceptedViaQwen3Family() {
+  const pageRoot = await createPageRoot("qwen3-banking-family", false);
+  const client = {
+    provider: "qwen",
+    async send() {
+      return documentationResponse(
+        '{"page":"CustomerSearch","confidence":"high","uncertainties":[]}',
+        "ONIKS",
+        "qwen",
+        "qwen3"
+      );
+    }
+  };
+  const result = await new QwenPageSemanticAnalyzer(undefined, "ONIKS", undefined, {
+    client,
+    cacheIdentity: "ONIKS@approved-banking-qwen3",
+    expectedModelMarker: "qwen3"
+  }).analyze(pageRoot, {}, token);
+  assert.strictEqual(result.failures, 0, "the approved banking alias must pass selected-page validation via response family=qwen3");
+  assert.strictEqual(result.analyzedInteractions, 0);
+}
+
+async function testVerifiedQwen3SemanticBoundaryRejection() {
+  const pageRoot = await createPageRoot("qwen3-wrong-model", false);
+  const wrongModel = {
+    provider: "qwen",
+    async send() { return documentationResponse('{"page":"wrong"}', "notqwen3fake", "qwen"); }
+  };
+  await assert.rejects(
+    () => new QwenPageSemanticAnalyzer(undefined, "qwen3", undefined, {
+      client: wrongModel,
+      cacheIdentity: "qwen3@wrong-model-test",
+      expectedModelMarker: "qwen3"
+    }).analyze(pageRoot, {}, token),
+    (error) => error?.name === "Qwen3PageSemanticBoundaryError" && /unexpected model/i.test(error.message)
+  );
+
+  const unattestedBankAlias = {
+    provider: "qwen",
+    async send() { return documentationResponse('{"page":"wrong"}', "ONIKS", "qwen"); }
+  };
+  await assert.rejects(
+    () => new QwenPageSemanticAnalyzer(undefined, "ONIKS", undefined, {
+      client: unattestedBankAlias,
+      cacheIdentity: "ONIKS@non-banking",
+      expectedModelMarker: "qwen3"
+    }).analyze(pageRoot, {}, token),
+    (error) => error?.name === "Qwen3PageSemanticBoundaryError" && /unexpected model/i.test(error.message),
+    "ONIKS without a trusted response family=qwen3 attestation must remain rejected"
+  );
+
+  let sends = 0;
+  const wrongProvider = {
+    provider: "copilot",
+    async send() { sends += 1; throw new Error("must not send"); }
+  };
+  await assert.rejects(
+    () => new QwenPageSemanticAnalyzer(undefined, "qwen3", undefined, {
+      client: wrongProvider,
+      cacheIdentity: "qwen3@wrong-provider-test"
+    }).analyze(pageRoot, {}, token),
+    /provider=qwen/i
+  );
+  assert.strictEqual(sends, 0);
+}
+
+async function testVerifiedQwen3DebugSanitation() {
+  const pageRoot = await createPageRoot("qwen3-debug-sanitized", false);
+  const client = {
+    provider: "qwen",
+    async send() {
+      return documentationResponse(
+        "<think>private semantic reasoning</think>\nnot-json api_key=raw-debug-secret",
+        "qwen3-32b",
+        "qwen"
+      );
+    }
+  };
+  const result = await new QwenPageSemanticAnalyzer(undefined, "qwen3-32b", undefined, {
+    client,
+    cacheIdentity: "qwen3-32b@debug-test"
+  }).analyze(pageRoot, {}, token);
+  assert.strictEqual(result.failures, 1);
+  const debugRoot = path.join(pageRoot, ".cache", "qwen", "debug");
+  const debugFiles = await fs.readdir(debugRoot);
+  const debug = await fs.readFile(path.join(debugRoot, debugFiles[0]), "utf8");
+  assert.doesNotMatch(debug, /<think>|private semantic reasoning|raw-debug-secret/i);
+  assert.match(debug, /\[MASKED_SECRET\]/);
+}
+
+function documentationResponse(text, modelId, provider, family = modelId) {
+  return {
+    text,
+    usage: {
+      inputCharacters: 100,
+      outputCharacters: text.length,
+      estimatedInputTokens: 25,
+      estimatedOutputTokens: 25,
+      estimatedTotalTokens: 50
+    },
+    model: {
+      id: modelId,
+      name: modelId,
+      vendor: provider,
+      family,
+      version: "test",
+      maxInputTokens: 131072
+    },
+    provider
+  };
 }
 
 async function createPageRoot(prefix, includeInteraction) {

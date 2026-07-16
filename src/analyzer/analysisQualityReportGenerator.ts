@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { readJsonl } from "../storage/jsonlWriter";
 import { Manifest } from "../storage/manifestService";
+import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
 
 type FileIndex = { file: string; kind: string; classification?: string };
 type ComponentIndex = { type: string; className: string; file: string; constructorDependencies?: string[]; fieldInjectedDependencies?: string[] };
@@ -93,8 +94,8 @@ export class AnalysisQualityReportGenerator {
     this.addWarnings(report);
     const jsonPath = path.join(aiDocsPath, "analysis-report.json");
     const markdownPath = path.join(aiDocsPath, "analysis-report.md");
-    await fs.writeFile(jsonPath, JSON.stringify(report, null, 2), "utf8");
-    await fs.writeFile(markdownPath, this.toMarkdown(report), "utf8");
+    await atomicWriteJson(jsonPath, report);
+    await atomicWriteFile(markdownPath, this.toMarkdown(report));
     return { markdownPath, jsonPath, report };
   }
 

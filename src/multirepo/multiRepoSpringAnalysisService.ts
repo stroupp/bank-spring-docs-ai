@@ -20,12 +20,16 @@ import { SpringTestExtractor } from "../analyzer/springTestExtractor";
 import { parseBitbucketUrl } from "../git/bitbucketUrlParser";
 import { ManifestService } from "../storage/manifestService";
 import { writeJsonl } from "../storage/jsonlWriter";
+import { atomicWriteFile } from "../storage/atomicFile";
+import { PipelineArtifactReceiptService } from "./pipelineArtifactReceiptService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 
 export interface MultiRepoSpringAnalysisInput {
   repoUrl: string;
   repoRoot: string;
   outputRoot: string;
   branch: string;
+  pipelineIdentity?: string;
   repositoryName?: string;
   role?: "bff" | "be";
 }
@@ -43,7 +47,11 @@ export class MultiRepoSpringAnalysisService {
   constructor(private readonly scanner = new RepositoryScanner()) {}
 
   async analyze(input: MultiRepoSpringAnalysisInput): Promise<MultiRepoSpringAnalysisResult> {
+    await assertPathContainedForWrite(path.dirname(input.outputRoot), input.outputRoot);
     await fs.mkdir(input.outputRoot, { recursive: true });
+    await assertPathContainedForWrite(path.dirname(input.outputRoot), input.outputRoot);
+    await fs.rm(path.join(input.outputRoot, "manifest.json"), { force: true });
+    await new PipelineArtifactReceiptService().invalidateTraceability(path.dirname(input.outputRoot));
 
     const files = await this.scanner.scan(input.repoRoot);
     const buildTool = this.scanner.detectBuildTool(files);
@@ -61,7 +69,10 @@ export class MultiRepoSpringAnalysisService {
       kind: file.kind,
       classification: file.classification,
       extension: file.extension,
-      size: file.size
+      size: file.size,
+      modulePath: file.modulePath,
+      sourceSet: file.sourceSet,
+      sourceRoot: file.sourceRoot
     })));
     await writeJsonl(path.join(input.outputRoot, "spring-components.jsonl"), components);
     await writeJsonl(path.join(input.outputRoot, "api-endpoints.jsonl"), endpoints);
@@ -74,7 +85,8 @@ export class MultiRepoSpringAnalysisService {
     if (input.role === "bff") {
       const outboundCalls = new BffOutboundCallExtractor().extract(files);
       const dtos = new BffDtoExtractor().extract(files);
-      const bffFlows = new BffFlowIndexBuilder().build(endpoints, components, outboundCalls);
+      const methodCalls = new JavaMethodCallExtractor().extract(files);
+      const bffFlows = new BffFlowIndexBuilder().build(endpoints, components, outboundCalls, methodCalls);
       await writeJsonl(path.join(input.outputRoot, "outbound-calls.jsonl"), outboundCalls);
       await writeJsonl(path.join(input.outputRoot, "dto-index.jsonl"), dtos);
       await writeJsonl(path.join(input.outputRoot, "bff-flow-index.jsonl"), bffFlows);
@@ -104,11 +116,12 @@ export class MultiRepoSpringAnalysisService {
       endpoints,
       entities
     });
-    await fs.writeFile(path.join(input.outputRoot, "repo-map.md"), repoMap, "utf8");
+    await atomicWriteFile(path.join(input.outputRoot, "repo-map.md"), repoMap);
     await new ManifestService().write(input.outputRoot, {
       repositoryUrl: input.repoUrl,
       repositoryName,
       branch: input.branch,
+      pipelineIdentity: input.pipelineIdentity,
       buildTool,
       generatedAt: new Date().toISOString()
     });

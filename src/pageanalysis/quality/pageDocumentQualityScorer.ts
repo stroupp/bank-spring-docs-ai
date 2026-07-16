@@ -4,6 +4,7 @@ import { readJsonl, writeJsonl } from "../../storage/jsonlWriter";
 import { buildPageArtifactMetadata, PageArtifactMetadata } from "../pageArtifactMetadata";
 import { ArtifactFreshnessService } from "../artifactFreshnessService";
 import { PageOutputFreshnessService } from "../pageOutputFreshnessService";
+import { atomicWriteJson } from "../../storage/atomicFile";
 
 export interface PageQualityMetricExplanation {
   metric: string;
@@ -275,7 +276,7 @@ export class PageDocumentQualityScorer {
       metricExplanations,
       outputFreshnessIssues: outputFreshnessIssueCount
     };
-    await fs.writeFile(path.join(pageRoot, "quality-score.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    await atomicWriteJson(path.join(pageRoot, "quality-score.json"), result);
     await appendQuality(multiRepoRoot, result);
     return result;
   }

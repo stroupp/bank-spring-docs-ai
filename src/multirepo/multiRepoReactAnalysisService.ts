@@ -10,12 +10,17 @@ import { ReactRouteExtractor } from "../analyzer/ui/reactRouteExtractor";
 import { ReactStateExtractor } from "../analyzer/ui/reactStateExtractor";
 import { parseBitbucketUrl } from "../git/bitbucketUrlParser";
 import { writeJsonl } from "../storage/jsonlWriter";
+import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
+import { repositoryUrlForArtifact } from "../utils/repositoryUrl";
+import { PipelineArtifactReceiptService } from "./pipelineArtifactReceiptService";
+import { assertPathContainedForWrite } from "../storage/localStorageService";
 
 export interface MultiRepoReactAnalysisInput {
   repoUrl: string;
   repoRoot: string;
   outputRoot: string;
   branch: string;
+  pipelineIdentity?: string;
 }
 
 export interface MultiRepoReactAnalysisResult {
@@ -32,7 +37,11 @@ export class MultiRepoReactAnalysisService {
   constructor(private readonly scanner = new ReactRepositoryScanner()) {}
 
   async analyze(input: MultiRepoReactAnalysisInput): Promise<MultiRepoReactAnalysisResult> {
+    await assertPathContainedForWrite(path.dirname(input.outputRoot), input.outputRoot);
     await fs.mkdir(input.outputRoot, { recursive: true });
+    await assertPathContainedForWrite(path.dirname(input.outputRoot), input.outputRoot);
+    await fs.rm(path.join(input.outputRoot, "manifest.json"), { force: true });
+    await new PipelineArtifactReceiptService().invalidateTraceability(path.dirname(input.outputRoot));
     const files = await this.scanner.scan(input.repoRoot);
     const indicators = this.scanner.detectIndicators(files);
     const routes = new ReactRouteExtractor().extract(files);
@@ -75,15 +84,16 @@ export class MultiRepoReactAnalysisService {
       formFields,
       states
     });
-    await fs.writeFile(path.join(input.outputRoot, "repo-map.md"), repoMap, "utf8");
-    await fs.writeFile(path.join(input.outputRoot, "manifest.json"), JSON.stringify({
-      repositoryUrl: input.repoUrl,
+    await atomicWriteFile(path.join(input.outputRoot, "repo-map.md"), repoMap);
+    await atomicWriteJson(path.join(input.outputRoot, "manifest.json"), {
+      repositoryUrl: repositoryUrlForArtifact(input.repoUrl),
       repositoryName,
       branch: input.branch,
+      pipelineIdentity: input.pipelineIdentity,
       generatedAt: new Date().toISOString(),
       framework: "React",
       indicators
-    }, null, 2), "utf8");
+    });
 
     return {
       repositoryName,

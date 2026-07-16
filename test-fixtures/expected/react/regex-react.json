@@ -13,7 +13,7 @@
   "apiCalls": [
     { "httpMethod": "GET", "path": "/api/customers/search" },
     { "httpMethod": "POST", "path": "/api/customers/search" },
-    { "httpMethod": "GET", "path": "/api/customers/{param}" }
+    { "httpMethod": "GET", "path": "/api/customers/{id}", "parameters": ["id"] }
   ],
   "formFields": [
     { "fieldName": "customerName", "component": "input" },

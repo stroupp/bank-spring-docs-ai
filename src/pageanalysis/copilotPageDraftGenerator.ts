@@ -1,8 +1,9 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
-import { CopilotResponseWithUsage, ICopilotClient, RealCopilotClient } from "../ai/copilotClient";
+import { RealCopilotClient } from "../ai/copilotClient";
 import { CopilotAuditLogger } from "../ai/copilotAuditLogger";
+import { DocumentationModelProvider, DocumentationModelResponse, IDocumentationModelClient } from "../ai/documentationModelClient";
 import { maskSecretsWithStats } from "../ai/safeContextFilter";
 import { buildCopilotPageDraftPrompt } from "./pageTechnicalAnalysisPrompts";
 import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
@@ -22,7 +23,7 @@ interface CopilotPageContextBuildResult {
 
 export class CopilotPageDraftGenerator {
   constructor(
-    private readonly client: ICopilotClient = new RealCopilotClient(),
+    private readonly client: IDocumentationModelClient = new RealCopilotClient(),
     private readonly maxContextCharacters?: number
   ) {}
 
@@ -43,9 +44,15 @@ export class CopilotPageDraftGenerator {
     await fs.writeFile(contextPath, safe.text, "utf8");
     await fs.writeFile(promptPath, prompt.combinedText, "utf8");
 
-    let response: CopilotResponseWithUsage;
+    let response: DocumentationModelResponse;
+    let responseReceived = false;
     try {
       response = await this.client.send(prompt, token);
+      responseReceived = true;
+      if (!response.text.trim()) {
+        throw new Error(`${resolveProvider(response.provider, this.client.provider)} sayfa taslağı için boş yanıt döndürdü.`);
+      }
+      const provider = resolveProvider(response.provider, this.client.provider);
       await fs.writeFile(draftPath, `${pageMetadataComment(metadata)}\n\n${response.text.trim()}\n`, "utf8");
       await new CopilotAuditLogger().write(multiRepoRoot, {
         timestamp: new Date().toISOString(),
@@ -63,6 +70,9 @@ export class CopilotPageDraftGenerator {
         estimatedOutputTokens: response.usage.estimatedOutputTokens,
         estimatedTotalTokens: response.usage.estimatedTotalTokens,
         modelCountedInputTokens: response.usage.modelCountedInputTokens,
+        promptTokens: response.usage.promptTokens,
+        completionTokens: response.usage.completionTokens,
+        totalTokens: response.usage.totalTokens,
         outputCharacters: response.usage.outputCharacters,
         copilotRequestStarted: true,
         copilotResponseReceived: true,
@@ -72,28 +82,36 @@ export class CopilotPageDraftGenerator {
         selectedModelFamily: response.model.family,
         selectedModelVersion: response.model.version,
         selectedModelMaxInputTokens: response.model.maxInputTokens,
-        modelFamily: "copilot",
+        provider,
+        finishReason: response.finishReason,
+        requestId: response.requestId,
+        modelFamily: provider,
         status: "success"
       });
     } catch (error) {
-      await new CopilotAuditLogger().write(multiRepoRoot, {
-        timestamp: new Date().toISOString(),
-        docType: "page-analysis-draft",
-        repositoryName: metadata.projectName,
-        branch: metadata.branch,
-        contextPackPath: path.relative(multiRepoRoot, contextPath),
-        promptPackPath: path.relative(multiRepoRoot, promptPath),
-        charactersSent: safe.text.length,
-        includedIndexes: context.includedFiles,
-        skippedIndexes: context.skippedFiles,
-        maskedSecrets: safe.maskedSecrets,
-        promptProfile: "page-technical-analysis-draft",
-        copilotRequestStarted: true,
-        copilotResponseReceived: false,
-        modelFamily: "copilot",
-        status: token.isCancellationRequested ? "cancelled" : "failed",
-        error: error instanceof Error ? error.message : String(error)
-      });
+      try {
+        await new CopilotAuditLogger().write(multiRepoRoot, {
+          timestamp: new Date().toISOString(),
+          docType: "page-analysis-draft",
+          repositoryName: metadata.projectName,
+          branch: metadata.branch,
+          contextPackPath: path.relative(multiRepoRoot, contextPath),
+          promptPackPath: path.relative(multiRepoRoot, promptPath),
+          charactersSent: safe.text.length,
+          includedIndexes: context.includedFiles,
+          skippedIndexes: context.skippedFiles,
+          maskedSecrets: safe.maskedSecrets,
+          promptProfile: "page-technical-analysis-draft",
+          copilotRequestStarted: true,
+          copilotResponseReceived: responseReceived,
+          provider: resolveProvider(undefined, this.client.provider),
+          modelFamily: resolveProvider(undefined, this.client.provider),
+          status: token.isCancellationRequested ? "cancelled" : "failed",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      } catch {
+        // Preserve the original provider failure if best-effort auditing fails.
+      }
       throw error;
     }
 
@@ -122,7 +140,7 @@ export class CopilotPageDraftGenerator {
         const staleDependencies = await staleDependenciesFor(pageRoot, fileName, dependencies);
         if (staleDependencies.length) {
           skippedFiles.push(fileName);
-          skippedSections.push(`## ${title} Skipped\n${fileName} is older than: ${staleDependencies.join(", ")}. Regenerate this artifact before using it as Copilot context.`);
+          skippedSections.push(`## ${title} Skipped\n${fileName} is older than: ${staleDependencies.join(", ")}. Regenerate this artifact before using it as ${providerDisplayName(this.client.provider)} context.`);
           continue;
         }
         includedFiles.push(fileName);
@@ -139,6 +157,17 @@ export class CopilotPageDraftGenerator {
       skippedFiles
     };
   }
+}
+
+function providerDisplayName(provider: IDocumentationModelClient["provider"]): string {
+  return provider === "qwen" ? "Qwen" : "Copilot";
+}
+
+function resolveProvider(
+  responseProvider?: DocumentationModelProvider,
+  clientProvider?: DocumentationModelProvider
+): DocumentationModelProvider {
+  return responseProvider ?? clientProvider ?? "copilot";
 }
 
 async function readOptional(filePath: string): Promise<string> {

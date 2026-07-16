@@ -2,12 +2,13 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { readJsonl } from "../../storage/jsonlWriter";
 import { PageDocumentQualityScore } from "./pageDocumentQualityScorer";
+import { atomicWriteFile } from "../../storage/atomicFile";
 
 export class PageDocumentQualityReportWriter {
   async write(pageRoot: string, score: PageDocumentQualityScore): Promise<string> {
     await fs.mkdir(pageRoot, { recursive: true });
     const target = path.join(pageRoot, "quality-report.md");
-    await fs.writeFile(target, [
+    await atomicWriteFile(target, [
       "# Sayfa Dokuman Kalite Raporu",
       "",
       `Sayfa: ${score.page}`,
@@ -41,7 +42,7 @@ export class PageDocumentQualityReportWriter {
         `- ${metric.metric} (${metric.status}, agirlik ${metric.weight}): ${metric.value === null ? "unknown" : metric.value.toFixed(2)}. ${metric.reason}`
       ),
       ""
-    ].join("\n"), "utf8");
+    ].join("\n"));
     return target;
   }
 
@@ -49,7 +50,7 @@ export class PageDocumentQualityReportWriter {
     const scores = await readJsonl<PageDocumentQualityScore>(path.join(multiRepoRoot, "quality", "page-document-quality.jsonl"));
     const target = path.join(multiRepoRoot, "quality", "page-document-quality-report.md");
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, [
+    await atomicWriteFile(target, [
       "# Sayfa Dokuman Kalite Raporu",
       "",
       `Olusturulma zamani: ${new Date().toISOString()}`,
@@ -71,7 +72,7 @@ export class PageDocumentQualityReportWriter {
       `- Unknown metric data olan sayfa: ${scores.filter((item) => item.metricsWithUnknownData.length > 0).length}`,
       `- Output freshness issue toplami: ${scores.reduce((sum, item) => sum + item.outputFreshnessIssues, 0)}`,
       ""
-    ].join("\n"), "utf8");
+    ].join("\n"));
     return target;
   }
 }

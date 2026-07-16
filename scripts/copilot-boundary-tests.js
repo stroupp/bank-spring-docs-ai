@@ -205,6 +205,7 @@ async function testContextBudgetEvidenceSemanticsAndSuccessAudit() {
   const { multiRoot, pageRoot } = await createPage("copilot-success");
   const requests = [];
   const mock = {
+    provider: "qwen",
     async send(prompt) {
       requests.push(prompt);
       return {
@@ -216,7 +217,9 @@ async function testContextBudgetEvidenceSemanticsAndSuccessAudit() {
           estimatedOutputTokens: 24,
           estimatedTotalTokens: Math.ceil(prompt.combinedText.length / 4) + 24
         },
-        model: { id: "mock", name: "Mock Copilot", vendor: "test", family: "mock", version: "1", maxInputTokens: 32000 }
+        model: { id: "mock-qwen", name: "Mock Qwen", vendor: "qwen", family: "qwen", version: "1", maxInputTokens: 131072 },
+        provider: "qwen",
+        finishReason: "stop"
       };
     }
   };
@@ -237,13 +240,16 @@ async function testContextBudgetEvidenceSemanticsAndSuccessAudit() {
   assert.strictEqual(audits.length, 1);
   assert.strictEqual(audits[0].status, "success");
   assert.strictEqual(audits[0].maskedSecrets, 1);
-  assert.strictEqual(audits[0].selectedModelId, "mock");
+  assert.strictEqual(audits[0].selectedModelId, "mock-qwen");
+  assert.strictEqual(audits[0].provider, "qwen");
+  assert.strictEqual(audits[0].modelFamily, "qwen");
+  assert.strictEqual(audits[0].finishReason, "stop");
   assert.ok(audits[0].includedIndexes.includes("page-evidence-pack.md"));
 }
 
 async function testFailureAndCancellationAudits() {
   const failed = await createPage("copilot-failed");
-  const throwingMock = { async send() { throw new Error("deterministic mock failure"); } };
+  const throwingMock = { async send() { throw new Error("api_key=boundary-audit-secret deterministic mock failure"); } };
   await assert.rejects(
     new CopilotPageDraftGenerator(throwingMock, 2000).generate(failed.multiRoot, failed.pageRoot, token),
     /deterministic mock failure/
@@ -251,6 +257,8 @@ async function testFailureAndCancellationAudits() {
   const failedAudits = await readAudit(failed.multiRoot);
   assert.strictEqual(failedAudits[0].status, "failed");
   assert.match(failedAudits[0].error, /deterministic mock failure/);
+  assert.doesNotMatch(failedAudits[0].error, /boundary-audit-secret/);
+  assert.match(failedAudits[0].error, /\[MASKED_SECRET\]/);
 
   const cancelled = await createPage("copilot-cancelled");
   const cancelledToken = { ...token, isCancellationRequested: true };
