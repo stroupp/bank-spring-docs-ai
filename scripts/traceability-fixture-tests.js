@@ -304,7 +304,16 @@ function testRestClientOutboundFlowAndTargetMatching() {
   const matched = new BffToBeMatcher().match(endpoints, beEndpoints, [post]);
   assert.strictEqual(matched[0].beController, "LedgerController", "BE matching must follow the extracted outbound target, not the public BFF path");
   assert.strictEqual(matched[0].bffController, "TransferController");
+  assert.strictEqual(matched[0].bffFile, post.file, "traceability must retain the outbound/Feign source file for evidence selection");
+  assert.strictEqual(matched[0].beFile, "LedgerController.java", "traceability must retain the matched BE endpoint file for evidence selection");
   assert.strictEqual(matched[0].confidence, "high");
+
+  const ambiguous = new BffToBeMatcher().match(endpoints, [
+    beEndpoints[1],
+    { ...beEndpoints[1], className: "SecondLedgerController", file: "SecondLedgerController.java" }
+  ], [post]);
+  assert.strictEqual(ambiguous[0].confidence, "low");
+  assert.strictEqual(ambiguous[0].beFile, undefined, "ambiguous BE matches must not prioritize an arbitrary controller file");
 
   const deleteMatched = new BffToBeMatcher().match(endpoints, [
     { httpMethod: "DELETE", path: "/internal/transfers/{id}", className: "LedgerController", handlerMethod: "cancel", file: "LedgerController.java" }

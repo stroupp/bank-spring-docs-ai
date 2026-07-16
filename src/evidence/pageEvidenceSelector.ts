@@ -13,6 +13,7 @@ type JsonRecord = Record<string, unknown>;
 
 export function selectPageEvidenceFiles(manifest: MultiRepoManifest, pageFlow: Record<string, unknown>): EvidenceFileSelection[] {
   const selectedPage = asRecord(pageFlow.selectedPage);
+  const bffToBeMatches = asRecords(pageFlow.bffToBeMatches);
   const beServiceFlows = asRecords(pageFlow.beServiceFlows);
   const trustedBeServiceFlows = beServiceFlows.filter((flow) => String(flow.confidence ?? "") !== "low");
   const referencedEntities = new Set(trustedBeServiceFlows.flatMap((flow) => asStringArray(flow.entities)).map(normalizeName));
@@ -43,6 +44,7 @@ export function selectPageEvidenceFiles(manifest: MultiRepoManifest, pageFlow: R
       role: "bff",
       repoRoot: manifest.repos.bff.localPath,
       files: unique([
+        ...collectTraceFiles(bffToBeMatches, "bff"),
         ...collectFiles(pageFlow.bffEndpoints),
         ...collectFiles(pageFlow.bffComponents),
         ...collectFiles(pageFlow.bffDtos),
@@ -55,6 +57,7 @@ export function selectPageEvidenceFiles(manifest: MultiRepoManifest, pageFlow: R
       role: "be",
       repoRoot: manifest.repos.be.localPath,
       files: unique([
+        ...collectTraceFiles(bffToBeMatches, "be"),
         ...collectFiles(pageFlow.beEndpoints),
         ...collectFiles(pageFlow.beComponents),
         ...collectFiles(pageFlow.beDtos),
@@ -67,6 +70,13 @@ export function selectPageEvidenceFiles(manifest: MultiRepoManifest, pageFlow: R
     }
   ];
   return selections.filter((selection) => selection.files.length > 0);
+}
+
+function collectTraceFiles(matches: JsonRecord[], role: "bff" | "be"): string[] {
+  const keys = role === "bff"
+    ? ["bffFile", "bffSourceFile", "clientFile", "outboundFile"]
+    : ["beFile", "beTargetFile", "targetFile", "endpointFile"];
+  return matches.flatMap((match) => keys.flatMap((key) => collectFiles(match[key])));
 }
 
 function buildUncertaintyNotes(pageFlow: Record<string, unknown>): Record<EvidenceRole, string[]> {
@@ -159,5 +169,5 @@ function normalizeFile(value: string): string {
 }
 
 function unique(values: string[]): string[] {
-  return [...new Set(values)].sort();
+  return [...new Set(values)];
 }

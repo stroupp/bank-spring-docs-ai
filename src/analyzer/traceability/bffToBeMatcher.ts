@@ -21,9 +21,13 @@ export interface BffToBeMatch {
   bffHandler: string;
   bffOutboundCall?: string;
   bffClient?: string;
+  /** Source file that performs the BFF outbound/Feign call. */
+  bffFile?: string;
   beEndpoint?: string;
   beController?: string;
   beHandler?: string;
+  /** Source file that declares the matched BE endpoint. */
+  beFile?: string;
   confidence: "high" | "medium" | "low" | "unmatched";
   matchReason: string;
 }
@@ -63,29 +67,34 @@ export class BffToBeMatcher {
       bffController: call.sourceController ?? call.client,
       bffHandler: call.sourceHandler ?? call.sourceMethod ?? call.method,
       bffOutboundCall: `${method} ${path}`,
-      bffClient: call.client
+      bffClient: call.client,
+      bffFile: call.file
     };
 
     if (exact) {
+      const uniqueExact = exactCandidates.length === 1;
       return {
         ...base,
         beEndpoint: `${normalizeMethod(exact.httpMethod)} ${normalizeHttpPath(exact.path)}`,
         beController: exact.className,
         beHandler: exact.handlerMethod,
-        confidence: exactCandidates.length === 1 ? "high" : "low",
-        matchReason: exactCandidates.length === 1
+        ...(uniqueExact ? { beFile: exact.file } : {}),
+        confidence: uniqueExact ? "high" : "low",
+        matchReason: uniqueExact
           ? "BFF outbound call matched BE endpoint by HTTP method and normalized path"
           : `Ambiguous BFF outbound match: ${exactCandidates.length} BE endpoints share the normalized method/path`
       };
     }
     if (suffix) {
+      const uniqueSuffix = suffixCandidates.length === 1;
       return {
         ...base,
         beEndpoint: `${normalizeMethod(suffix.httpMethod)} ${normalizeHttpPath(suffix.path)}`,
         beController: suffix.className,
         beHandler: suffix.handlerMethod,
-        confidence: suffixCandidates.length === 1 ? "medium" : "low",
-        matchReason: suffixCandidates.length === 1
+        ...(uniqueSuffix ? { beFile: suffix.file } : {}),
+        confidence: uniqueSuffix ? "medium" : "low",
+        matchReason: uniqueSuffix
           ? "BFF outbound call matched BE endpoint by normalized suffix/prefix path"
           : `Ambiguous BFF outbound suffix/prefix match: ${suffixCandidates.length} BE endpoints are candidates`
       };

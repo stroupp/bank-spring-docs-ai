@@ -22,7 +22,7 @@ const qwen3ModelSegment = /(?:^|[/:._-])qwen3(?:$|[/:._-])/i;
 export function getConfiguredDocumentationModelProvider(): DocumentationModelProvider {
   const configured = vscode.workspace
     .getConfiguration("bankSpringDocs")
-    .get<string>("ai.provider", "copilot")
+    .get<string>("ai.provider", "qwen")
     .trim()
     .toLowerCase();
 

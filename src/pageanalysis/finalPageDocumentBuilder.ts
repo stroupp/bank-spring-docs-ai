@@ -2,9 +2,18 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
 import { atomicWriteFile } from "../storage/atomicFile";
+import { sha256 } from "../utils/hash";
+import { PageFlowDiagramBuilder } from "./pageFlowDiagramBuilder";
 
 export interface FinalPageDocumentResult {
   finalDocumentPath: string;
+}
+
+interface DraftGenerationMetadata {
+  provider?: string;
+  model?: string;
+  pipeline?: string;
+  qwenSemanticArtifactsUsed?: boolean;
 }
 
 export class FinalPageDocumentBuilder {
@@ -24,15 +33,32 @@ export class FinalPageDocumentBuilder {
     }
     const mergedBody = mergeRepairedSections(draft, repaired);
     const draftGeneration = parseGenerationMetadata(draft);
+    const qwenGenerated = draftGeneration.provider === "qwen" || Boolean(draftGeneration.pipeline?.startsWith("qwen3"));
+    const diagrams = qwenGenerated ? new PageFlowDiagramBuilder().build(pageFlow) : undefined;
+    if (diagrams) {
+      await atomicWriteFile(path.join(pageRoot, "page-flow-uml.svg"), diagrams.svg);
+    }
+    const mergedBodyWithDiagrams = diagrams && !hasPageFlowDiagrams(mergedBody)
+      ? `${mergedBody.trimEnd()}\n\n${diagrams.markdown}`
+      : mergedBody;
     const qwenAvailable = Boolean(await readOptional(path.join(pageRoot, "qwen-page-semantics.json")));
+    const storedContextSelection = await readJson(path.join(pageRoot, "copilot-draft-context-selection.json"));
+    const contextSelection = storedContextSelection.draftHash === sha256(draft)
+      ? storedContextSelection
+      : {};
+    const qwenUsage = resolveQwenSemanticUsage(contextSelection, draftGeneration, qwenAvailable);
     const finalDocumentPath = path.join(pageRoot, "final-page-technical-analysis.md");
-    const metadata = await buildPageArtifactMetadata(pageRoot, [
+    const metadataInputs = [
       "page-context-pack.md",
       "page-evidence-pack.md",
       "copilot-draft.md",
       "detected-gaps.json",
       "repaired-sections.md"
-    ]);
+    ];
+    if (!draftGeneration.pipeline?.startsWith("qwen3-") && typeof contextSelection.qwenSemanticArtifactsEnabled === "boolean") {
+      metadataInputs.push("copilot-draft-context-selection.json");
+    }
+    const metadata = await buildPageArtifactMetadata(pageRoot, metadataInputs);
     const content = [
       "# Final Sayfa Teknik Analiz Dokumani",
       "",
@@ -48,7 +74,7 @@ export class FinalPageDocumentBuilder {
       draftGeneration.provider ? `Taslak saglayicisi: ${draftGeneration.provider}` : "",
       draftGeneration.model ? `Taslak modeli: ${draftGeneration.model}` : "",
       draftGeneration.pipeline ? `Taslak pipeline: ${draftGeneration.pipeline}` : "",
-      `Qwen semantik mevcut: ${qwenAvailable ? "evet" : "hayir"}`,
+      `Qwen semantik kullanimi: ${qwenUsage}`,
       draftStale.length ? `AI draft atlandi: ${draftStale.join(", ")} dosyalarindan eski.` : "",
       repairStale.length ? `Repaired sections atlandi: ${repairStale.join(", ")} dosyalarindan eski.` : "",
       `Evidence pack: ${path.join(pageRoot, "page-evidence-pack.md")}`,
@@ -56,7 +82,7 @@ export class FinalPageDocumentBuilder {
       "",
       "---",
       "",
-      mergedBody || "Provided context icinde net gorunmuyor.",
+      mergedBodyWithDiagrams || "Provided context icinde net gorunmuyor.",
       "",
       "## Final Not",
       "- Bu final dokuman taslak ve varsa repaired sections ciktilarindan olusturuldu.",
@@ -68,21 +94,60 @@ export class FinalPageDocumentBuilder {
   }
 }
 
-function parseGenerationMetadata(markdown: string): Record<string, string> {
+function hasPageFlowDiagrams(markdown: string): boolean {
+  return /page-flow-uml\.svg|^##\s+UML\s+ve\s+Ak[ıi]ş\s+Diyagramlar[ıi]\s*$/im.test(markdown);
+}
+
+function resolveQwenSemanticUsage(
+  selection: Record<string, unknown>,
+  generation: DraftGenerationMetadata,
+  artifactAvailable: boolean
+): "evet" | "hayir" | "devre disi" | "bilinmiyor" {
+  if (generation.pipeline?.startsWith("qwen3-")) {
+    if (typeof generation.qwenSemanticArtifactsUsed === "boolean") {
+      return generation.qwenSemanticArtifactsUsed ? "evet" : "devre disi";
+    }
+    return artifactAvailable ? "evet" : "hayir";
+  }
+  if (typeof selection.qwenSemanticArtifactsEnabled !== "boolean") {
+    return "bilinmiyor";
+  }
+  if (!selection.qwenSemanticArtifactsEnabled) {
+    return "devre disi";
+  }
+  const used = asRecords(selection.parts).some((part) =>
+    String(part.fileName ?? "").startsWith("qwen-")
+    && part.status === "included"
+    && Number(part.sentCharacters ?? 0) > 0
+  );
+  return used ? "evet" : "hayir";
+}
+
+function parseGenerationMetadata(markdown: string): DraftGenerationMetadata {
   const match = markdown.match(/<!--\s*bank-spring-docs-generation\s+({[^\r\n]*})\s*-->/);
   if (!match) {
     return {};
   }
   try {
     const parsed = JSON.parse(match[1]) as Record<string, unknown>;
-    return Object.fromEntries(
+    const result = Object.fromEntries(
       ["provider", "model", "pipeline"]
         .filter((key) => parsed[key] !== undefined)
         .map((key) => [key, String(parsed[key])])
-    );
+    ) as DraftGenerationMetadata;
+    if (typeof parsed.qwenSemanticArtifactsUsed === "boolean") {
+      result.qwenSemanticArtifactsUsed = parsed.qwenSemanticArtifactsUsed;
+    }
+    return result;
   } catch {
     return {};
   }
+}
+
+function asRecords(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
 }
 
 function mergeRepairedSections(draft: string, repaired: string): string {

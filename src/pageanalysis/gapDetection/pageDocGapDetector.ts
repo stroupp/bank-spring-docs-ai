@@ -53,11 +53,12 @@ export class PageDocGapDetector {
     const pageName = String((pageFlow.selectedPage as Record<string, unknown> | undefined)?.pageName ?? path.basename(pageRoot));
     const sections = splitSections(draft);
     const gaps: PageDocGap[] = [];
+    const qwenIterativeDraft = /<!--\s*bank-spring-docs-generation\s+\{[^\r\n]*"pipeline"\s*:\s*"qwen3-/i.test(draft);
 
     for (const section of requiredSections) {
       const body = sections.get(normalizeHeading(section)) ?? "";
-      if (!body.trim()) {
-        gaps.push(gap(pageName, section, "empty-section", `${section} bolumu bos veya bulunamadi.`, ["page-context-pack.md", "page-evidence-pack.md"], "high"));
+      if (!body.trim() || (qwenIterativeDraft && isQwenGeneratedPlaceholder(body))) {
+        gaps.push(gap(pageName, section, "empty-section", `${section} bolumu bos, bulunamadi veya Qwen grouped synthesis tarafindan atlandi.`, ["page-context-pack.md", "page-evidence-pack.md"], "high"));
       }
     }
 
@@ -149,6 +150,12 @@ function evidenceForSection(section: string): string[] {
 
 function sourceReferenceCount(markdown: string): number {
   return (markdown.match(/src[\\/][^\s)`]+?\.(?:java|ts|tsx|js|jsx|properties|ya?ml|json)/g) ?? []).length;
+}
+
+function isQwenGeneratedPlaceholder(body: string): boolean {
+  return /^provided context icinde net gorunmuyor\.?$/i.test(
+    foldToAscii(body).replace(/\s+/g, " ").trim()
+  );
 }
 
 async function readJson(filePath: string): Promise<Record<string, unknown>> {

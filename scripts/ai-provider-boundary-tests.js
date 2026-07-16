@@ -96,7 +96,8 @@ const token = {
 };
 
 async function main() {
-  testCopilotDefaultWithoutLanguageModelAccess();
+  testQwenDefaultWithoutLanguageModelAccess();
+  testQwen36SettingsDefaults();
   testExplicitQwenFactoryKeepsConfiguredCopilot();
   testResumableQwenIdentityIgnoresOperationalCeilings();
   testExplicitQwen3ModelPreflight();
@@ -118,6 +119,9 @@ async function main() {
   await testQwenContextPreflight();
   await testConservativeQwenContextPreflight();
   await testPerRequestQwenOutputBudget();
+  await testQwen36PhaseSamplingWireContract();
+  await testGlobalQwenRequestSerializationAndCooldown();
+  await testQwenQueueRecoversAfterFailureAndQueuedCancellation();
   testInvalidProviderRejected();
 
   assert.strictEqual(languageModelSelections, 0, "provider selection must not call vscode.lm until a Copilot request is sent");
@@ -184,8 +188,9 @@ async function testBankingPastedEndpointApproval() {
     endpoint: `  ${TEST_BANKING_ENDPOINT}/  `,
     model: "must-be-overridden",
     temperature: 0.6,
-    maxTokens: 163849,
+    maxTokens: 4096,
     timeoutSeconds: 120,
+    interRequestDelaySeconds: 23,
     useApiKey: true,
     apiKey: "must-not-be-stored"
   });
@@ -194,6 +199,7 @@ async function testBankingPastedEndpointApproval() {
   assert.strictEqual(settings["qwen.enabled"], true);
   assert.strictEqual(settings["qwen.bankingEnvironment"], true);
   assert.strictEqual(settings["qwen.model"], BANKING_QWEN_MODEL_ALIAS);
+  assert.strictEqual(settings["qwen.interRequestDelaySeconds"], 23);
   assert.strictEqual(settings["qwen.useApiKey"], false);
   assert.deepStrictEqual(settings["qwen.allowedHosts"], ["localhost", TEST_BANKING_HOST]);
   assert.ok(
@@ -221,8 +227,9 @@ async function testBankingApprovalRequiresTrust() {
         endpoint: TEST_BANKING_ENDPOINT,
         model: "must-be-overridden",
         temperature: 0.6,
-        maxTokens: 163849,
+        maxTokens: 4096,
         timeoutSeconds: 120,
+        interRequestDelaySeconds: 15,
         useApiKey: false
       }),
       /trusted VS Code workspace/i
@@ -298,13 +305,27 @@ function testUntrustedWorkspacePreflight() {
   workspaceTrusted = true;
 }
 
-function testCopilotDefaultWithoutLanguageModelAccess() {
+function testQwenDefaultWithoutLanguageModelAccess() {
   settings = {};
   const client = createDocumentationModelClient(context);
-  assert.strictEqual(getConfiguredDocumentationModelProvider(), "copilot");
-  assert.strictEqual(client.provider, "copilot");
-  assert.deepStrictEqual(getConfiguredDocumentationModelIdentity(context), { provider: "copilot", model: undefined });
+  assert.strictEqual(getConfiguredDocumentationModelProvider(), "qwen");
+  assert.strictEqual(client.provider, "qwen");
+  const identity = getConfiguredDocumentationModelIdentity(context);
+  assert.strictEqual(identity.provider, "qwen");
+  assert.strictEqual(identity.model, "Qwen/Qwen3.6-27B");
+  assert.match(identity.configurationFingerprint, /^[a-f0-9]{64}$/);
   assert.strictEqual(networkCalls, 0);
+}
+
+function testQwen36SettingsDefaults() {
+  settings = {};
+  const defaults = new QwenSettingsService(context).getSettings();
+  assert.strictEqual(defaults.enabled, true);
+  assert.strictEqual(defaults.bankingEnvironment, false);
+  assert.strictEqual(defaults.model, "Qwen/Qwen3.6-27B");
+  assert.strictEqual(defaults.temperature, 0.6);
+  assert.strictEqual(defaults.maxTokens, 16384);
+  assert.strictEqual(defaults.interRequestDelaySeconds, 15);
 }
 
 function testExplicitQwenFactoryKeepsConfiguredCopilot() {
@@ -526,8 +547,9 @@ async function testBankingConnectionProbeMatchesWireContract() {
     endpoint: `  ${TEST_BANKING_ENDPOINT}  `,
     model: BANKING_QWEN_MODEL_ALIAS,
     temperature: 0.6,
-    maxTokens: 163849,
+    maxTokens: 4096,
     timeoutSeconds: 120,
+    interRequestDelaySeconds: 0,
     useApiKey: true
   };
   let apiKeyReads = 0;
@@ -577,6 +599,160 @@ async function testTruncatedQwenResponseRejected() {
   });
   const client = createDocumentationModelClient(context);
   await assert.rejects(() => client.send("bounded prompt", token), /maksimum token|kesildi/i);
+}
+
+async function testQwen36PhaseSamplingWireContract() {
+  settings = {
+    ...qwenSettings(),
+    "qwen.model": "Qwen/Qwen3.6-27B",
+    "qwen.temperature": 0.6
+  };
+  responses.push(
+    {
+      model: "Qwen/Qwen3.6-27B",
+      choices: [{ message: { content: '{"sections":[]}' }, finish_reason: "stop" }]
+    },
+    {
+      model: "Qwen/Qwen3.6-27B",
+      choices: [{ message: { content: "## Sayfa Amacı\nGrounded." }, finish_reason: "stop" }]
+    }
+  );
+  const client = createQwenDocumentationModelClient(context);
+  await client.send({
+    instructions: "Return JSON.",
+    userPrompt: "Extract evidence.",
+    combinedText: "Return JSON.\n\nExtract evidence.",
+    profile: "qwen3-page-chunk-analysis",
+    maxOutputTokens: 2048
+  }, token);
+  const analysisRequest = requestBodies.at(-1);
+  assert.strictEqual(analysisRequest.temperature, 0.7);
+  assert.strictEqual(analysisRequest.top_p, 0.8);
+  assert.strictEqual(analysisRequest.top_k, 20);
+  assert.strictEqual(analysisRequest.presence_penalty, 1.5);
+  assert.deepStrictEqual(analysisRequest.chat_template_kwargs, { enable_thinking: false });
+
+  await client.send({
+    instructions: "Return Markdown.",
+    userPrompt: "Synthesize grounded sections.",
+    combinedText: "Return Markdown.\n\nSynthesize grounded sections.",
+    profile: "qwen3-page-final-synthesis",
+    maxOutputTokens: 8192
+  }, token);
+  const synthesisRequest = requestBodies.at(-1);
+  assert.strictEqual(synthesisRequest.temperature, 0.6);
+  assert.strictEqual(synthesisRequest.top_p, 0.95);
+  assert.strictEqual(synthesisRequest.top_k, 20);
+  assert.strictEqual(synthesisRequest.presence_penalty, 0);
+  assert.deepStrictEqual(synthesisRequest.chat_template_kwargs, { enable_thinking: true });
+}
+
+async function testGlobalQwenRequestSerializationAndCooldown() {
+  settings = { "qwen.allowedHosts": ["127.0.0.1"] };
+  const directSettings = directQwen36Settings(0.04);
+  const firstClient = directQwenClient(directSettings);
+  const secondClient = directQwenClient(directSettings);
+  const originalFetch = global.fetch;
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  let activeRequests = 0;
+  let maximumActiveRequests = 0;
+  let requestCount = 0;
+  let firstParsedAt = 0;
+  let secondStartedAt = 0;
+
+  global.fetch = async () => {
+    requestCount += 1;
+    const current = requestCount;
+    activeRequests += 1;
+    maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+    if (current === 1) {
+      markFirstStarted();
+      await firstRelease;
+    } else {
+      secondStartedAt = Date.now();
+    }
+    activeRequests -= 1;
+    return successfulResponse("Qwen/Qwen3.6-27B", `response-${current}`, () => {
+      if (current === 1) {
+        firstParsedAt = Date.now();
+      }
+    });
+  };
+
+  try {
+    const first = firstClient.complete([{ role: "user", content: "first" }]);
+    await firstStarted;
+    let secondSettled = false;
+    const second = secondClient.complete([{ role: "user", content: "second" }]).finally(() => {
+      secondSettled = true;
+    });
+    await delay(10);
+    assert.strictEqual(requestCount, 1, "a second QwenClient instance must not overlap the active request");
+    assert.strictEqual(secondSettled, false, "the queued request must remain pending until the first response completes");
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.strictEqual(maximumActiveRequests, 1, "the shared coordinator must enforce Qwen concurrency=1");
+    assert.ok(
+      secondStartedAt - firstParsedAt >= 30,
+      `the next request must observe the configured response cooldown (observed ${secondStartedAt - firstParsedAt}ms)`
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testQwenQueueRecoversAfterFailureAndQueuedCancellation() {
+  settings = { "qwen.allowedHosts": ["127.0.0.1"] };
+  const directSettings = directQwen36Settings(0);
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new Error("fetch failed");
+    }
+    return successfulResponse("Qwen/Qwen3.6-27B", "recovered");
+  };
+  try {
+    const firstClient = directQwenClient(directSettings);
+    const secondClient = directQwenClient(directSettings);
+    const [failed, recovered] = await Promise.allSettled([
+      firstClient.complete([{ role: "user", content: "fail once" }]),
+      secondClient.complete([{ role: "user", content: "recover" }])
+    ]);
+    assert.strictEqual(failed.status, "rejected");
+    assert.strictEqual(recovered.status, "fulfilled", "a failed request must not poison the shared Qwen queue");
+    assert.strictEqual(calls, 2);
+
+    let releaseActive;
+    let markActiveStarted;
+    const activeStarted = new Promise((resolve) => { markActiveStarted = resolve; });
+    const activeRelease = new Promise((resolve) => { releaseActive = resolve; });
+    calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      markActiveStarted();
+      await activeRelease;
+      return successfulResponse("Qwen/Qwen3.6-27B", "active-complete");
+    };
+    const active = firstClient.complete([{ role: "user", content: "active" }]);
+    await activeStarted;
+    const cancellable = cancellationToken();
+    const queued = secondClient.complete([{ role: "user", content: "queued" }], {}, cancellable.token);
+    cancellable.cancel();
+    await assert.rejects(
+      () => Promise.race([queued, delay(150).then(() => { throw new Error("queued cancellation timed out"); })]),
+      /iptal|cancel/i
+    );
+    assert.strictEqual(calls, 1, "a request cancelled while queued must never reach fetch");
+    releaseActive();
+    await active;
+  } finally {
+    global.fetch = originalFetch;
+  }
 }
 
 async function testQwenContextPreflight() {
@@ -657,6 +833,7 @@ function qwenSettings() {
     "qwen.temperature": 0.1,
     "qwen.maxTokens": 4096,
     "qwen.timeoutSeconds": 120,
+    "qwen.interRequestDelaySeconds": 0,
     "qwen.useApiKey": false,
     "qwen.generationTimeoutSeconds": 600,
     "qwen.generationMaxTokens": 12000,
@@ -672,10 +849,70 @@ function bankingQwenSettings() {
     "qwen.endpoint": `  ${TEST_BANKING_ENDPOINT}  `,
     "qwen.model": "ignored-wire-model",
     "qwen.temperature": 0.6,
-    "qwen.maxTokens": 163849,
+    "qwen.maxTokens": 4096,
     "qwen.useApiKey": true,
     "qwen.allowedHosts": [TEST_BANKING_HOST]
   };
+}
+
+function directQwen36Settings(interRequestDelaySeconds) {
+  return {
+    enabled: true,
+    bankingEnvironment: false,
+    endpoint: "http://127.0.0.1:8000/v1/chat/completions",
+    model: "Qwen/Qwen3.6-27B",
+    temperature: 0.6,
+    maxTokens: 512,
+    timeoutSeconds: 2,
+    interRequestDelaySeconds,
+    useApiKey: false
+  };
+}
+
+function directQwenClient(directSettings) {
+  return new QwenClient({
+    getSettings: () => ({ ...directSettings }),
+    async getApiKey() { return undefined; }
+  });
+}
+
+function successfulResponse(model, content, onJson) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    async json() {
+      onJson?.();
+      return {
+        model,
+        choices: [{ message: { content }, finish_reason: "stop" }]
+      };
+    }
+  };
+}
+
+function cancellationToken() {
+  let cancelled = false;
+  const listeners = new Set();
+  return {
+    token: {
+      get isCancellationRequested() { return cancelled; },
+      onCancellationRequested(listener) {
+        listeners.add(listener);
+        return { dispose() { listeners.delete(listener); } };
+      }
+    },
+    cancel() {
+      cancelled = true;
+      for (const listener of [...listeners]) {
+        listener();
+      }
+    }
+  };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 main().catch((error) => {

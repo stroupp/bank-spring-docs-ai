@@ -1,6 +1,6 @@
 import { DocumentationModelRequest } from "../ai/documentationModelClient";
 
-export const qwenIterativePageDraftPromptVersion = "qwen3-iterative-page-draft-v3";
+export const qwenIterativePageDraftPromptVersion = "qwen3.6-iterative-page-draft-v4";
 
 export const qwenPageDocumentSections = [
   "Sayfa Amacı",

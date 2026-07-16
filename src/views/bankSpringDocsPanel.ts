@@ -20,6 +20,7 @@ type QwenUiSettings = {
   temperature: number;
   maxTokens: number;
   timeoutSeconds: number;
+  interRequestDelaySeconds: number;
   useApiKey: boolean;
   semanticCacheEnabled?: boolean;
   semanticMaxFilesPerRun?: number;
@@ -33,6 +34,7 @@ type PanelMessage =
   | { type: "analyze"; repoUrl: string; branch: string }
   | { type: "command"; command: string }
   | { type: "saveAiProvider"; provider: AiProvider }
+  | { type: "saveCopilotQwenSemanticPrepass"; enabled: boolean }
   | { type: "saveQwenSettings"; settings: QwenUiSettings }
   | { type: "testQwenConnection"; settings: QwenUiSettings };
 
@@ -46,7 +48,10 @@ export class BankSpringDocsPanel {
     private readonly analyzeCommand: AnalyzeRepositoryUrlCommand
   ) {
     this.configurationListener = vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("bankSpringDocs.ai.provider")) {
+      if (
+        event.affectsConfiguration("bankSpringDocs.ai.provider")
+        || event.affectsConfiguration("bankSpringDocs.pageAnalysis.copilotQwenSemanticPrepassEnabled")
+      ) {
         this.postSettings();
       }
     });
@@ -130,6 +135,23 @@ export class BankSpringDocsPanel {
       return;
     }
 
+    if (message.type === "saveCopilotQwenSemanticPrepass") {
+      try {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update(
+          "pageAnalysis.copilotQwenSemanticPrepassEnabled",
+          Boolean(message.enabled),
+          vscode.ConfigurationTarget.Global
+        );
+        this.postSettings();
+      } catch (error) {
+        this.panel.webview.postMessage({
+          type: "error",
+          message: `Copilot Qwen semantik ön adım ayarı kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+      return;
+    }
+
     if (message.type === "saveQwenSettings") {
       try {
         await saveQwenLimitSettings(message.settings);
@@ -201,20 +223,23 @@ export class BankSpringDocsPanel {
       defaultBranch: getDefaultBranch(),
       workspaceFolder: config.get<string>("workspaceFolder", ""),
       ai: {
-        provider: normalizeAiProvider(config.get<string>("ai.provider", "copilot"))
+        provider: normalizeAiProvider(config.get<string>("ai.provider", "qwen"))
       },
       qwen: {
         ...new QwenSettingsService(this.context).getSettings(),
         qwenContextWindowTokens: config.get<number>("qwen.contextWindowTokens", 131072),
         qwenGenerationMaxTokens: config.get<number>("qwen.generationMaxTokens", 16384),
-        qwenAnalysisMaxOutputTokens: config.get<number>("pageAnalysis.qwenAnalysisMaxOutputTokens", 2048),
-        qwenReduceMaxOutputTokens: config.get<number>("pageAnalysis.qwenReduceMaxOutputTokens", 3072),
-        qwenSynthesisMaxOutputTokens: config.get<number>("pageAnalysis.qwenSynthesisMaxOutputTokens", 4096)
+        qwenAnalysisMaxOutputTokens: config.get<number>("pageAnalysis.qwenAnalysisMaxOutputTokens", 16384),
+        qwenReduceMaxOutputTokens: config.get<number>("pageAnalysis.qwenReduceMaxOutputTokens", 16384),
+        qwenSynthesisMaxOutputTokens: config.get<number>("pageAnalysis.qwenSynthesisMaxOutputTokens", 16384)
       },
       semantic: {
         cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
         maxFilesPerRun: config.get<number>("semantic.maxFilesPerRun", 50),
         maxCharactersPerFile: config.get<number>("semantic.maxCharactersPerFile", 20000)
+      },
+      pageAnalysis: {
+        copilotQwenSemanticPrepassEnabled: config.get<boolean>("pageAnalysis.copilotQwenSemanticPrepassEnabled", false)
       }
     });
   }
@@ -512,6 +537,11 @@ export class BankSpringDocsPanel {
         </select>
       </label>
       <div class="muted">Seçim, tüm AI destekli doküman üretim adımlarında kullanılır. Yerel analiz adımları değişmez.</div>
+      <label class="checkLabel">
+        <input id="copilotQwenSemanticPrepassEnabled" type="checkbox">
+        Gelişmiş: Copilot sayfa analizinde Qwen semantik ön adımını ve context'ini kullan
+      </label>
+      <div class="muted">Varsayılan olarak kapalıdır ve yalnız Copilot'u zenginleştirir. Qwen-only akışı semantic ön adımı ve eski semantic artifact'leri her zaman atlar.</div>
     </section>
 
     <section class="layout">
@@ -621,7 +651,7 @@ export class BankSpringDocsPanel {
           </label>
           <label>
             Model
-            <input id="qwenModel" type="text" placeholder="qwen3">
+            <input id="qwenModel" type="text" placeholder="Qwen/Qwen3.6-27B">
           </label>
           <label>
             Temperature
@@ -635,7 +665,12 @@ export class BankSpringDocsPanel {
             Semantik Timeout
             <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
           </label>
-          <div class="muted wide"><strong>Qwen-only context ve aşama limitleri</strong><br>Bu alanlar Copilot'u etkilemez. Banking için başlangıç önerisi: context 16384, tam üretim 4096, analysis 2048, reduce 3072, synthesis 4096.</div>
+        <label>
+          İstekler arası bekleme (saniye; 0 kapatır)
+          <input id="qwenInterRequestDelaySeconds" type="number" min="0" max="300" step="1">
+        </label>
+        <div class="muted wide"><strong>Qwen3.6 sampling</strong><br>Evidence/reduce çağrıları non-thinking; synthesis ve gerçek gap repair çağrıları precise-coding thinking profiliyle otomatik gönderilir.</div>
+        <div class="muted wide"><strong>Qwen-only context ve aşama limitleri</strong><br>Yarım Qwen3.6-27B profili context 131072 ve çıktı tavanları 16384 kullanır. Bunlar model kapasitesinin yarısıdır; endpoint deployment'ının gerçek <code>max_model_len</code> değeri daha düşükse context mutlaka o değere indirilmelidir. Bu alanlar Copilot'u etkilemez.</div>
           <label>
             Toplam context window (token)
             <input id="qwenContextWindowTokens" type="number" min="8192" step="1024">
@@ -697,6 +732,7 @@ export class BankSpringDocsPanel {
     const status = document.getElementById("status");
     const defaultBranch = document.getElementById("defaultBranch");
     const aiProviderSelect = document.getElementById("aiProviderSelect");
+    const copilotQwenSemanticPrepassEnabled = document.getElementById("copilotQwenSemanticPrepassEnabled");
     const qwenModal = document.getElementById("qwenModal");
     const openQwenSettingsButton = document.getElementById("openQwenSettingsButton");
     const closeQwenSettingsButton = document.getElementById("closeQwenSettingsButton");
@@ -708,6 +744,7 @@ export class BankSpringDocsPanel {
     const qwenTemperature = document.getElementById("qwenTemperature");
     const qwenMaxTokens = document.getElementById("qwenMaxTokens");
     const qwenTimeoutSeconds = document.getElementById("qwenTimeoutSeconds");
+    const qwenInterRequestDelaySeconds = document.getElementById("qwenInterRequestDelaySeconds");
     const qwenContextWindowTokens = document.getElementById("qwenContextWindowTokens");
     const qwenGenerationMaxTokens = document.getElementById("qwenGenerationMaxTokens");
     const qwenAnalysisMaxOutputTokens = document.getElementById("qwenAnalysisMaxOutputTokens");
@@ -738,7 +775,12 @@ export class BankSpringDocsPanel {
         qwenApiKey.value = "";
         if (applyDefaults) {
           qwenTemperature.value = "0.6";
-          qwenMaxTokens.value = "163849";
+          qwenMaxTokens.value = "16384";
+          qwenContextWindowTokens.value = "131072";
+          qwenGenerationMaxTokens.value = "16384";
+          qwenAnalysisMaxOutputTokens.value = "16384";
+          qwenReduceMaxOutputTokens.value = "16384";
+          qwenSynthesisMaxOutputTokens.value = "16384";
         }
       }
       qwenModel.disabled = enabled;
@@ -760,14 +802,15 @@ export class BankSpringDocsPanel {
         bankingEnvironment: qwenBankingEnvironment.checked,
         endpoint: qwenEndpoint.value,
         model: qwenModel.value,
-        temperature: Number(qwenTemperature.value || "0.1"),
-        maxTokens: Number(qwenMaxTokens.value || "4096"),
+        temperature: Number(qwenTemperature.value || "0.6"),
+        maxTokens: Number(qwenMaxTokens.value || "16384"),
         timeoutSeconds: Number(qwenTimeoutSeconds.value || "120"),
+        interRequestDelaySeconds: Number(qwenInterRequestDelaySeconds.value || "15"),
         qwenContextWindowTokens: Number(qwenContextWindowTokens.value || "131072"),
         qwenGenerationMaxTokens: Number(qwenGenerationMaxTokens.value || "16384"),
-        qwenAnalysisMaxOutputTokens: Number(qwenAnalysisMaxOutputTokens.value || "2048"),
-        qwenReduceMaxOutputTokens: Number(qwenReduceMaxOutputTokens.value || "3072"),
-        qwenSynthesisMaxOutputTokens: Number(qwenSynthesisMaxOutputTokens.value || "4096"),
+        qwenAnalysisMaxOutputTokens: Number(qwenAnalysisMaxOutputTokens.value || "16384"),
+        qwenReduceMaxOutputTokens: Number(qwenReduceMaxOutputTokens.value || "16384"),
+        qwenSynthesisMaxOutputTokens: Number(qwenSynthesisMaxOutputTokens.value || "16384"),
         useApiKey: qwenUseApiKey.checked,
         semanticCacheEnabled: semanticCacheEnabled.checked,
         semanticMaxFilesPerRun: Number(semanticMaxFilesPerRun.value || "50"),
@@ -784,6 +827,13 @@ export class BankSpringDocsPanel {
 
     aiProviderSelect.addEventListener("change", () => {
       vscode.postMessage({ type: "saveAiProvider", provider: aiProviderSelect.value });
+    });
+
+    copilotQwenSemanticPrepassEnabled.addEventListener("change", () => {
+      vscode.postMessage({
+        type: "saveCopilotQwenSemanticPrepass",
+        enabled: copilotQwenSemanticPrepassEnabled.checked
+      });
     });
 
     selectWorkspaceButton.addEventListener("click", () => {
@@ -842,14 +892,15 @@ export class BankSpringDocsPanel {
           qwenBankingEnvironment.checked = Boolean(message.qwen.bankingEnvironment);
           qwenEndpoint.value = message.qwen.endpoint || "";
           qwenModel.value = message.qwen.model || "";
-          qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
-          qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
+          qwenTemperature.value = String(message.qwen.temperature ?? 0.6);
+          qwenMaxTokens.value = String(message.qwen.maxTokens ?? 16384);
           qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
+          qwenInterRequestDelaySeconds.value = String(message.qwen.interRequestDelaySeconds ?? 15);
           qwenContextWindowTokens.value = String(message.qwen.qwenContextWindowTokens ?? 131072);
           qwenGenerationMaxTokens.value = String(message.qwen.qwenGenerationMaxTokens ?? 16384);
-          qwenAnalysisMaxOutputTokens.value = String(message.qwen.qwenAnalysisMaxOutputTokens ?? 2048);
-          qwenReduceMaxOutputTokens.value = String(message.qwen.qwenReduceMaxOutputTokens ?? 3072);
-          qwenSynthesisMaxOutputTokens.value = String(message.qwen.qwenSynthesisMaxOutputTokens ?? 4096);
+          qwenAnalysisMaxOutputTokens.value = String(message.qwen.qwenAnalysisMaxOutputTokens ?? 16384);
+          qwenReduceMaxOutputTokens.value = String(message.qwen.qwenReduceMaxOutputTokens ?? 16384);
+          qwenSynthesisMaxOutputTokens.value = String(message.qwen.qwenSynthesisMaxOutputTokens ?? 16384);
           qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
           applyBankingEnvironmentState(qwenBankingEnvironment.checked);
         }
@@ -857,6 +908,9 @@ export class BankSpringDocsPanel {
           semanticCacheEnabled.checked = Boolean(message.semantic.cacheEnabled);
           semanticMaxFilesPerRun.value = String(message.semantic.maxFilesPerRun ?? 50);
           semanticMaxCharactersPerFile.value = String(message.semantic.maxCharactersPerFile ?? 20000);
+        }
+        if (message.pageAnalysis) {
+          copilotQwenSemanticPrepassEnabled.checked = Boolean(message.pageAnalysis.copilotQwenSemanticPrepassEnabled);
         }
       }
       if (message.type === "busy") {
@@ -901,6 +955,7 @@ function normalizeAiProvider(value: unknown): AiProviderUiValue {
 
 async function saveQwenLimitSettings(settings: QwenUiSettings): Promise<void> {
   const config = vscode.workspace.getConfiguration("bankSpringDocs");
+  qwenLimitValue(settings.interRequestDelaySeconds, "Qwen istekler arası bekleme", 0, 300);
   const contextWindow = qwenLimitValue(settings.qwenContextWindowTokens, "Qwen context window", 8192);
   const generationCap = qwenLimitValue(settings.qwenGenerationMaxTokens, "Qwen generation cap", 256);
   const analysisOutput = qwenLimitValue(settings.qwenAnalysisMaxOutputTokens, "Qwen analysis output", 256, 65536);

@@ -403,12 +403,12 @@
             "Doküman üretim adımlarında GitHub Copilot Language Model API kullanılır.",
             "Doküman üretim adımlarında yapılandırılmış yerel veya kurum içi Qwen endpoint'i kullanılır."
           ],
-          "default": "copilot",
+          "default": "qwen",
           "description": "Tüm AI destekli doküman üretim adımlarında kullanılacak sağlayıcı. Yerel statik analiz adımları bu ayardan etkilenmez."
         },
         "bankSpringDocs.qwen.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Qwen semantik analizini ve Qwen seçildiğinde AI doküman üretimini etkinleştirir."
         },
         "bankSpringDocs.qwen.bankingEnvironment": {
@@ -438,28 +438,35 @@
         },
         "bankSpringDocs.qwen.model": {
           "type": "string",
-          "default": "qwen3",
+          "default": "Qwen/Qwen3.6-27B",
           "scope": "machine",
           "description": "Yerel Qwen model adı."
         },
         "bankSpringDocs.qwen.temperature": {
           "type": "number",
-          "default": 0.1,
+          "default": 0.6,
           "minimum": 0,
           "maximum": 2,
-          "description": "Qwen isteklerinde kullanılacak temperature değeri."
+          "description": "Genel/legacy Qwen isteklerinin temperature değeri. Qwen3.6 sayfa pipeline'ı evidence/reduce için resmi non-thinking, synthesis/repair için precise-coding thinking profilini otomatik uygular."
         },
         "bankSpringDocs.qwen.maxTokens": {
           "type": "number",
-          "default": 4096,
+          "default": 16384,
           "minimum": 256,
-          "description": "Genel/legacy Qwen yanıtları için maksimum token değeri. Kısa bağlantı testi sabit 64 token, Qwen-only sayfa analizi ise aşama bazlı bütçeler kullanır."
+          "description": "Genel/legacy Qwen yanıtları için maksimum token değeri. Qwen3.6'nın çoğu sorgu için önerdiği 32768 çıktı tavanının yarısı varsayılandır. Kısa bağlantı testi sabit 64 token, Qwen-only sayfa analizi ise aşama bazlı bütçeler kullanır."
         },
         "bankSpringDocs.qwen.timeoutSeconds": {
           "type": "number",
           "default": 120,
           "minimum": 5,
           "description": "Qwen HTTP isteği zaman aşımı süresi."
+        },
+        "bankSpringDocs.qwen.interRequestDelaySeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 300,
+          "description": "Ardışık Qwen model istekleri arasındaki bekleme süresi (saniye). 0 beklemeyi kapatır; kurum içi gateway yükünü ve 429/504 riskini azaltmak için artırılabilir."
         },
         "bankSpringDocs.qwen.generationTimeoutSeconds": {
           "type": "number",
@@ -471,13 +478,13 @@
           "type": "number",
           "default": 16384,
           "minimum": 256,
-          "description": "Qwen doküman üretim yanıtları için global üst token sınırı. Qwen-only sayfa aşaması bütçeleri bu değeri aşamaz."
+          "description": "Qwen doküman üretim yanıtları için global üst token sınırı. Qwen3.6 önerilen 32768 çıktı tavanının yarısıdır; Qwen-only sayfa aşaması bütçeleri bu değeri aşamaz."
         },
         "bankSpringDocs.qwen.contextWindowTokens": {
           "type": "number",
           "default": 131072,
           "minimum": 8192,
-          "description": "Qwen sunucusunda kullanılabilir olduğu varsayılan toplam context penceresi. Prompt bütçesi hesaplanırken kullanılır."
+          "description": "Qwen sunucusunda gerçekten kullanılabilir toplam context penceresi. Qwen3.6 native 262144 token destekler; ancak burada model kartı değil deployment'ın gerçek max_model_len değeri kullanılmalıdır. Prompt bütçesi bu değerle hesaplanır."
         },
         "bankSpringDocs.qwen.useApiKey": {
           "type": "boolean",
@@ -546,8 +553,13 @@
         },
         "bankSpringDocs.pageAnalysis.qwenOnly": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Etkinse side paneldeki tam sayfa analizi AI adımlarını yalnızca yapılandırılmış Qwen modeliyle çalıştırır. Global AI sağlayıcısını değiştirmez."
+        },
+        "bankSpringDocs.pageAnalysis.copilotQwenSemanticPrepassEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Gelişmiş seçenek: yalnız Copilot sayfa analizi için Qwen semantik ön adımını ve semantic context'i etkinleştirir. Varsayılan olarak kapalıdır. Qwen-only akışı bu ayardan bağımsız olarak semantik ön adımı ve semantic artifact'leri her zaman atlar."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters": {
           "type": "number",
@@ -561,60 +573,60 @@
           "default": 720000,
           "minimum": 30000,
           "maximum": 5000000,
-          "description": "Qwen3-only iteratif sayfa analizinde UI, BFF ve BE arasinda adil paylastirilan toplam ham kaynak karakter butcesi."
+          "description": "Qwen-only iteratif sayfa analizinde UI, BFF ve BE arasinda adil paylastirilan ham kaynak karakter tavanidir. Deterministik artifact'ler korunurken varsayilan istek butcesine sigmak icin etkin deger provider-derived chunk boyutunda yaklasik 12 ham kaynak penceresiyle de sinirlanir."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxModelCalls": {
           "type": "number",
-          "default": 96,
+          "default": 32,
           "minimum": 12,
           "maximum": 200,
-          "description": "Bir Qwen3-only tam sayfa calistirmasindaki toplam yeni Qwen istek denemesi siniri. Semantik, chunk, reduce, bolum sentezi, retry ve gap repair dahildir; resume edilen tamamlanmis adimlar dahil degildir. Opsiyonel semantik asama zorunlu dokuman asamalari icin kapasite birakir."
+          "description": "Bir Qwen-only tam sayfa calistirmasindaki evidence chunk, reduce, bolum sentezi, retry ve gercek gap repair dahil toplam yeni model istek denemesi icin sert ust sinir. Resume edilen tamamlanmis adimlar dahil degildir; semantic on adim Qwen-only akista calismaz."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxReduceLevels": {
           "type": "number",
-          "default": 5,
+          "default": 3,
           "minimum": 1,
           "maximum": 10,
           "description": "Chunk analizleri final sentez contextine sigmazsa kullanilabilecek hiyerarsik Qwen3 ledger birlestirme seviyesi."
         },
         "bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens": {
           "type": "number",
-          "default": 2048,
+          "default": 16384,
           "minimum": 256,
           "maximum": 65536,
           "description": "Qwen3-only semantik ve evidence chunk analizlerinin istek basina maksimum cikti token butcesi."
         },
         "bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens": {
           "type": "number",
-          "default": 3072,
+          "default": 16384,
           "minimum": 256,
           "maximum": 65536,
           "description": "Qwen3-only hiyerarsik ledger reduce isteklerinin maksimum cikti token butcesi."
         },
         "bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens": {
           "type": "number",
-          "default": 4096,
+          "default": 16384,
           "minimum": 256,
           "maximum": 65536,
           "description": "Qwen3-only bolum grubu final sentez isteklerinin maksimum cikti token butcesi."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxGatewayRetries": {
           "type": "number",
-          "default": 2,
+          "default": 1,
           "minimum": 0,
           "maximum": 5,
           "description": "429/502/503/504 ve gecici ag timeout hatalarinda adaptif bolmeden once yapilacak kontrollu retry sayisi."
         },
         "bankSpringDocs.pageAnalysis.qwenRetryBaseDelayMs": {
           "type": "number",
-          "default": 750,
+          "default": 1000,
           "minimum": 100,
           "maximum": 30000,
           "description": "Gecici Qwen gateway hatalarindaki exponential backoff baslangic gecikmesi (milisaniye)."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxAdaptiveSplitDepth": {
           "type": "number",
-          "default": 3,
+          "default": 2,
           "minimum": 0,
           "maximum": 8,
           "description": "Timeout/504 veya 413/context/output-length gibi boyuta bagli hatalarda yalnizca basarisiz evidence chunk'i icin kullanilacak maksimum adaptif bolme derinligi. Kalici 429/502/503 hatalari parcacik sayisini artirmaz."
@@ -635,7 +647,7 @@
         },
         "bankSpringDocs.pageAnalysis.qwenFinalSectionGroupSize": {
           "type": "number",
-          "default": 4,
+          "default": 6,
           "minimum": 1,
           "maximum": 17,
           "description": "Tek bir Qwen3 final sentez isteginde hedeflenecek kanonik dokuman bolumu sayisi. Boyut veya output-length hatasinda grup otomatik olarak daha kucuk isteklere ayrilir."

@@ -40,7 +40,10 @@ global.fetch = async () => {
 };
 
 const { buildRepairContext } = require("../dist/pageanalysis/gapRepair/pageGapEvidenceSelector");
-const { buildPageGapRepairPlan } = require("../dist/pageanalysis/gapRepair/pageGapRepairPlanner");
+const {
+  buildPageGapRepairPlan,
+  selectGenuinelyWeakQwenGaps
+} = require("../dist/pageanalysis/gapRepair/pageGapRepairPlanner");
 const { PageSectionRegenerator } = require("../dist/pageanalysis/gapRepair/pageSectionRegenerator");
 const { FinalPageDocumentBuilder } = require("../dist/pageanalysis/finalPageDocumentBuilder");
 
@@ -104,7 +107,7 @@ async function testGroupedQwenRepair(multiRepoRoot) {
     id: `group-gap-${index + 1}`,
     pageName: "GroupedRepair",
     section,
-    gapType: "not-visible",
+    gapType: "missing-be-match",
     description: `${section} needs bounded repair.`,
     suggestedEvidence: ["page-evidence-pack.md"],
     severity: "medium"
@@ -145,21 +148,21 @@ async function testGroupedQwenRepair(multiRepoRoot) {
     delete settings["qwen.generationMaxTokens"];
   }
 
-  assert.strictEqual(calls.length, 5, "quality-sensitive Qwen repair must isolate every target section");
-  assert.ok(calls.every((call) => call.targets.length === 1));
+  assert.strictEqual(calls.length, 2, "Qwen repair must batch actionable weak sections to reduce request count");
+  assert.deepStrictEqual(calls.map((call) => call.targets.length), [3, 1]);
+  assert.ok(calls.flatMap((call) => call.targets).every((section) => section !== "Belirsizlikler"));
   assert.ok(calls.every((call) => call.prompt.combinedText.length <= 9000));
   assert.deepStrictEqual(
     calls.map((call) => call.prompt.maxOutputTokens),
-    [4000, 4000, 4000, 4000, 4000],
-    "each isolated section must receive the complete configured synthesis ceiling"
+    [4000, 4000],
+    "each grouped request must receive the configured synthesis ceiling"
   );
   const repaired = await fs.readFile(path.join(pageRoot, "repaired-sections.md"), "utf8");
   const expectedHeadings = [
     "BFF Endpoint E\u015fle\u015fmesi",
     "Backend Endpoint E\u015fle\u015fmesi",
     "Validasyon ve Hata Y\u00f6netimi",
-    "G\u00fcvenlik G\u00f6zlemleri",
-    "Belirsizlikler"
+    "G\u00fcvenlik G\u00f6zlemleri"
   ];
   const actualHeadings = [...repaired.matchAll(/^##\s+(.+)$/gm)].map((match) => match[1]);
   assert.deepStrictEqual(actualHeadings, expectedHeadings, "group outputs must be assembled in canonical page-section order");
@@ -169,13 +172,13 @@ async function testGroupedQwenRepair(multiRepoRoot) {
     .trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const audit = audits.at(-1);
   assert.strictEqual(audit.status, "success");
-  assert.strictEqual(audit.groupCount, 5);
-  assert.strictEqual(audit.completedGroupCount, 5);
-  assert.strictEqual(audit.requestCount, 5);
+  assert.strictEqual(audit.groupCount, 2);
+  assert.strictEqual(audit.completedGroupCount, 2);
+  assert.strictEqual(audit.requestCount, 2);
   assert.strictEqual(audit.maxOutputTokens, 4000);
-  assert.deepStrictEqual(audit.requestOutputTokenBudgets, [4000, 4000, 4000, 4000, 4000]);
-  assert.strictEqual(audit.estimatedTotalTokens, 190);
-  assert.strictEqual(audit.canonicalOutputPaths.length, 5);
+  assert.deepStrictEqual(audit.requestOutputTokenBudgets, [4000, 4000]);
+  assert.strictEqual(audit.estimatedTotalTokens, 76);
+  assert.strictEqual(audit.canonicalOutputPaths.length, 2);
   for (const relativePath of [...audit.rawOutputPaths, ...audit.canonicalOutputPaths]) {
     await fs.access(path.join(multiRepoRoot, relativePath));
   }
@@ -187,7 +190,7 @@ async function testGroupedQwenCancellation(multiRepoRoot) {
     id: `cancel-gap-${index + 1}`,
     pageName: "CancelledGroupedRepair",
     section,
-    gapType: "not-visible",
+    gapType: "missing-be-match",
     description: `${section} needs repair.`,
     suggestedEvidence: ["page-evidence-pack.md"],
     severity: "medium"
@@ -202,7 +205,7 @@ async function testGroupedQwenCancellation(multiRepoRoot) {
     provider: "qwen",
     async send(prompt) {
       calls += 1;
-      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+(.+)\n<\/TARGET_SECTIONS>/)?.[1] ?? "Belirsizlikler";
+      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+([^\n]+)/)?.[1] ?? "Belirsizlikler";
       cancellationToken.isCancellationRequested = true;
       return {
         text: `## ${target}\nUseful completed output before cancellation.`,
@@ -240,7 +243,7 @@ async function testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot) {
     id: `missing-heading-gap-${index + 1}`,
     pageName: "MissingHeading",
     section,
-    gapType: "not-visible",
+    gapType: "missing-be-match",
     description: `${section} needs repair.`,
     suggestedEvidence: ["page-evidence-pack.md"],
     severity: "medium"
@@ -252,10 +255,8 @@ async function testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot) {
     provider: "qwen",
     async send(prompt) {
       calls += 1;
-      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+(.+)\n<\/TARGET_SECTIONS>/)?.[1];
-      const text = calls === 1
-        ? `## ${target}\nRepaired first section src/main/java/example/GroupedRepair.java.`
-        : "## Untargeted Model Heading\nThis must not replace the original backend section.";
+      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+([^\n]+)/)?.[1];
+      const text = `## ${target}\nRepaired first section src/main/java/example/GroupedRepair.java.`;
       return {
         text,
         usage: usage(),
@@ -270,7 +271,7 @@ async function testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot) {
     maxInputCharacters: 9000,
     maxOutputTokens: 4000
   }).repair(multiRepoRoot, pageRoot, token);
-  assert.strictEqual(calls, 2);
+  assert.strictEqual(calls, 1);
   assert.deepStrictEqual(result.missingSections, ["Backend Endpoint Eşleşmesi"]);
   const repaired = await fs.readFile(result.repairedSectionsPath, "utf8");
   assert.match(repaired, /^## BFF Endpoint Eşleşmesi$/m);
@@ -288,6 +289,25 @@ async function testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot) {
 }
 
 async function main() {
+  assert.deepStrictEqual(
+    selectGenuinelyWeakQwenGaps([
+      { id: "empty", pageName: "P", section: "BFF Endpoint Eslesmesi", gapType: "empty-section", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "high" },
+      { id: "source", pageName: "P", section: "Form Alanlari ve Parametreler", gapType: "missing-source-reference", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "medium" },
+      { id: "honest", pageName: "P", section: "Backend Endpoint Eslesmesi", gapType: "not-visible", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "high" },
+      { id: "uncertainty", pageName: "P", section: "Belirsizlikler", gapType: "empty-section", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "high" },
+      { id: "low", pageName: "P", section: "Validasyon ve Hata Yonetimi", gapType: "missing-validation", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "low" }
+    ]).map((gap) => gap.id),
+    ["empty", "source"],
+    "Qwen auto-repair must keep only actionable weak sections and preserve honest uncertainty"
+  );
+  assert.deepStrictEqual(
+    selectGenuinelyWeakQwenGaps([
+      { id: "grounded", pageName: "P", section: "BFF Endpoint Eslesmesi", gapType: "empty-section", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "high" },
+      { id: "unsupported", pageName: "P", section: "Backend Endpoint Eslesmesi", gapType: "empty-section", description: "", suggestedEvidence: ["page-evidence-pack.md"], severity: "high" }
+    ], ["BFF Endpoint Eşleşmesi"]).map((gap) => gap.id),
+    ["grounded"],
+    "Qwen auto-repair must not spend a call on a section with no grounded ledger evidence"
+  );
   const multiRepoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bank-spring-qwen-gap-"));
   const pageRoot = path.join(multiRepoRoot, "page-analysis", "pages", "complex-page");
   await fs.mkdir(pageRoot, { recursive: true });
@@ -296,7 +316,7 @@ async function main() {
     id: "gap-backend",
     pageName: "ComplexPage",
     section: "Backend Endpoint Eslesmesi",
-    gapType: "not-visible",
+    gapType: "missing-be-match",
     description: "Backend endpoint evidence is incomplete.",
     suggestedEvidence: ["page-evidence-pack.md", "be/service-flow-index.jsonl"],
     severity: "high"
@@ -325,36 +345,49 @@ async function main() {
 
   await fs.writeFile(path.join(pageRoot, "page-context-pack.md"), pageContext, "utf8");
   await fs.writeFile(path.join(pageRoot, "page-evidence-pack.md"), pageEvidence, "utf8");
+  await fs.writeFile(path.join(pageRoot, "page-flow.json"), JSON.stringify({
+    selectedPage: { pageName: "ComplexPage", route: "/complex" },
+    bffEndpoints: [{ endpoint: "POST /api/complex", file: "src/backend/ComplexController.java" }]
+  }), "utf8");
   await fs.writeFile(path.join(pageRoot, "qwen-page-semantics.json"), pageSemantics, "utf8");
   await fs.writeFile(path.join(pageRoot, "qwen-interaction-semantics.jsonl"), interactionSemantics, "utf8");
   await fs.writeFile(path.join(pageRoot, "copilot-draft.md"), draft, "utf8");
   await fs.writeFile(path.join(pageRoot, "detected-gaps.json"), JSON.stringify(gaps), "utf8");
 
-  const legacyFull = [
-    ["Detected Gaps", JSON.stringify(plan.gaps, null, 2)],
-    ["Target Sections", plan.targetSections.map((section) => `- ${section}`).join("\n")],
-    ["Suggested Evidence", plan.evidenceFiles.map((file) => `- ${file}`).join("\n")],
-    ["Page Context Pack", pageContext],
-    ["Page Evidence Pack", pageEvidence],
-    ["Qwen Page Semantics", pageSemantics],
-    ["Qwen Interaction Semantics", interactionSemantics],
-    ["Copilot Draft", draft]
-  ]
-    .filter(([, content]) => Boolean(content))
-    .map(([title, content]) => `## ${title}\n${content}`)
-    .join("\n\n---\n\n");
   settings["copilot.maxContextCharacters"] = 100000;
-  assert.ok(
-    (await buildRepairContext(pageRoot, plan)).includes("## Copilot Draft"),
-    "the optionless context must preserve the established Copilot Draft heading"
-  );
-  settings["copilot.maxContextCharacters"] = 900;
-  const expectedLegacy = `${legacyFull.slice(0, settings["copilot.maxContextCharacters"])}\n[REPAIR_CONTEXT_TRUNCATED_FOR_TOKEN_LIMIT]`;
-  assert.strictEqual(
-    await buildRepairContext(pageRoot, plan),
-    expectedLegacy,
-    "the optionless path must retain the exact legacy ordering and head truncation"
-  );
+  const fullCopilotContext = await buildRepairContext(pageRoot, plan);
+  assert.ok(fullCopilotContext.includes("## Copilot Draft"));
+  assert.ok(fullCopilotContext.includes("## Qwen Page Semantics"));
+  assert.ok(fullCopilotContext.includes("## Qwen Interaction Semantics"));
+
+  settings["copilot.maxContextCharacters"] = 6000;
+  const boundedCopilotContext = await buildRepairContext(pageRoot, plan);
+  assert.ok(boundedCopilotContext.length <= 6000, "Copilot repair context must obey its exact configured ceiling");
+  assert.ok(boundedCopilotContext.includes("TARGET_DRAFT_SENTINEL"), "target draft evidence must survive Copilot context reduction");
+  assert.ok(!boundedCopilotContext.includes("DRAFT_IRRELEVANT_SENTINEL"), "unrelated draft sections must not consume Copilot repair budget");
+  assert.ok(boundedCopilotContext.includes("EVIDENCE_RELEVANT_SENTINEL"), "relevant evidence must receive a protected Copilot budget share");
+  assert.ok(boundedCopilotContext.indexOf("## Copilot Draft") < boundedCopilotContext.indexOf("## Page Evidence Pack"));
+  assert.ok(boundedCopilotContext.indexOf("## Page Evidence Pack") < boundedCopilotContext.indexOf("## Page Context Pack"));
+
+  settings["pageAnalysis.copilotQwenSemanticPrepassEnabled"] = false;
+  const semanticFreeCopilotContext = await buildRepairContext(pageRoot, plan, {
+    mode: "configured-provider",
+    includeQwenSemantics: false,
+    maxCharacters: 6000
+  });
+  assert.ok(semanticFreeCopilotContext.includes("TARGET_DRAFT_SENTINEL"));
+  assert.ok(semanticFreeCopilotContext.includes("EVIDENCE_RELEVANT_SENTINEL"));
+  assert.ok(!semanticFreeCopilotContext.includes("Qwen Page Semantics"));
+  assert.ok(!semanticFreeCopilotContext.includes("Qwen Interaction Semantics"));
+  assert.ok(!semanticFreeCopilotContext.includes("SEMANTICS_SENTINEL"));
+  assert.ok(!semanticFreeCopilotContext.includes("INTERACTION_SENTINEL"));
+
+  const configuredQwenContext = await buildRepairContext(pageRoot, plan, {
+    mode: "configured-provider",
+    includeQwenSemantics: true,
+    maxCharacters: 6000
+  });
+  assert.ok(configuredQwenContext.includes("SEMANTICS_SENTINEL"), "the Copilot-only toggle must not leak into configured-Qwen repair context");
 
   const qwenContext = await buildRepairContext(pageRoot, plan, {
     mode: "qwen3-target-first",
@@ -364,8 +397,26 @@ async function main() {
   assert.ok(qwenContext.includes("TARGET_DRAFT_SENTINEL"), "target draft evidence must survive a large unrelated draft");
   assert.ok(!qwenContext.includes("DRAFT_IRRELEVANT_SENTINEL"), "unrelated draft sections should not consume target repair budget");
   assert.ok(qwenContext.includes("EVIDENCE_RELEVANT_SENTINEL"), "relevant page evidence must receive a protected budget share");
+  assert.ok(!qwenContext.includes("SEMANTICS_SENTINEL"), "Qwen3 target-first repair must exclude existing page semantics");
+  assert.ok(!qwenContext.includes("INTERACTION_SENTINEL"), "Qwen3 target-first repair must exclude existing interaction semantics");
+  assert.ok(!qwenContext.includes("Qwen Page Semantics"));
+  assert.ok(!qwenContext.includes("Qwen Interaction Semantics"));
   assert.ok(qwenContext.indexOf("Current AI Draft - Target Sections") < qwenContext.indexOf("Relevant Page Evidence"));
-  assert.ok(qwenContext.indexOf("Relevant Page Evidence") < qwenContext.indexOf("Page Context Pack"));
+  assert.ok(qwenContext.indexOf("Relevant Page Evidence") < qwenContext.indexOf("Page Flow"));
+  assert.ok(qwenContext.indexOf("Page Flow") < qwenContext.indexOf("Page Context Pack"));
+
+  let configuredQwenLegacyPrompt;
+  await new PageSectionRegenerator({
+    provider: "qwen",
+    async send(prompt) {
+      configuredQwenLegacyPrompt = prompt;
+      return { text: "## Configured Qwen Legacy Repair\nok", usage: usage(), model: model("configured-qwen"), provider: "qwen" };
+    }
+  }).repair(multiRepoRoot, pageRoot, token);
+  assert.ok(!configuredQwenLegacyPrompt.combinedText.includes("SEMANTICS_SENTINEL"));
+  assert.ok(!configuredQwenLegacyPrompt.combinedText.includes("INTERACTION_SENTINEL"));
+
+  settings["pageAnalysis.copilotQwenSemanticPrepassEnabled"] = true;
 
   const legacyRaw = "```markdown\n## Legacy Raw\npassword=legacy-secret\n```";
   let legacyPrompt;

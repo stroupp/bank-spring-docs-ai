@@ -15,6 +15,7 @@ import { atomicWriteFile, atomicWriteJson } from "../storage/atomicFile";
 import { sha256 } from "../utils/hash";
 import { ensureWithin, safeName } from "../utils/pathUtils";
 import { buildPageArtifactMetadata, pageMetadataComment } from "./pageArtifactMetadata";
+import { PageFlowDiagramBuilder } from "./pageFlowDiagramBuilder";
 import {
   QwenPageDraftContextChunk,
   QwenPageDraftContextChunker
@@ -104,6 +105,8 @@ export interface QwenIterativePageDraftResult {
   includedSourceFiles: string[];
   warnings: string[];
   modelIds: string[];
+  /** Canonical sections with at least one grounded finding and source reference. */
+  evidenceBackedSections: string[];
 }
 
 type RunState = "running" | "completed" | "failed" | "cancelled";
@@ -213,17 +216,17 @@ const defaults = {
   maxChunkCharacters: 42000,
   maxSourceFileCharacters: 180000,
   maxTotalSourceCharacters: 720000,
-  maxModelCalls: 96,
-  maxReduceLevels: 5,
-  analysisMaxOutputTokens: 2048,
-  reduceMaxOutputTokens: 3072,
-  synthesisMaxOutputTokens: 4096,
-  maxGatewayRetries: 2,
-  retryBaseDelayMs: 750,
-  maxAdaptiveSplitDepth: 3,
+  maxModelCalls: 32,
+  maxReduceLevels: 3,
+  analysisMaxOutputTokens: 16384,
+  reduceMaxOutputTokens: 16384,
+  synthesisMaxOutputTokens: 16384,
+  maxGatewayRetries: 1,
+  retryBaseDelayMs: 1000,
+  maxAdaptiveSplitDepth: 2,
   minAdaptiveSplitCharacters: 4000,
   adaptiveSplitOverlapCharacters: 600,
-  finalSectionGroupSize: 4,
+  finalSectionGroupSize: 6,
   modelIdentity: "qwen3",
   expectedModelMarker: "qwen3"
 };
@@ -283,16 +286,11 @@ export class QwenIterativePageDraftGenerator {
     }
 
     const optionsFingerprint = sha256(JSON.stringify(serializableOptions(this.options)));
-    // Semantic artifacts are derived, model-produced inputs. Keep their own
-    // chunk/step hashes, but do not let a regenerated semantic file relocate an
-    // otherwise resumable run. Core page artifacts and selected source files
-    // remain part of the run identity.
-    const resumeIdentityChunks = context.chunks.filter((chunk) => chunk.kind !== "semantic-artifact");
     const inputHash = sha256(JSON.stringify({
       promptVersion: qwenIterativePageDraftPromptVersion,
       optionsFingerprint,
       modelIdentity: this.options.modelIdentity,
-      chunks: resumeIdentityChunks.map((chunk) => ({ id: chunk.id, hash: chunk.contentHash }))
+      chunks: context.chunks.map((chunk) => ({ id: chunk.id, hash: chunk.contentHash }))
     }));
     const statusRoot = path.join(input.pageRoot, ".qwen3-page-draft");
     const runRoot = path.join(statusRoot, "runs", inputHash.slice(0, 24));
@@ -363,6 +361,7 @@ export class QwenIterativePageDraftGenerator {
         onProgress: input.onProgress
       });
       reduceLevels = reduced.levels;
+      const evidenceBackedSections = groundedEvidenceSections(reduced.ledgers);
 
       const page = asRecord(context.pageFlow.selectedPage);
       const pageName = maskSecretsWithStats(String(page.pageName ?? path.basename(input.pageRoot))).text;
@@ -437,59 +436,23 @@ export class QwenIterativePageDraftGenerator {
           const missingNames = selected.missingSections.join(", ");
           manifest.warnings = uniqueStrings([
             ...manifest.warnings,
-            `Qwen3 final synthesis ${groupId} yaniti beklenen bolumleri atladı; hedefli ikinci istek calistirildi: ${missingNames}.`
+            `Qwen3 final synthesis ${groupId} yaniti beklenen bolumleri atladi; tekrarli sentez cagrisi yerine grounded grouped gap repair'e birakildi: ${missingNames}.`
           ]);
           await this.persistManifest(statusRoot, runRoot, manifest);
-          const repairLedgerText = serializeLedgerForSections(reduced.ledgers, selected.missingSections);
-          const repairPrompt: DocumentationModelRequest = {
-            ...buildQwenPageFinalSynthesisPrompt({
-              pageName,
-              route,
-              ledger: repairLedgerText,
-              sections: selected.missingSections,
-              groupId: `${groupId}-missing-sections`
-            }),
-            maxOutputTokens: sectionGroupOutputTokens(
-              selected.missingSections.length,
-              this.options.synthesisMaxOutputTokens
-            )
-          };
-          assertPromptBudget(repairPrompt, this.options.maxInputCharacters, `final synthesis ${groupId} missing sections`);
-          const repairStep = await this.runMarkdownStepWithRetry({
-            runRoot,
-            statusRoot,
-            manifest,
-            counters,
-            stepId: `final-synthesis-${groupId}-missing-${sha256(repairLedgerText).slice(0, 16)}`,
-            kind: "synthesis",
-            contextText: repairLedgerText,
-            prompt: repairPrompt,
-            token: input.token
-          });
-          const repaired = selectCanonicalSections(repairStep.value, selected.missingSections);
-          if (repaired.markdown) {
-            finalParts.push(repaired.markdown);
-          }
-          if (repaired.missingSections.length) {
-            manifest.warnings = uniqueStrings([
-              ...manifest.warnings,
-              `Qwen3 final synthesis ${groupId} hedefli ikinci istekte de bolum atladı: ${repaired.missingSections.join(", ")}. Placeholder korunarak gap repair'e birakildi.`
-            ]);
-            await this.persistManifest(statusRoot, runRoot, manifest);
-          }
         }
       }
 
-      const canonicalMarkdown = appendCoverageWarnings(
+      const canonicalSections = appendCoverageWarnings(
         ensureCanonicalSections(finalParts.join("\n\n")),
         manifest.warnings
       );
+      const diagrams = new PageFlowDiagramBuilder().build(context.pageFlow);
+      await atomicWriteFile(path.join(input.pageRoot, "page-flow-uml.svg"), diagrams.svg);
+      const canonicalMarkdown = [canonicalSections.trim(), diagrams.markdown].join("\n\n");
       const metadata = await buildPageArtifactMetadata(input.pageRoot, [
         "page-flow.json",
         "page-context-pack.md",
-        "page-evidence-pack.md",
-        "qwen-page-semantics.json",
-        "qwen-interaction-semantics.jsonl"
+        "page-evidence-pack.md"
       ]);
       const generationMetadata = {
         provider: "qwen",
@@ -499,7 +462,9 @@ export class QwenIterativePageDraftGenerator {
         runId: manifest.runId,
         inputHash,
         chunks: context.chunks.length,
-        reduceLevels
+        reduceLevels,
+        deterministicDiagramFlows: diagrams.flowCount,
+        qwenSemanticArtifactsUsed: false
       };
       const published = [
         pageMetadataComment(metadata),
@@ -557,7 +522,8 @@ export class QwenIterativePageDraftGenerator {
         estimatedTotalTokens: manifest.estimatedTotalTokens,
         includedSourceFiles: context.includedSourceFiles,
         warnings: manifest.warnings,
-        modelIds: [...manifest.modelIds]
+        modelIds: [...manifest.modelIds],
+        evidenceBackedSections
       };
     } catch (error) {
       const cancelled = input.token.isCancellationRequested || /cancel|iptal/i.test(error instanceof Error ? error.message : String(error));
@@ -1382,6 +1348,19 @@ function sectionGroups(size: number): Array<Array<(typeof qwenPageDocumentSectio
     groups.push(qwenPageDocumentSections.slice(index, index + size) as Array<(typeof qwenPageDocumentSections)[number]>);
   }
   return groups;
+}
+
+function groundedEvidenceSections(ledgers: QwenPageFactLedger[]): string[] {
+  const grounded = new Set<string>();
+  for (const ledger of ledgers) {
+    for (const section of ledger.sections) {
+      const heading = canonicalHeading(section.heading);
+      if (heading && section.findings.length > 0 && section.sourceReferences.length > 0) {
+        grounded.add(heading);
+      }
+    }
+  }
+  return qwenPageDocumentSections.filter((heading) => grounded.has(heading));
 }
 
 function ledgersFitFinalSectionGroups(

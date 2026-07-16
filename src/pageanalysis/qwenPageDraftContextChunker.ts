@@ -10,7 +10,6 @@ export type QwenPageDraftChunkKind =
   | "page-flow"
   | "context-pack"
   | "evidence-pack"
-  | "semantic-artifact"
   | "source-file";
 
 export interface QwenPageDraftContextChunk {
@@ -47,9 +46,7 @@ export interface QwenPageDraftContextBuildResult {
 const artifactSpecs: Array<{ fileName: string; kind: QwenPageDraftChunkKind; format: "json" | "jsonl" | "markdown" }> = [
   { fileName: "page-flow.json", kind: "page-flow", format: "json" },
   { fileName: "page-context-pack.md", kind: "context-pack", format: "markdown" },
-  { fileName: "page-evidence-pack.md", kind: "evidence-pack", format: "markdown" },
-  { fileName: "qwen-page-semantics.json", kind: "semantic-artifact", format: "json" },
-  { fileName: "qwen-interaction-semantics.jsonl", kind: "semantic-artifact", format: "jsonl" }
+  { fileName: "page-evidence-pack.md", kind: "evidence-pack", format: "markdown" }
 ];
 
 export class QwenPageDraftContextChunker {
@@ -69,9 +66,7 @@ export class QwenPageDraftContextChunker {
       const filePath = path.join(pageRoot, spec.fileName);
       const content = await readOptional(filePath);
       if (!content) {
-        if (spec.fileName === "page-flow.json" || spec.fileName === "page-context-pack.md") {
-          warnings.push(`Required page artifact is missing or empty: ${spec.fileName}.`);
-        }
+        warnings.push(`Required page artifact is missing or empty: ${spec.fileName}.`);
         continue;
       }
       let canonicalContent: string;
@@ -87,7 +82,7 @@ export class QwenPageDraftContextChunker {
       if (spec.fileName === "page-flow.json") {
         pageFlow = parseJsonRecord(canonicalContent, filePath);
       }
-      const blocks = semanticArtifactBlocks(spec.fileName, canonicalContent, spec.format);
+      const blocks = artifactBlocks(spec.fileName, canonicalContent, spec.format);
       chunks.push(...this.toChunks(spec.kind, spec.fileName, blocks));
     }
 
@@ -300,7 +295,7 @@ function safeWarning(value: string): string {
     : `${safe.slice(0, maxCharacters - 35)} [WARNING_TEXT_TRUNCATED]`;
 }
 
-function semanticArtifactBlocks(fileName: string, content: string, format: "json" | "jsonl" | "markdown"): string[] {
+function artifactBlocks(fileName: string, content: string, format: "json" | "jsonl" | "markdown"): string[] {
   if (format === "markdown") {
     return markdownHeadingBlocks(fileName, content);
   }
@@ -346,7 +341,11 @@ interface SourceEvidenceWindow {
   boundary: "structure" | "line" | "character" | "end-of-source";
 }
 
-const maxSourceBodyCharacters = 12000;
+// A larger, still bounded source window materially reduces map calls. The
+// provider-derived chunk ceiling and wrapper reserve remain the final hard
+// boundary; adaptive splitting handles a gateway that rejects an otherwise
+// valid large window without permanently multiplying every normal run.
+const maxSourceBodyCharacters = 60000;
 const maxSourceOverlapCharacters = 800;
 
 function sourceFileBlocks(

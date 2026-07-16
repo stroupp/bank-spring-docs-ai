@@ -45,6 +45,7 @@ export interface QwenSettings {
   temperature: number;
   maxTokens: number;
   timeoutSeconds: number;
+  interRequestDelaySeconds: number;
   useApiKey: boolean;
 }
 
@@ -62,19 +63,21 @@ export class QwenSettingsService {
     const config = vscode.workspace.getConfiguration("bankSpringDocs");
     const bankingEnvironment = config.get<boolean>("qwen.bankingEnvironment", false);
     return {
-      enabled: bankingEnvironment || config.get<boolean>("qwen.enabled", false),
+      enabled: bankingEnvironment || config.get<boolean>("qwen.enabled", true),
       bankingEnvironment,
       endpoint: config.get<string>("qwen.endpoint", "http://localhost:8000/v1/chat/completions"),
-      model: bankingEnvironment ? BANKING_QWEN_MODEL_ALIAS : config.get<string>("qwen.model", "qwen3"),
-      temperature: config.get<number>("qwen.temperature", 0.1),
-      maxTokens: config.get<number>("qwen.maxTokens", 4096),
+      model: bankingEnvironment ? BANKING_QWEN_MODEL_ALIAS : config.get<string>("qwen.model", "Qwen/Qwen3.6-27B"),
+      temperature: config.get<number>("qwen.temperature", 0.6),
+      maxTokens: config.get<number>("qwen.maxTokens", 16384),
       timeoutSeconds: config.get<number>("qwen.timeoutSeconds", 120),
+      interRequestDelaySeconds: config.get<number>("qwen.interRequestDelaySeconds", 15),
       useApiKey: bankingEnvironment ? false : config.get<boolean>("qwen.useApiKey", false)
     };
   }
 
   async saveSettings(update: QwenSettingsUpdate): Promise<void> {
     const config = vscode.workspace.getConfiguration("bankSpringDocs");
+    const interRequestDelaySeconds = validateInterRequestDelaySeconds(update.interRequestDelaySeconds);
     const bankingApproval = update.bankingEnvironment
       ? normalizeBankingQwenEndpoint(update.endpoint)
       : undefined;
@@ -103,6 +106,7 @@ export class QwenSettingsService {
     await config.update("qwen.temperature", update.temperature, vscode.ConfigurationTarget.Global);
     await config.update("qwen.maxTokens", update.maxTokens, vscode.ConfigurationTarget.Global);
     await config.update("qwen.timeoutSeconds", update.timeoutSeconds, vscode.ConfigurationTarget.Global);
+    await config.update("qwen.interRequestDelaySeconds", interRequestDelaySeconds, vscode.ConfigurationTarget.Global);
     await config.update("qwen.useApiKey", update.bankingEnvironment ? false : update.useApiKey, vscode.ConfigurationTarget.Global);
     if (update.semanticCacheEnabled !== undefined) {
       await config.update("semantic.cacheEnabled", update.semanticCacheEnabled, vscode.ConfigurationTarget.Global);
@@ -137,4 +141,11 @@ function bankingEndpointError(): Error {
   return new Error(
     "Banking environment Qwen endpoint must be an HTTPS URL with the exact /v1/chat/completions path, without credentials, custom port, query, or fragment."
   );
+}
+
+function validateInterRequestDelaySeconds(value: number): number {
+  if (!Number.isFinite(value) || value < 0 || value > 300) {
+    throw new Error("Qwen inter-request delay must be between 0 and 300 seconds.");
+  }
+  return value;
 }

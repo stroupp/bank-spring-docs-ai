@@ -27,15 +27,17 @@ const manifest = {
 const settings = {
   "ai.provider": "copilot",
   "pageAnalysis.qwenOnly": false,
+  "pageAnalysis.copilotQwenSemanticPrepassEnabled": true,
   "qwen.enabled": true,
   "qwen.bankingEnvironment": false,
-  "qwen.contextWindowTokens": 16384,
+  "qwen.contextWindowTokens": 131072,
   "qwen.generationMaxTokens": 16384,
-  "pageAnalysis.qwenMaxModelCalls": 96
+  "pageAnalysis.qwenMaxModelCalls": 32
 };
 let currentRun;
 let networkCalls = 0;
 let languageModelSelections = 0;
+let markdownPreviewCalls = 0;
 const errors = [];
 const warnings = [];
 let progressBarrier;
@@ -75,8 +77,9 @@ const dependencyMocks = {
   },
   "../pageanalysis/copilotPageDraftGenerator": {
     CopilotPageDraftGenerator: class {
-      constructor(client) {
+      constructor(client, _maxContextCharacters, includeQwenSemanticArtifacts) {
         currentRun.copilotDraftClients.push(client);
+        currentRun.copilotDraftSemanticFlags.push(includeQwenSemanticArtifacts);
       }
       async generate() {
         record("copilot-draft");
@@ -94,7 +97,18 @@ const dependencyMocks = {
   },
   "../pageanalysis/gapDetection/pageDocGapDetector": {
     PageDocGapDetector: class {
-      async detect() { record("gap"); return [{ id: "gap-1", section: "Backend" }]; }
+      async detect() {
+        record("gap");
+        return [{
+          id: "gap-1",
+          pageName: "ComplexPage",
+          section: "Backend Endpoint Eslesmesi",
+          gapType: "empty-section",
+          description: "Bolum bos.",
+          suggestedEvidence: ["page-evidence-pack.md"],
+          severity: "high"
+        }];
+      }
     }
   },
   "../pageanalysis/finalPageDocumentBuilder": {
@@ -146,7 +160,8 @@ const dependencyMocks = {
           draftPath: "/mock/page/copilot-draft.md",
           chunkCount: 3,
           newModelCallCount: 4,
-          reusedStepCount: 0
+          reusedStepCount: 0,
+          evidenceBackedSections: ["Backend Endpoint Eşleşmesi"]
         };
       }
     }
@@ -199,7 +214,7 @@ const vscodeMock = {
         return Object.prototype.hasOwnProperty.call(settings, key) ? settings[key] : defaultValue;
       }
     }),
-    async openTextDocument(filePath) { return { filePath }; },
+    async openTextDocument(filePath) { return { filePath, uri: { fsPath: filePath } }; },
     fs: {
       async stat() { return {}; }
     }
@@ -224,6 +239,13 @@ const vscodeMock = {
     async selectChatModels() {
       languageModelSelections += 1;
       throw new Error("Qwen-only command tests attempted vscode.lm access");
+    }
+  },
+  commands: {
+    async executeCommand(command, uri) {
+      assert.strictEqual(command, "markdown.showPreviewToSide");
+      assert.ok(uri?.fsPath?.endsWith("final-page-technical-analysis.md"));
+      markdownPreviewCalls += 1;
     }
   }
 };
@@ -253,6 +275,7 @@ function newRun(name) {
     explicitQwenFactoryCalls: 0,
     qwenIdentityCalls: 0,
     copilotDraftClients: [],
+    copilotDraftSemanticFlags: [],
     iterativeClients: [],
     iterativeOptions: [],
     semanticConstructorArgs: [],
@@ -281,33 +304,31 @@ async function main() {
   assert.strictEqual(qwenRun.explicitQwenFactoryCalls, 1);
   assert.strictEqual(qwenRun.configuredFactoryCalls, 0, "Qwen-only mode must not use the configured/Copilot factory");
   assert.strictEqual(qwenRun.qwenIdentityCalls, 1);
-  assert.strictEqual(qwenRun.semanticConstructorArgs.length, 1);
-  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].client, qwenClient, "Qwen-only semantics must reuse the explicit client snapshot");
-  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].expectedModelMarker, "qwen3");
-  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].maxOutputTokens, 2048);
-  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].maxGatewayRetries, 2);
-  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].retryBaseDelayMs, 750);
-  assert.strictEqual(typeof qwenRun.semanticConstructorArgs[0][3].onModelCall, "function");
-  assert.match(qwenRun.semanticConstructorArgs[0][3].cacheIdentity, /qwen3/i);
+  assert.deepStrictEqual(qwenRun.semanticConstructorArgs, [], "Qwen-only mode must bypass the redundant semantic pre-pass");
   assert.deepStrictEqual(qwenRun.iterativeClients, [qwenClient]);
-  assert.strictEqual(qwenRun.iterativeOptions[0].maxInputCharacters, 30720, "16K context must reserve only the largest phase output budget");
-  assert.strictEqual(qwenRun.iterativeOptions[0].maxChunkCharacters, 23720);
-  assert.strictEqual(qwenRun.iterativeOptions[0].analysisMaxOutputTokens, 2048);
-  assert.strictEqual(qwenRun.iterativeOptions[0].reduceMaxOutputTokens, 3072);
-  assert.strictEqual(qwenRun.iterativeOptions[0].synthesisMaxOutputTokens, 4096);
-  assert.strictEqual(qwenRun.iterativeOptions[0].maxGatewayRetries, 2);
-  assert.strictEqual(qwenRun.iterativeOptions[0].maxModelCalls, 96);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxInputCharacters, 240000, "half-capacity Qwen3.6 context must reserve the configured output budget");
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxChunkCharacters, 180000);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxTotalSourceCharacters, 720000, "raw source must remain bounded to about twelve map windows");
+  assert.strictEqual(qwenRun.iterativeOptions[0].analysisMaxOutputTokens, 16384);
+  assert.strictEqual(qwenRun.iterativeOptions[0].reduceMaxOutputTokens, 16384);
+  assert.strictEqual(qwenRun.iterativeOptions[0].synthesisMaxOutputTokens, 16384);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxGatewayRetries, 1);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxModelCalls, 32);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxReduceLevels, 3);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxAdaptiveSplitDepth, 2);
+  assert.strictEqual(qwenRun.iterativeOptions[0].finalSectionGroupSize, 6);
   assert.strictEqual(typeof qwenRun.iterativeOptions[0].onModelCall, "function");
   assert.deepStrictEqual(qwenRun.copilotDraftClients, [], "Qwen-only mode must not construct the existing Copilot draft generator");
   assert.deepStrictEqual(qwenRun.repairClients, [qwenClient], "Qwen-only gap repair must receive the explicit Qwen client");
   assert.strictEqual(qwenRun.repairOptions[0].mode, "qwen3", "Qwen-only gap repair must enable its hardened Qwen3 mode");
   assert.strictEqual(qwenRun.repairOptions[0].maxInputCharacters, qwenRun.iterativeOptions[0].maxInputCharacters, "repair must reuse the provider-derived Qwen input budget");
-  assert.strictEqual(qwenRun.repairOptions[0].maxOutputTokens, 4096);
-  assert.strictEqual(qwenRun.repairOptions[0].maxGatewayRetries, 2);
+  assert.strictEqual(qwenRun.repairOptions[0].maxOutputTokens, 16384);
+  assert.strictEqual(qwenRun.repairOptions[0].maxGatewayRetries, 1);
   assert.strictEqual(qwenRun.repairOptions[0].expectedModelMarker, "qwen3");
   assert.strictEqual(typeof qwenRun.repairOptions[0].onModelCall, "function");
+  assert.deepStrictEqual(qwenRun.repairOptions[0].gaps.map((gap) => gap.id), ["gap-1"]);
   assert.deepStrictEqual(qwenRun.events, [
-    "freshness", "context", "evidence", "qwen-semantics", "qwen-iterative-draft",
+    "freshness", "context", "evidence", "qwen-iterative-draft",
     "gap", "repair", "final", "quality", "quality-write", "quality-aggregate"
   ]);
 
@@ -323,46 +344,27 @@ async function main() {
     "an exact-validated banking alias must carry a trusted Qwen3 marker into the iterative constructor identity"
   );
   assert.strictEqual(bankingQwenRun.iterativeOptions[0].expectedModelMarker, "qwen3");
-  assert.match(bankingQwenRun.semanticConstructorArgs[0][3].cacheIdentity, /qwen3/i);
-  assert.strictEqual(bankingQwenRun.semanticConstructorArgs[0][3].client, qwenClient);
+  assert.deepStrictEqual(bankingQwenRun.semanticConstructorArgs, []);
   assert.deepStrictEqual(bankingQwenRun.repairClients, [qwenClient]);
   settings["qwen.bankingEnvironment"] = false;
 
-  const qwenBoundaryRun = newRun("qwen3-semantic-boundary");
-  qwenBoundaryRun.semanticError = Object.assign(new Error("unexpected model notqwen3fake"), {
-    name: "Qwen3PageSemanticBoundaryError"
-  });
-  await execute({ qwenOnly: true }, qwenBoundaryRun);
-  assert.deepStrictEqual(
-    qwenBoundaryRun.events,
-    ["freshness", "context", "evidence", "qwen-semantics"],
-    "a Qwen3 semantic boundary violation must stop before draft generation"
-  );
-  assert.ok(errors.some((message) => /unexpected model notqwen3fake/i.test(message)));
-  errors.length = 0;
-
   settings["pageAnalysis.qwenMaxModelCalls"] = 12;
-  const reservedBudgetRun = newRun("semantic-budget-reservation");
-  reservedBudgetRun.semanticHookCalls = 1;
-  reservedBudgetRun.draftHookCalls = 10;
-  reservedBudgetRun.repairHookCalls = 2;
-  await execute({ qwenOnly: true }, reservedBudgetRun);
-  assert.ok(
-    warnings.some((message) => /zorunlu dokuman asamalari icin kapasite korundu/i.test(message)),
-    "optional semantics must yield its budget when required phases need the full small cap"
-  );
-  assert.ok(reservedBudgetRun.events.includes("final"), "reserved draft/repair capacity must let the required pipeline finish");
+  const boundedBudgetRun = newRun("global-budget-boundary");
+  boundedBudgetRun.draftHookCalls = 10;
+  boundedBudgetRun.repairHookCalls = 2;
+  await execute({ qwenOnly: true }, boundedBudgetRun);
+  assert.ok(boundedBudgetRun.events.includes("final"), "the hard cap must allow a run that uses exactly its configured attempt budget");
+  assert.deepStrictEqual(boundedBudgetRun.semanticConstructorArgs, []);
 
   settings["pageAnalysis.qwenMaxModelCalls"] = 14;
   const exhaustedBudgetRun = newRun("global-budget-exhaustion");
-  exhaustedBudgetRun.semanticHookCalls = 1;
   exhaustedBudgetRun.draftHookCalls = 13;
-  exhaustedBudgetRun.repairHookCalls = 1;
+  exhaustedBudgetRun.repairHookCalls = 2;
   await execute({ qwenOnly: true }, exhaustedBudgetRun);
   assert.ok(errors.some((message) => /14 toplam model istek denemesi sinirina ulasti \(repair\)/i.test(message)));
   assert.ok(!exhaustedBudgetRun.events.includes("final"), "global attempt exhaustion must stop before publishing a misleading final document");
   errors.length = 0;
-  settings["pageAnalysis.qwenMaxModelCalls"] = 96;
+  settings["pageAnalysis.qwenMaxModelCalls"] = 32;
 
   // Explicit false must override a persisted true setting and preserve the old path.
   settings["pageAnalysis.qwenOnly"] = true;
@@ -373,6 +375,7 @@ async function main() {
   assert.strictEqual(copilotRun.qwenIdentityCalls, 0);
   assert.deepStrictEqual(copilotRun.semanticConstructorArgs, [[]], "the existing path must retain the optionless semantic analyzer");
   assert.deepStrictEqual(copilotRun.copilotDraftClients, [copilotClient]);
+  assert.deepStrictEqual(copilotRun.copilotDraftSemanticFlags, [true]);
   assert.deepStrictEqual(copilotRun.iterativeClients, [], "the existing path must not construct the iterative Qwen generator");
   assert.deepStrictEqual(copilotRun.repairClients, [copilotClient], "existing gap repair must receive the configured Copilot client");
   assert.deepStrictEqual(copilotRun.repairOptions, [undefined], "the existing Copilot path must retain legacy repair behavior");
@@ -380,6 +383,27 @@ async function main() {
     "freshness", "context", "evidence", "qwen-semantics", "copilot-draft",
     "gap", "repair", "final", "quality", "quality-write", "quality-aggregate"
   ]);
+
+  settings["pageAnalysis.copilotQwenSemanticPrepassEnabled"] = false;
+  const copilotWithoutSemanticRun = newRun("configured-copilot-without-semantic-prepass");
+  await execute({ qwenOnly: false }, copilotWithoutSemanticRun);
+  assert.deepStrictEqual(
+    copilotWithoutSemanticRun.semanticConstructorArgs,
+    [],
+    "disabled Copilot semantic pre-pass must not construct the Qwen analyzer"
+  );
+  assert.deepStrictEqual(copilotWithoutSemanticRun.copilotDraftSemanticFlags, [false]);
+  assert.ok(!copilotWithoutSemanticRun.events.includes("qwen-semantics"));
+
+  const qwenOnlyWithCopilotSemanticDisabled = newRun("qwen-only-ignores-copilot-semantic-toggle");
+  await execute({ qwenOnly: true }, qwenOnlyWithCopilotSemanticDisabled);
+  assert.deepStrictEqual(
+    qwenOnlyWithCopilotSemanticDisabled.semanticConstructorArgs,
+    [],
+    "Qwen-only mode must bypass semantics regardless of the Copilot-only advanced toggle"
+  );
+  assert.ok(!qwenOnlyWithCopilotSemanticDisabled.events.includes("qwen-semantics"));
+  settings["pageAnalysis.copilotQwenSemanticPrepassEnabled"] = true;
 
   settings["ai.provider"] = "copilot";
   settings["pageAnalysis.qwenOnly"] = false;
@@ -402,6 +426,8 @@ async function main() {
   assert.deepStrictEqual(configuredQwenRun.repairClients, [configuredQwenClient]);
   assert.deepStrictEqual(configuredQwenRun.repairOptions, [undefined], "legacy configured-Qwen mode must not silently opt into Qwen3-only repair rules");
   assert.deepStrictEqual(configuredQwenRun.iterativeClients, []);
+  assert.deepStrictEqual(configuredQwenRun.semanticConstructorArgs, [], "Qwen must not run a semantic self-enrichment pre-pass");
+  assert.deepStrictEqual(configuredQwenRun.copilotDraftSemanticFlags, [false]);
 
   settings["ai.provider"] = "copilot";
   settings["pageAnalysis.qwenOnly"] = false;
@@ -425,6 +451,7 @@ async function main() {
   assert.deepStrictEqual(errors, [], "all command matrix runs must finish without VS Code error messages");
   assert.strictEqual(languageModelSelections, 0, "the mocked command test must not access VS Code LM");
   assert.strictEqual(networkCalls, 0, "the mocked command test must stay fully offline");
+  assert.ok(markdownPreviewCalls > 0, "completed page analysis must open Markdown preview so generated UML is visible");
   console.log("Qwen-only command tests passed (explicit Qwen and configured Copilot paths mocked; no live AI calls).");
 }
 

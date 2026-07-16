@@ -6,7 +6,7 @@ import {
   DocumentationModelUsage,
   IDocumentationModelClient
 } from "./documentationModelClient";
-import { assertBankingQwenEndpoint, QwenChatMessage, QwenClient } from "./qwenClient";
+import { assertBankingQwenEndpoint, QwenChatMessage, QwenClient, QwenCompletionOptions } from "./qwenClient";
 import { BANKING_QWEN_MODEL_ALIAS, QwenSettings, QwenSettingsService } from "./qwenSettingsService";
 
 const defaultGenerationTimeoutSeconds = 600;
@@ -45,7 +45,7 @@ export class QwenDocumentationModelClient implements IDocumentationModelClient {
       config.get<number>("qwen.contextWindowTokens", defaultContextWindowTokens),
       "bankSpringDocs.qwen.contextWindowTokens"
     );
-    this.modelFamily = isApprovedBankingQwen3Settings(this.settings) ? "qwen3" : "qwen";
+    this.modelFamily = isQwen36Settings(this.settings) ? "qwen3" : "qwen";
   }
 
   async send(
@@ -65,8 +65,13 @@ export class QwenDocumentationModelClient implements IDocumentationModelClient {
       );
     }
 
+    const phaseSampling = qwen36PhaseSampling(prompt, this.settings);
     const result = await this.client.complete(messages, {
-      temperature: this.settings.temperature,
+      temperature: phaseSampling?.temperature ?? this.settings.temperature,
+      topP: phaseSampling?.topP,
+      topK: phaseSampling?.topK,
+      presencePenalty: phaseSampling?.presencePenalty,
+      enableThinking: phaseSampling?.enableThinking,
       maxTokens: requestMaxOutputTokens,
       timeoutSeconds: this.timeoutSeconds
     }, token);
@@ -98,6 +103,45 @@ export class QwenDocumentationModelClient implements IDocumentationModelClient {
       requestId: result.requestId
     };
   }
+}
+
+interface Qwen36SamplingProfile extends QwenCompletionOptions {
+  temperature: number;
+  topP: number;
+  topK: number;
+  presencePenalty: number;
+  enableThinking: boolean;
+}
+
+function qwen36PhaseSampling(
+  prompt: string | DocumentationModelRequest,
+  settings: QwenSettings
+): Qwen36SamplingProfile | undefined {
+  if (!isQwen36Settings(settings)) {
+    return undefined;
+  }
+  const profile = typeof prompt === "string" ? "" : prompt.profile ?? "";
+  if (profile === "qwen3-page-chunk-analysis" || profile === "qwen3-page-ledger-reduce") {
+    return {
+      temperature: 0.7,
+      topP: 0.8,
+      topK: 20,
+      presencePenalty: 1.5,
+      enableThinking: false
+    };
+  }
+  return {
+    temperature: 0.6,
+    topP: 0.95,
+    topK: 20,
+    presencePenalty: 0,
+    enableThinking: true
+  };
+}
+
+function isQwen36Settings(settings: QwenSettings): boolean {
+  return isApprovedBankingQwen3Settings(settings)
+    || /(?:^|[\s/:._-])qwen3[._-]?6(?:$|[\s/:._-])/i.test(settings.model.trim());
 }
 
 function isApprovedBankingQwen3Settings(settings: QwenSettings): boolean {

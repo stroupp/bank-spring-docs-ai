@@ -22,6 +22,7 @@ type QwenUiSettings = {
   temperature: number;
   maxTokens: number;
   timeoutSeconds: number;
+  interRequestDelaySeconds: number;
   useApiKey: boolean;
   semanticCacheEnabled?: boolean;
   semanticMaxFilesPerRun?: number;
@@ -37,6 +38,7 @@ type WebviewMessage =
   | { type: "saveCopilotModel"; modelId: string }
   | { type: "saveMultiRepoAgenticQwenFlag"; enabled: boolean }
   | { type: "savePageAnalysisQwenOnly"; enabled: boolean }
+  | { type: "saveCopilotQwenSemanticPrepass"; enabled: boolean }
   | { type: "runFullSelectedPageAnalysis"; qwenOnly: boolean }
   | { type: "saveMultiRepoManifest"; input: MultiRepoInput }
   | { type: "cloneOrUpdateMultiRepos"; input: MultiRepoInput }
@@ -60,6 +62,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       if ((
         event.affectsConfiguration("bankSpringDocs.ai.provider")
         || event.affectsConfiguration("bankSpringDocs.pageAnalysis.qwenOnly")
+        || event.affectsConfiguration("bankSpringDocs.pageAnalysis.copilotQwenSemanticPrepassEnabled")
       ) && this.webviewView) {
         this.postSettings(this.webviewView);
       }
@@ -247,7 +250,24 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
       } catch (error) {
         webviewView.webview.postMessage({
           type: "error",
-          message: `Qwen3-only sayfa ayari kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+          message: `Qwen3.6-only sayfa ayari kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+      return;
+    }
+
+    if (message.type === "saveCopilotQwenSemanticPrepass") {
+      try {
+        await vscode.workspace.getConfiguration("bankSpringDocs").update(
+          "pageAnalysis.copilotQwenSemanticPrepassEnabled",
+          Boolean(message.enabled),
+          vscode.ConfigurationTarget.Global
+        );
+        this.postSettings(webviewView);
+      } catch (error) {
+        webviewView.webview.postMessage({
+          type: "error",
+          message: `Copilot Qwen semantik ön adım ayarı kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
         });
       }
       return;
@@ -319,7 +339,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
   private postSettings(webviewView: vscode.WebviewView): void {
     const config = vscode.workspace.getConfiguration("bankSpringDocs");
-    const provider = normalizeAiProvider(config.get<string>("ai.provider", "copilot"));
+    const provider = normalizeAiProvider(config.get<string>("ai.provider", "qwen"));
     const modelsPromise = provider === "copilot" ? this.getCopilotModels() : Promise.resolve([]);
     modelsPromise.then((models) => {
       webviewView.webview.postMessage({
@@ -338,9 +358,9 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         ...new QwenSettingsService(this.context).getSettings(),
         qwenContextWindowTokens: config.get<number>("qwen.contextWindowTokens", 131072),
         qwenGenerationMaxTokens: config.get<number>("qwen.generationMaxTokens", 16384),
-        qwenAnalysisMaxOutputTokens: config.get<number>("pageAnalysis.qwenAnalysisMaxOutputTokens", 2048),
-        qwenReduceMaxOutputTokens: config.get<number>("pageAnalysis.qwenReduceMaxOutputTokens", 3072),
-        qwenSynthesisMaxOutputTokens: config.get<number>("pageAnalysis.qwenSynthesisMaxOutputTokens", 4096)
+        qwenAnalysisMaxOutputTokens: config.get<number>("pageAnalysis.qwenAnalysisMaxOutputTokens", 16384),
+        qwenReduceMaxOutputTokens: config.get<number>("pageAnalysis.qwenReduceMaxOutputTokens", 16384),
+        qwenSynthesisMaxOutputTokens: config.get<number>("pageAnalysis.qwenSynthesisMaxOutputTokens", 16384)
       },
       semantic: {
         cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
@@ -351,7 +371,8 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         agenticRunQwenSemantics: config.get<boolean>("multiRepo.agenticRunQwenSemantics", true)
       },
       pageAnalysis: {
-        qwenOnly: config.get<boolean>("pageAnalysis.qwenOnly", false)
+        qwenOnly: config.get<boolean>("pageAnalysis.qwenOnly", true),
+        copilotQwenSemanticPrepassEnabled: config.get<boolean>("pageAnalysis.copilotQwenSemanticPrepassEnabled", false)
       }
     });
   }
@@ -833,9 +854,14 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         </div>
         <label class="checkLabel">
           <input id="pageAnalysisQwenOnly" type="checkbox">
-          Bu sayfanın tüm AI adımlarını yalnızca Qwen3 ile çalıştır
+          Bu sayfanın tüm AI adımlarını yalnızca Qwen3.6 ile çalıştır
         </label>
         <div class="muted">Yalnızca tam sayfa analizi için geçerlidir; global AI sağlayıcısı ve Copilot akışı değişmez.</div>
+        <label class="checkLabel">
+          <input id="copilotQwenSemanticPrepassEnabled" type="checkbox">
+          Gelişmiş: Copilot sayfa analizinde Qwen semantik ön adımını ve context'ini kullan
+        </label>
+        <div class="muted">Varsayılan olarak kapalıdır ve yalnız Copilot'u zenginleştirir. Qwen-only akışı semantic ön adımı ve eski semantic artifact'leri her zaman atlar.</div>
         <div class="buttonGrid">
           <button class="secondary" data-command="bankSpringDocs.buildPageList">Sayfa Listesini Yenile</button>
           <button class="secondary" data-command="bankSpringDocs.analyzeSelectedPage">Seçili Sayfayı Analiz Et</button>
@@ -889,7 +915,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         </label>
         <label>
           Model
-          <input id="qwenModel" type="text" placeholder="qwen3">
+          <input id="qwenModel" type="text" placeholder="Qwen/Qwen3.6-27B">
         </label>
         <label>
           Temperature
@@ -903,7 +929,12 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
           Semantik Timeout
           <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
         </label>
-        <div class="muted"><strong>Qwen-only context ve aşama limitleri</strong><br>Bu alanlar Copilot'u etkilemez. Banking için başlangıç önerisi: context 16384, tam üretim 4096, analysis 2048, reduce 3072, synthesis 4096.</div>
+        <label>
+          İstekler arası bekleme (saniye; 0 kapatır)
+          <input id="qwenInterRequestDelaySeconds" type="number" min="0" max="300" step="1">
+        </label>
+        <div class="muted"><strong>Qwen3.6 sampling</strong><br>Evidence/reduce çağrıları non-thinking; synthesis ve gerçek gap repair çağrıları precise-coding thinking profiliyle otomatik gönderilir.</div>
+        <div class="muted"><strong>Qwen-only context ve aşama limitleri</strong><br>Yarım Qwen3.6-27B profili context 131072 ve çıktı tavanları 16384 kullanır. Bunlar model kapasitesinin yarısıdır; endpoint deployment'ının gerçek <code>max_model_len</code> değeri daha düşükse context mutlaka o değere indirilmelidir. Bu alanlar Copilot'u etkilemez.</div>
         <label>
           Toplam context window (token)
           <input id="qwenContextWindowTokens" type="number" min="8192" step="1024">
@@ -983,6 +1014,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     const multiTraceabilityStatus = document.getElementById("multiTraceabilityStatus");
     const selectedPageStatus = document.getElementById("selectedPageStatus");
     const pageAnalysisQwenOnly = document.getElementById("pageAnalysisQwenOnly");
+    const copilotQwenSemanticPrepassEnabled = document.getElementById("copilotQwenSemanticPrepassEnabled");
     const runFullSelectedPageAnalysisButton = document.getElementById("runFullSelectedPageAnalysisButton");
     const defaultBranch = document.getElementById("defaultBranch");
     const qwenModal = document.getElementById("qwenModal");
@@ -996,6 +1028,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
     const qwenTemperature = document.getElementById("qwenTemperature");
     const qwenMaxTokens = document.getElementById("qwenMaxTokens");
     const qwenTimeoutSeconds = document.getElementById("qwenTimeoutSeconds");
+    const qwenInterRequestDelaySeconds = document.getElementById("qwenInterRequestDelaySeconds");
     const qwenContextWindowTokens = document.getElementById("qwenContextWindowTokens");
     const qwenGenerationMaxTokens = document.getElementById("qwenGenerationMaxTokens");
     const qwenAnalysisMaxOutputTokens = document.getElementById("qwenAnalysisMaxOutputTokens");
@@ -1114,7 +1147,12 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         qwenApiKey.value = "";
         if (applyDefaults) {
           qwenTemperature.value = "0.6";
-          qwenMaxTokens.value = "163849";
+          qwenMaxTokens.value = "16384";
+          qwenContextWindowTokens.value = "131072";
+          qwenGenerationMaxTokens.value = "16384";
+          qwenAnalysisMaxOutputTokens.value = "16384";
+          qwenReduceMaxOutputTokens.value = "16384";
+          qwenSynthesisMaxOutputTokens.value = "16384";
         }
       }
       qwenModel.disabled = enabled;
@@ -1136,14 +1174,15 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         bankingEnvironment: qwenBankingEnvironment.checked,
         endpoint: qwenEndpoint.value,
         model: qwenModel.value,
-        temperature: Number(qwenTemperature.value || "0.1"),
-        maxTokens: Number(qwenMaxTokens.value || "4096"),
+        temperature: Number(qwenTemperature.value || "0.6"),
+        maxTokens: Number(qwenMaxTokens.value || "16384"),
         timeoutSeconds: Number(qwenTimeoutSeconds.value || "120"),
+        interRequestDelaySeconds: Number(qwenInterRequestDelaySeconds.value || "15"),
         qwenContextWindowTokens: Number(qwenContextWindowTokens.value || "131072"),
         qwenGenerationMaxTokens: Number(qwenGenerationMaxTokens.value || "16384"),
-        qwenAnalysisMaxOutputTokens: Number(qwenAnalysisMaxOutputTokens.value || "2048"),
-        qwenReduceMaxOutputTokens: Number(qwenReduceMaxOutputTokens.value || "3072"),
-        qwenSynthesisMaxOutputTokens: Number(qwenSynthesisMaxOutputTokens.value || "4096"),
+        qwenAnalysisMaxOutputTokens: Number(qwenAnalysisMaxOutputTokens.value || "16384"),
+        qwenReduceMaxOutputTokens: Number(qwenReduceMaxOutputTokens.value || "16384"),
+        qwenSynthesisMaxOutputTokens: Number(qwenSynthesisMaxOutputTokens.value || "16384"),
         useApiKey: qwenUseApiKey.checked,
         semanticCacheEnabled: semanticCacheEnabled.checked,
         semanticMaxFilesPerRun: Number(semanticMaxFilesPerRun.value || "50"),
@@ -1172,6 +1211,13 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
 
     pageAnalysisQwenOnly.addEventListener("change", () => {
       vscode.postMessage({ type: "savePageAnalysisQwenOnly", enabled: pageAnalysisQwenOnly.checked });
+    });
+
+    copilotQwenSemanticPrepassEnabled.addEventListener("change", () => {
+      vscode.postMessage({
+        type: "saveCopilotQwenSemanticPrepass",
+        enabled: copilotQwenSemanticPrepassEnabled.checked
+      });
     });
 
     runFullSelectedPageAnalysisButton.addEventListener("click", () => {
@@ -1280,14 +1326,15 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
           qwenBankingEnvironment.checked = Boolean(message.qwen.bankingEnvironment);
           qwenEndpoint.value = message.qwen.endpoint || "";
           qwenModel.value = message.qwen.model || "";
-          qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
-          qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
+          qwenTemperature.value = String(message.qwen.temperature ?? 0.6);
+          qwenMaxTokens.value = String(message.qwen.maxTokens ?? 16384);
           qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
+          qwenInterRequestDelaySeconds.value = String(message.qwen.interRequestDelaySeconds ?? 15);
           qwenContextWindowTokens.value = String(message.qwen.qwenContextWindowTokens ?? 131072);
           qwenGenerationMaxTokens.value = String(message.qwen.qwenGenerationMaxTokens ?? 16384);
-          qwenAnalysisMaxOutputTokens.value = String(message.qwen.qwenAnalysisMaxOutputTokens ?? 2048);
-          qwenReduceMaxOutputTokens.value = String(message.qwen.qwenReduceMaxOutputTokens ?? 3072);
-          qwenSynthesisMaxOutputTokens.value = String(message.qwen.qwenSynthesisMaxOutputTokens ?? 4096);
+          qwenAnalysisMaxOutputTokens.value = String(message.qwen.qwenAnalysisMaxOutputTokens ?? 16384);
+          qwenReduceMaxOutputTokens.value = String(message.qwen.qwenReduceMaxOutputTokens ?? 16384);
+          qwenSynthesisMaxOutputTokens.value = String(message.qwen.qwenSynthesisMaxOutputTokens ?? 16384);
           qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
           applyBankingEnvironmentState(qwenBankingEnvironment.checked);
         }
@@ -1301,6 +1348,7 @@ export class BankSpringDocsViewProvider implements vscode.WebviewViewProvider {
         }
         if (message.pageAnalysis) {
           pageAnalysisQwenOnly.checked = Boolean(message.pageAnalysis.qwenOnly);
+          copilotQwenSemanticPrepassEnabled.checked = Boolean(message.pageAnalysis.copilotQwenSemanticPrepassEnabled);
         }
       }
       if (message.type === "copilotModels") {
@@ -1396,6 +1444,7 @@ function normalizeAiProvider(value: unknown): AiProviderUiValue {
 
 async function saveQwenLimitSettings(settings: QwenUiSettings): Promise<void> {
   const config = vscode.workspace.getConfiguration("bankSpringDocs");
+  qwenLimitValue(settings.interRequestDelaySeconds, "Qwen istekler arası bekleme", 0, 300);
   const contextWindow = qwenLimitValue(settings.qwenContextWindowTokens, "Qwen context window", 8192);
   const generationCap = qwenLimitValue(settings.qwenGenerationMaxTokens, "Qwen generation cap", 256);
   const analysisOutput = qwenLimitValue(settings.qwenAnalysisMaxOutputTokens, "Qwen analysis output", 256, 65536);

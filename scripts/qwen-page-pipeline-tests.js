@@ -19,6 +19,11 @@ const {
   buildQwenPageChunkAnalysisPrompt,
   buildQwenPageFinalSynthesisPrompt
 } = require("../dist/pageanalysis/qwenPageDraftPrompts");
+const { FinalPageDocumentBuilder } = require("../dist/pageanalysis/finalPageDocumentBuilder");
+const { PageDocumentQualityScorer } = require("../dist/pageanalysis/quality/pageDocumentQualityScorer");
+const { PageDocGapDetector } = require("../dist/pageanalysis/gapDetection/pageDocGapDetector");
+const { selectGenuinelyWeakQwenGaps } = require("../dist/pageanalysis/gapRepair/pageGapRepairPlanner");
+const { PageFlowDiagramBuilder } = require("../dist/pageanalysis/pageFlowDiagramBuilder");
 
 const canonicalSections = [
   "Sayfa Amacı",
@@ -47,6 +52,7 @@ const token = {
 
 async function main() {
   testUntrustedPromptDelimitersAreEscaped();
+  testDeterministicPageFlowDiagrams();
   await testSourceChunkingPreservesStableOverlappingRanges();
   await testSecretShapedSourceLabelsAreMasked();
   await testMultiChunkRawSourceCoverageAndPublishing();
@@ -56,16 +62,37 @@ async function main() {
   await testOutputLengthTriggersAdaptiveSplit();
   await testTransientGatewayRetryAdaptiveSplitAndResume();
   await testSynthesisTuningReusesCompletedEvidenceMaps();
-  await testMissingFinalHeadingsTriggerTargetedSynthesis();
+  await testMissingFinalHeadingsDeferToGroundedGroupedRepair();
   await testUnsupportedSourceReferenceIsDemoted();
   await testLowCallCapResumeAfterVolatileMetadataRegeneration();
-  await testInvalidOptionalSemanticArtifactIsSkipped();
+  await testExistingSemanticArtifactsAreStrictlyExcluded();
   await testMaskedRawResponseIsPreservedOnParseFailure();
   await testWrongSchemaLedgerIsRejectedBeforeCaching();
   await testApprovedBankingAliasAcceptedViaQwen3Family();
   await testRejectsEmbeddedFakeQwen3Identity();
   assert.strictEqual(networkCalls, 0, "mock-only Qwen page tests must never use fetch");
   console.log("Qwen iterative page pipeline tests passed (mock only; network calls: 0).");
+}
+
+function testDeterministicPageFlowDiagrams() {
+  const records = [
+    { uiApiCall: "POST /api/releases", bffEndpoint: "POST /api/releases", beEndpoint: "POST /releases", confidence: "high" },
+    { uiApiCall: "GET /api/releases/{id}", bffEndpoint: "GET /api/releases/{id}", confidence: "partial" }
+  ];
+  const base = {
+    selectedPage: { pageName: "Release <script> %%{init", route: "/releases/:id" },
+    bffToBeMatches: [{ bffEndpoint: "POST /api/releases", beEndpoint: "POST /releases", bffClient: "ReleaseFeignClient", confidence: "high" }],
+    beServiceFlows: [{ endpoint: "POST /releases", repositoryMethods: ["ReleaseRepository.save"], entities: ["Release"] }]
+  };
+  const first = new PageFlowDiagramBuilder().build({ ...base, pageFlows: records });
+  const reordered = new PageFlowDiagramBuilder().build({ ...base, pageFlows: [...records].reverse() });
+  assert.strictEqual(first.markdown, reordered.markdown, "diagram Markdown must be byte-stable when page-flow order changes");
+  assert.strictEqual(first.svg, reordered.svg, "diagram SVG must be byte-stable when page-flow order changes");
+  assert.match(first.markdown, /```mermaid[\s\S]*sequenceDiagram/);
+  assert.match(first.markdown, /ReleaseFeignClient/);
+  assert.doesNotMatch(first.markdown, /%%\s*\{/i, "Mermaid init directives from repository labels must be neutralized");
+  assert.doesNotMatch(first.svg, /<script>/i, "SVG labels must be XML escaped");
+  assert.doesNotMatch(first.markdown, /GET \/releases/, "an unmatched BFF flow must not invent a BE edge");
 }
 
 function testUntrustedPromptDelimitersAreEscaped() {
@@ -184,6 +211,8 @@ async function testMultiChunkRawSourceCoverageAndPublishing() {
   pageFlow.pageFlows[0].uncertainties = ["api_key=boundary-warning-secret"];
   await fs.writeFile(pageFlowPath, JSON.stringify(pageFlow, null, 2), "utf8");
   await fs.writeFile(path.join(fixture.pageRoot, "copilot-draft.md"), "# previous Copilot draft\n", "utf8");
+  await fs.writeFile(path.join(fixture.pageRoot, "qwen-page-semantics.json"), "QWEN_ONLY_STALE_PAGE_SEMANTIC", "utf8");
+  await fs.writeFile(path.join(fixture.pageRoot, "qwen-interaction-semantics.jsonl"), "QWEN_ONLY_STALE_INTERACTION_SEMANTIC\n", "utf8");
   const prompts = [];
   const mock = createMockClient({ prompts });
   const generator = new QwenIterativePageDraftGenerator(mock, options("multi-run"));
@@ -194,12 +223,13 @@ async function testMultiChunkRawSourceCoverageAndPublishing() {
     token
   });
 
-  assert.ok(result.chunkCount > 4, "small chunk budget must create multiple semantic/source chunks");
+  assert.ok(result.chunkCount > 4, "small chunk budget must create multiple deterministic/source chunks");
   assert.ok(result.newModelCallCount > 4, "iterative pipeline must use multiple bounded model calls");
   assert.ok(result.reduceLevels >= 1, "large evidence ledger must use hierarchical reduction");
   assert.ok(result.includedSourceFiles.some((file) => file === "ui:src/pages/LateUi.tsx"));
   assert.ok(result.includedSourceFiles.some((file) => file === "bff:src/main/java/app/LateBff.java"));
   assert.ok(result.includedSourceFiles.some((file) => file === "be:src/main/java/app/LateBe.java"));
+  assert.ok(result.evidenceBackedSections.includes("Sayfa Amacı"));
 
   const sentText = prompts.map((prompt) => prompt.combinedText).join("\n");
   assert.match(sentText, /LATE_UI_SOURCE_SENTINEL/, "late UI source file must reach a bounded request");
@@ -208,6 +238,7 @@ async function testMultiChunkRawSourceCoverageAndPublishing() {
   assert.doesNotMatch(sentText, /boundary-qwen-page-secret/);
   assert.doesNotMatch(sentText, /boundary-qwen-json-secret/);
   assert.doesNotMatch(sentText, /boundary-page-name-secret|boundary-route-secret|boundary-warning-secret/);
+  assert.doesNotMatch(sentText, /QWEN_ONLY_STALE_(?:PAGE|INTERACTION)_SEMANTIC/);
   assert.match(sentText, /\[MASKED_SECRET\]/);
   assert.ok(prompts.every((prompt) => prompt.combinedText.length <= 12000), "every request must respect the configured full prompt budget");
   const analysisPrompts = prompts.filter((prompt) => prompt.profile === "qwen3-page-chunk-analysis");
@@ -231,14 +262,32 @@ async function testMultiChunkRawSourceCoverageAndPublishing() {
 
   const qwenDraft = await fs.readFile(result.qwenDraftPath, "utf8");
   const compatibilityDraft = await fs.readFile(result.draftPath, "utf8");
+  assert.strictEqual(prompts.length, result.newModelCallCount, "local UML generation must not add a model request");
   assert.strictEqual(qwenDraft, compatibilityDraft, "qwen-draft and canonical compatibility draft must be identical");
   assert.match(qwenDraft, /bank-spring-docs-generation/);
   assert.match(qwenDraft, /"provider":"qwen"/);
+  assert.match(qwenDraft, /"qwenSemanticArtifactsUsed":false/);
   assert.doesNotMatch(qwenDraft, /<think>/i, "Qwen3 reasoning must not leak into the published Markdown");
   assert.doesNotMatch(qwenDraft, /```markdown/i, "an outer Qwen3 Markdown fence must not wrap the published document");
   assert.match(qwenDraft, /Pipeline Kapsam Uyarilari/);
+  assert.match(qwenDraft, /^## UML ve Akış Diyagramları$/m);
+  assert.match(qwenDraft, /\.\/page-flow-uml\.svg/);
+  assert.strictEqual((qwenDraft.match(/```mermaid/g) ?? []).length, 2);
+  const diagramSvg = await fs.readFile(path.join(fixture.pageRoot, "page-flow-uml.svg"), "utf8");
+  assert.match(diagramSvg, /UI BFF Backend UML flow/);
+  assert.match(diagramSvg, /ReleaseRepository\.save/);
   assert.match(qwenDraft, /\[MASKED_SECRET\]/, "masked coverage warnings must be disclosed in Belirsizlikler");
   assert.doesNotMatch(qwenDraft, /boundary-warning-secret/);
+  await fs.writeFile(path.join(fixture.pageRoot, "detected-gaps.json"), "[]\n", "utf8");
+  const finalResult = await new FinalPageDocumentBuilder().build(fixture.pageRoot);
+  const finalDocument = await fs.readFile(finalResult.finalDocumentPath, "utf8");
+  assert.match(finalDocument, /Qwen semantik kullanimi: devre disi/);
+  assert.strictEqual((finalDocument.match(/^## UML ve Akış Diyagramları$/gm) ?? []).length, 1, "final document must retain exactly one deterministic UML section");
+  const quality = await new PageDocumentQualityScorer().score(fixture.root, fixture.pageRoot);
+  assert.strictEqual(quality.qwenSemanticCoverage, 0, "stale semantic files must not earn Qwen-only quality credit");
+  assert.ok(quality.metricExplanations.some((item) =>
+    item.metric === "qwen-semantic-coverage" && /intentionally disabled/i.test(item.reason)
+  ));
   assert.ok(result.warnings.some((warning) => warning.includes("[MASKED_SECRET]")));
   assert.ok(result.warnings.every((warning) => !warning.includes("boundary-warning-secret")));
   let previousHeadingOffset = -1;
@@ -520,7 +569,7 @@ async function testSynthesisTuningReusesCompletedEvidenceMaps() {
   );
 }
 
-async function testMissingFinalHeadingsTriggerTargetedSynthesis() {
+async function testMissingFinalHeadingsDeferToGroundedGroupedRepair() {
   const fixture = await createFixture("qwen-page-missing-final-heading", false);
   const prompts = [];
   const base = createMockClient({ prompts });
@@ -540,10 +589,21 @@ async function testMissingFinalHeadingsTriggerTargetedSynthesis() {
   const result = await new QwenIterativePageDraftGenerator(client, options("missing-final-heading-run"))
     .generate({ multiRepoRoot: fixture.root, pageRoot: fixture.pageRoot, token });
   const synthesisPrompts = prompts.filter((prompt) => prompt.profile === "qwen3-page-final-synthesis");
-  assert.ok(synthesisPrompts.length > Math.ceil(canonicalSections.length / 4), "a malformed group must trigger a targeted missing-section synthesis request");
-  assert.ok(result.warnings.some((warning) => /hedefli ikinci istek/i.test(warning)));
+  assert.strictEqual(
+    synthesisPrompts.length,
+    Math.ceil(canonicalSections.length / 4),
+    "a malformed group must not trigger a duplicate per-group synthesis request"
+  );
+  assert.ok(result.warnings.some((warning) => /grounded grouped gap repair/i.test(warning)));
   const draft = await fs.readFile(result.qwenDraftPath, "utf8");
   assert.ok(canonicalSections.every((heading) => draft.includes(`## ${heading}`)));
+  const gaps = await new PageDocGapDetector().detect(fixture.pageRoot, fixture.root);
+  const repairable = selectGenuinelyWeakQwenGaps(gaps, result.evidenceBackedSections);
+  assert.deepStrictEqual(
+    repairable.map((gap) => gap.section),
+    ["Sayfa Amaci"],
+    "only a missing section with grounded ledger evidence may consume grouped repair capacity"
+  );
 }
 
 async function testUnsupportedSourceReferenceIsDemoted() {
@@ -761,9 +821,8 @@ async function testLowCallCapResumeAfterVolatileMetadataRegeneration() {
   assert.strictEqual(resumedManifest.steps[preservedStepId].attempt, preservedStep.attempt, "reused step attempt must not increment");
   assert.strictEqual(resumedManifest.steps[preservedStepId].outputHash, preservedStep.outputHash, "reused output must remain byte-verified");
 
-  // Derived semantic output may legitimately change between full-command
-  // iterations. It must invalidate only its own step (and downstream reduce /
-  // synthesis work), not relocate the core page/source run.
+  // Existing semantic artifacts are deliberately outside the Qwen-only input
+  // contract. Changing one must neither relocate the run nor trigger a call.
   const semanticsPath = path.join(fixture.pageRoot, "qwen-page-semantics.json");
   const semantics = JSON.parse(await fs.readFile(semanticsPath, "utf8"));
   semantics.purpose = "A meaningfully updated semantic fact.";
@@ -774,12 +833,20 @@ async function testLowCallCapResumeAfterVolatileMetadataRegeneration() {
     maxModelCalls: 100
   });
   const semanticResult = await semanticRefresh.generate({ multiRepoRoot: fixture.root, pageRoot: fixture.pageRoot, token });
-  assert.strictEqual(semanticResult.runRoot, firstRunRoot, "derived semantic changes must retain the core run root");
-  assert.ok(semanticResult.newModelCallCount >= 1, "changed semantic chunk must be analyzed under a new per-step hash");
-  assert.ok(semanticResult.reusedStepCount >= 1, "unchanged core chunks must still be reused during semantic refresh");
+  assert.strictEqual(semanticResult.runRoot, firstRunRoot, "excluded semantic changes must retain the deterministic run root");
+  assert.strictEqual(semanticResult.newModelCallCount, 0, "excluded semantic changes must not create a Qwen request");
+  assert.strictEqual(semanticRefreshPrompts.length, 0, "excluded semantic content must never enter a prompt");
+  assert.ok(semanticResult.reusedStepCount >= 1, "all completed deterministic/evidence steps must remain reusable");
 }
 
 async function testRejectsEmbeddedFakeQwen3Identity() {
+  assert.doesNotThrow(
+    () => new QwenIterativePageDraftGenerator(createMockClient({ prompts: [] }), {
+      ...options("qwen36-constructor-identity"),
+      modelIdentity: "Qwen3.6-35B-A3B"
+    }),
+    "Qwen3.6 model ids must satisfy the existing delimited qwen3 family boundary"
+  );
   assert.throws(
     () => new QwenIterativePageDraftGenerator(createMockClient({ prompts: [] }), {
       ...options("fake-constructor-identity"),
@@ -822,9 +889,10 @@ async function testRejectsEmbeddedFakeQwen3Identity() {
   );
 }
 
-async function testInvalidOptionalSemanticArtifactIsSkipped() {
-  const fixture = await createFixture("qwen-page-invalid-optional-semantic", false);
-  await fs.writeFile(path.join(fixture.pageRoot, "qwen-page-semantics.json"), "{ definitely-not-json", "utf8");
+async function testExistingSemanticArtifactsAreStrictlyExcluded() {
+  const fixture = await createFixture("qwen-page-excluded-semantics", false);
+  await fs.writeFile(path.join(fixture.pageRoot, "qwen-page-semantics.json"), "SEMANTIC_PAGE_SENTINEL { definitely-not-json", "utf8");
+  await fs.writeFile(path.join(fixture.pageRoot, "qwen-interaction-semantics.jsonl"), "SEMANTIC_INTERACTION_SENTINEL\n", "utf8");
   const result = await new QwenPageDraftContextChunker({
     maxChunkCharacters: 2800,
     maxSourceFileCharacters: 9000,
@@ -832,8 +900,12 @@ async function testInvalidOptionalSemanticArtifactIsSkipped() {
   }).build(fixture.pageRoot);
   assert.ok(result.chunks.some((chunk) => chunk.kind === "page-flow"));
   assert.ok(result.chunks.some((chunk) => chunk.kind === "context-pack"));
-  assert.ok(result.warnings.some((warning) => /qwen-page-semantics\.json.*gecersiz/i.test(warning)));
+  assert.ok(result.chunks.some((chunk) => chunk.kind === "evidence-pack"));
+  assert.ok(!result.warnings.some((warning) => /qwen-(?:page|interaction)-semantics/i.test(warning)));
   assert.ok(!result.chunks.some((chunk) => chunk.sourceLabel === "qwen-page-semantics.json"));
+  assert.ok(!result.chunks.some((chunk) => chunk.sourceLabel === "qwen-interaction-semantics.jsonl"));
+  const combined = result.chunks.map((chunk) => chunk.content).join("\n");
+  assert.doesNotMatch(combined, /SEMANTIC_(?:PAGE|INTERACTION)_SENTINEL/);
 }
 
 function createMockClient({ prompts, failAt }) {
@@ -907,6 +979,12 @@ function options(runId) {
     maxTotalSourceCharacters: 27000,
     maxModelCalls: 100,
     maxReduceLevels: 5,
+    analysisMaxOutputTokens: 2048,
+    reduceMaxOutputTokens: 3072,
+    synthesisMaxOutputTokens: 4096,
+    maxGatewayRetries: 2,
+    maxAdaptiveSplitDepth: 3,
+    finalSectionGroupSize: 4,
     modelIdentity: "qwen3-test",
     expectedModelMarker: "qwen3",
     now: () => new Date("2026-07-16T10:00:00.000Z"),

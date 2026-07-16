@@ -47,6 +47,10 @@ export interface QwenChatMessage {
 
 export interface QwenCompletionOptions {
   temperature?: number;
+  topP?: number;
+  topK?: number;
+  presencePenalty?: number;
+  enableThinking?: boolean;
   maxTokens?: number;
   timeoutSeconds?: number;
 }
@@ -113,23 +117,27 @@ export class QwenClient implements IQwenClient {
     const timeoutSeconds = positiveNumber(options.timeoutSeconds ?? settings.timeoutSeconds, "Qwen timeout");
     const maxTokens = positiveNumber(options.maxTokens ?? settings.maxTokens, "Qwen max token");
     const temperature = finiteNumber(options.temperature ?? settings.temperature, "Qwen temperature");
+    const topP = options.topP === undefined ? undefined : boundedNumber(options.topP, "Qwen top_p", 0, 1);
+    const topK = options.topK === undefined ? undefined : boundedPositiveInteger(options.topK, "Qwen top_k", 1000);
+    const presencePenalty = options.presencePenalty === undefined
+      ? undefined
+      : boundedNumber(options.presencePenalty, "Qwen presence_penalty", -2, 2);
+    const interRequestDelaySeconds = boundedNonNegativeNumber(
+      settings.interRequestDelaySeconds ?? 15,
+      "Qwen istekler arasi bekleme",
+      300
+    );
     if (token?.isCancellationRequested) {
       throw new QwenRequestCancelledError();
     }
 
-    const controller = new AbortController();
-    let timedOut = false;
-    let cancelled = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutSeconds * 1000);
-    const cancellation = token?.onCancellationRequested(() => {
-      cancelled = true;
-      controller.abort();
-    });
+    if (settings.bankingEnvironment) {
+      assertBankingQwenEndpoint(settings.endpoint);
+    }
+    const endpoint = normalizeChatCompletionsEndpoint(settings.endpoint);
+    assertQwenEndpointAllowed(endpoint, settings.bankingEnvironment);
 
-    try {
+    return qwenRequestCoordinator.run(interRequestDelaySeconds, token, async (markRequestStarted) => {
       const headers: Record<string, string> = {
         "Content-Type": "application/json"
       };
@@ -140,73 +148,103 @@ export class QwenClient implements IQwenClient {
         }
         headers.Authorization = `Bearer ${apiKey}`;
       }
-
-      if (settings.bankingEnvironment) {
-        assertBankingQwenEndpoint(settings.endpoint);
+      if (token?.isCancellationRequested) {
+        throw new QwenRequestCancelledError();
       }
-      const endpoint = normalizeChatCompletionsEndpoint(settings.endpoint);
-      assertQwenEndpointAllowed(endpoint, settings.bankingEnvironment);
-      const response = await fetch(endpoint, {
-        method: "POST",
-        redirect: "error",
-        headers,
-        body: JSON.stringify({
+
+      const controller = new AbortController();
+      let timedOut = false;
+      let cancelled = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutSeconds * 1000);
+      const cancellation = token?.onCancellationRequested(() => {
+        cancelled = true;
+        controller.abort();
+      });
+
+      try {
+        markRequestStarted();
+        const requestBody: Record<string, unknown> = {
           model: requestModel,
           messages,
           temperature,
           max_tokens: Math.floor(maxTokens),
           stream: false
-        }),
-        signal: controller.signal
-      });
-
-      if (response.status === 401 || response.status === 403) {
-        throw new Error("Qwen isteği yetkisiz döndü. API key ayarını kontrol edin.");
-      }
-      if (!response.ok) {
-        throw new Error(`Qwen HTTP hatası: ${response.status} ${response.statusText}. Sunucu hata gövdesi güvenlik nedeniyle kaydedilmedi.`);
-      }
-
-      let data: QwenResponse;
-      try {
-        data = (await response.json()) as QwenResponse;
-      } catch {
-        throw new Error("Qwen yanıtı geçerli JSON içermiyor.");
-      }
-      if (token?.isCancellationRequested || cancelled) {
-        throw new QwenRequestCancelledError();
-      }
-
-      const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text;
-      if (typeof content !== "string" || !content.trim()) {
-        throw new Error("Qwen yanıtı geçersiz veya boş: choices[0].message.content ya da choices[0].text bulunamadı.");
-      }
-      const responseModel = data.model?.trim() || requestModel;
-      if (settings.bankingEnvironment && !isApprovedBankingResponseModel(responseModel)) {
-        throw new Error(`Banking environment rejected unexpected Qwen model response '${responseModel}'.`);
-      }
-
-      return {
-        content,
-        finishReason: data.choices?.[0]?.finish_reason ?? undefined,
-        model: responseModel,
-        requestId: data.id,
-        usage: {
-          promptTokens: finiteOptionalNumber(data.usage?.prompt_tokens),
-          completionTokens: finiteOptionalNumber(data.usage?.completion_tokens),
-          totalTokens: finiteOptionalNumber(data.usage?.total_tokens)
+        };
+        if (topP !== undefined) {
+          requestBody.top_p = topP;
         }
-      };
-    } catch (error) {
-      throw normalizeQwenError(error, {
-        cancelled: cancelled || Boolean(token?.isCancellationRequested),
-        timedOut,
-        timeoutSeconds
-      });
-    } finally {
-      clearTimeout(timeout);
-      cancellation?.dispose();
-    }
+        if (topK !== undefined) {
+          requestBody.top_k = topK;
+        }
+        if (presencePenalty !== undefined) {
+          requestBody.presence_penalty = presencePenalty;
+        }
+        if (options.enableThinking !== undefined) {
+          if (isDashScopeEndpoint(endpoint)) {
+            requestBody.enable_thinking = options.enableThinking;
+          } else {
+            requestBody.chat_template_kwargs = { enable_thinking: options.enableThinking };
+          }
+        }
+        const response = await fetch(endpoint, {
+          method: "POST",
+          redirect: "error",
+          headers,
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        });
+
+        if (response.status === 401 || response.status === 403) {
+          throw new Error("Qwen isteği yetkisiz döndü. API key ayarını kontrol edin.");
+        }
+        if (!response.ok) {
+          throw new Error(`Qwen HTTP hatası: ${response.status} ${response.statusText}. Sunucu hata gövdesi güvenlik nedeniyle kaydedilmedi.`);
+        }
+
+        let data: QwenResponse;
+        try {
+          data = (await response.json()) as QwenResponse;
+        } catch {
+          throw new Error("Qwen yanıtı geçerli JSON içermiyor.");
+        }
+        if (token?.isCancellationRequested || cancelled) {
+          throw new QwenRequestCancelledError();
+        }
+
+        const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text;
+        if (typeof content !== "string" || !content.trim()) {
+          throw new Error("Qwen yanıtı geçersiz veya boş: choices[0].message.content ya da choices[0].text bulunamadı.");
+        }
+        const responseModel = data.model?.trim() || requestModel;
+        if (settings.bankingEnvironment && !isApprovedBankingResponseModel(responseModel)) {
+          throw new Error(`Banking environment rejected unexpected Qwen model response '${responseModel}'.`);
+        }
+
+        return {
+          content,
+          finishReason: data.choices?.[0]?.finish_reason ?? undefined,
+          model: responseModel,
+          requestId: data.id,
+          usage: {
+            promptTokens: finiteOptionalNumber(data.usage?.prompt_tokens),
+            completionTokens: finiteOptionalNumber(data.usage?.completion_tokens),
+            totalTokens: finiteOptionalNumber(data.usage?.total_tokens)
+          }
+        };
+      } catch (error) {
+        throw normalizeQwenError(error, {
+          cancelled: cancelled || Boolean(token?.isCancellationRequested),
+          timedOut,
+          timeoutSeconds
+        });
+      } finally {
+        clearTimeout(timeout);
+        cancellation?.dispose();
+      }
+    });
   }
 
   async testConnection(): Promise<QwenConnectionResult> {
@@ -221,6 +259,7 @@ export class QwenClient implements IQwenClient {
         },
         { role: "user", content: "Return exactly this JSON: {\"ok\":true}" }
       ], {
+        enableThinking: false,
         maxTokens: 64,
         timeoutSeconds: settings.timeoutSeconds
       });
@@ -244,6 +283,47 @@ export class QwenClient implements IQwenClient {
     }
   }
 }
+
+class QwenRequestCoordinator {
+  private tail: Promise<void> = Promise.resolve();
+  private nextRequestNotBefore = 0;
+
+  async run<T>(
+    delaySeconds: number,
+    token: vscode.CancellationToken | undefined,
+    operation: (markRequestStarted: () => void) => Promise<T>
+  ): Promise<T> {
+    const previous = this.tail.catch(() => undefined);
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.tail = previous.then(() => done);
+    let requestStarted = false;
+
+    try {
+      await waitForPromise(previous, token);
+      const remainingDelay = Math.max(0, this.nextRequestNotBefore - Date.now());
+      await cancellableDelay(remainingDelay, token);
+      if (token?.isCancellationRequested) {
+        throw new QwenRequestCancelledError();
+      }
+      return await operation(() => {
+        requestStarted = true;
+      });
+    } finally {
+      if (requestStarted) {
+        this.nextRequestNotBefore = Math.max(
+          this.nextRequestNotBefore,
+          Date.now() + Math.round(delaySeconds * 1000)
+        );
+      }
+      release();
+    }
+  }
+}
+
+const qwenRequestCoordinator = new QwenRequestCoordinator();
 
 export function normalizeChatCompletionsEndpoint(endpoint: string): string {
   const trimmed = endpoint.trim().replace(/\/+$/, "");
@@ -358,6 +438,110 @@ function positiveNumber(value: number, label: string): number {
   return finite;
 }
 
+function boundedNumber(value: number, label: string, minimum: number, maximum: number): number {
+  const finite = finiteNumber(value, label);
+  if (finite < minimum || finite > maximum) {
+    throw new Error(`${label} ayarı ${minimum}-${maximum} aralığında olmalıdır.`);
+  }
+  return finite;
+}
+
+function boundedPositiveInteger(value: number, label: string, maximum: number): number {
+  const finite = positiveNumber(value, label);
+  if (!Number.isSafeInteger(finite) || finite > maximum) {
+    throw new Error(`${label} ayarı en fazla ${maximum} olan pozitif bir tam sayı olmalıdır.`);
+  }
+  return finite;
+}
+
+function boundedNonNegativeNumber(value: number, label: string, maximum: number): number {
+  const finite = finiteNumber(value, label);
+  if (finite < 0 || finite > maximum) {
+    throw new Error(`${label} ayarı 0-${maximum} aralığında olmalıdır.`);
+  }
+  return finite;
+}
+
+async function waitForPromise(
+  promise: Promise<void>,
+  token?: vscode.CancellationToken
+): Promise<void> {
+  if (!token) {
+    await promise;
+    return;
+  }
+  if (token.isCancellationRequested) {
+    throw new QwenRequestCancelledError();
+  }
+
+  let cancellation: vscode.Disposable | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        callback();
+      };
+      cancellation = token.onCancellationRequested(() => {
+        finish(() => reject(new QwenRequestCancelledError()));
+      });
+      promise.then(
+        () => finish(resolve),
+        (error) => finish(() => reject(error))
+      );
+    });
+  } finally {
+    cancellation?.dispose();
+  }
+}
+
+async function cancellableDelay(milliseconds: number, token?: vscode.CancellationToken): Promise<void> {
+  if (token?.isCancellationRequested) {
+    throw new QwenRequestCancelledError();
+  }
+  if (milliseconds <= 0) {
+    return;
+  }
+
+  let cancellation: vscode.Disposable | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        callback();
+      };
+      timer = setTimeout(() => finish(resolve), milliseconds);
+      cancellation = token?.onCancellationRequested(() => {
+        finish(() => reject(new QwenRequestCancelledError()));
+      });
+    });
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    cancellation?.dispose();
+  }
+}
+
 function finiteOptionalNumber(value: number | undefined): number | undefined {
   return value !== undefined && Number.isFinite(value) ? value : undefined;
+}
+
+function isDashScopeEndpoint(endpoint: string): boolean {
+  try {
+    return /(?:^|\.)dashscope(?:-intl)?\.aliyuncs\.com$/i.test(new URL(endpoint).hostname);
+  } catch {
+    return false;
+  }
 }

@@ -230,7 +230,7 @@ export async function generateQwenPageSemanticsCommand(context: vscode.Extension
     vscode.window.showWarningMessage("Bank Spring Docs: Once coklu repo manifesti kaydet.");
     return undefined;
   }
-  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
+  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", true)) {
     vscode.window.showWarningMessage("Bank Spring Docs: Qwen semantik analiz aktif degil. Panelden etkinlestirip ayarlari kaydet.");
     return manifest;
   }
@@ -446,7 +446,7 @@ export async function generateMultiRepoAgenticCopilotDocsCommand(context: vscode
 
           ensureNotCancelled();
           const shouldRunQwen = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("multiRepo.agenticRunQwenSemantics", true);
-          const qwenEnabled = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false);
+          const qwenEnabled = vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", true);
           if (runStatus.isPhaseReusable("qwen-semantics")) {
             progress.report({ message: "Qwen semantiği önceki çalışmadan yeniden kullanılıyor..." });
           } else if (shouldRunQwen && qwenEnabled) {

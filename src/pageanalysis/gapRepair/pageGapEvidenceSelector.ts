@@ -3,11 +3,17 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { PageGapRepairPlan } from "./pageGapRepairPlanner";
 
-export interface PageRepairContextOptions {
+export type PageRepairContextOptions = {
   mode: "qwen3-target-first";
   /** Exact ceiling for the returned repair context, including headings and separators. */
   maxCharacters: number;
-}
+} | {
+  mode: "configured-provider";
+  /** Provider-aware decision made by the caller; the Copilot-only toggle must not leak into Qwen. */
+  includeQwenSemantics: boolean;
+  /** Exact ceiling for the returned repair context, including headings and separators. */
+  maxCharacters: number;
+};
 
 export async function buildRepairContext(
   pageRoot: string,
@@ -18,23 +24,38 @@ export async function buildRepairContext(
     return buildQwen3TargetFirstContext(pageRoot, plan, options.maxCharacters);
   }
 
-  // Keep the established Copilot/configured-provider path byte-for-byte compatible.
-  const parts = [
+  const maxCharacters = options?.mode === "configured-provider"
+    ? options.maxCharacters
+    : vscode.workspace.getConfiguration("bankSpringDocs").get<number>("copilot.maxContextCharacters", 24000);
+  const includeQwenSemantics = options?.mode === "configured-provider"
+    ? options.includeQwenSemantics
+    : true;
+  const [draft, evidence, pageContext, pageSemantics, interactionSemantics] = await Promise.all([
+    readFreshOptional(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"]),
+    readOptional(path.join(pageRoot, "page-evidence-pack.md")),
+    readOptional(path.join(pageRoot, "page-context-pack.md")),
+    includeQwenSemantics
+      ? readFreshOptional(pageRoot, "qwen-page-semantics.json", ["page-context-pack.md", "page-evidence-pack.md"])
+      : Promise.resolve(""),
+    includeQwenSemantics
+      ? readFreshOptional(pageRoot, "qwen-interaction-semantics.jsonl", ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"])
+      : Promise.resolve("")
+  ]);
+
+  const fixed = [
     ["Detected Gaps", JSON.stringify(plan.gaps, null, 2)],
     ["Target Sections", plan.targetSections.map((section) => `- ${section}`).join("\n")],
-    ["Suggested Evidence", plan.evidenceFiles.map((file) => `- ${file}`).join("\n")],
-    ["Page Context Pack", await readOptional(path.join(pageRoot, "page-context-pack.md"))],
-    ["Page Evidence Pack", await readOptional(path.join(pageRoot, "page-evidence-pack.md"))],
-    ["Qwen Page Semantics", await readFreshOptional(pageRoot, "qwen-page-semantics.json", ["page-context-pack.md", "page-evidence-pack.md"])],
-    ["Qwen Interaction Semantics", await readFreshOptional(pageRoot, "qwen-interaction-semantics.jsonl", ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"])],
-    ["Copilot Draft", await readFreshOptional(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"])]
-  ];
-  const context = parts
-    .filter(([, content]) => Boolean(content))
-    .map(([title, content]) => `## ${title}\n${content}`)
-    .join("\n\n---\n\n");
-  const maxCharacters = vscode.workspace.getConfiguration("bankSpringDocs").get<number>("copilot.maxContextCharacters", 24000);
-  return context.length <= maxCharacters ? context : `${context.slice(0, maxCharacters)}\n[REPAIR_CONTEXT_TRUNCATED_FOR_TOKEN_LIMIT]`;
+    ["Suggested Evidence", plan.evidenceFiles.map((file) => `- ${file}`).join("\n")]
+  ] as Array<[string, string]>;
+  const prioritized = [
+    ["Copilot Draft", selectRelevantMarkdown(draft, plan), 5],
+    ["Page Evidence Pack", selectRelevantMarkdown(evidence, plan), 5],
+    ["Page Context Pack", selectRelevantMarkdown(pageContext, plan), 3],
+    ["Qwen Page Semantics", pageSemantics, 1],
+    ["Qwen Interaction Semantics", interactionSemantics, 1]
+  ] as Array<[string, string, number]>;
+
+  return assembleWeightedContext(fixed, prioritized, maxCharacters);
 }
 
 async function buildQwen3TargetFirstContext(
@@ -46,28 +67,40 @@ async function buildQwen3TargetFirstContext(
     throw new Error("Qwen3 repair context budget must be an integer of at least 1000 characters.");
   }
 
-  const [draft, evidence, pageSemantics, interactionSemantics, pageContext] = await Promise.all([
+  const qwenPlan = withoutQwenSemanticArtifacts(plan);
+  const [draft, evidence, pageContext, pageFlow] = await Promise.all([
     readFreshOptional(pageRoot, "copilot-draft.md", ["page-context-pack.md", "page-evidence-pack.md"]),
     readOptional(path.join(pageRoot, "page-evidence-pack.md")),
-    readFreshOptional(pageRoot, "qwen-page-semantics.json", ["page-context-pack.md", "page-evidence-pack.md"]),
-    readFreshOptional(pageRoot, "qwen-interaction-semantics.jsonl", ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"]),
-    readOptional(path.join(pageRoot, "page-context-pack.md"))
+    readOptional(path.join(pageRoot, "page-context-pack.md")),
+    readOptional(path.join(pageRoot, "page-flow.json"))
   ]);
 
   const fixed = [
-    ["Detected Gaps", JSON.stringify(plan.gaps, null, 2)],
-    ["Target Sections", plan.targetSections.map((section) => `- ${section}`).join("\n")],
-    ["Suggested Evidence", plan.evidenceFiles.map((file) => `- ${file}`).join("\n")]
+    ["Detected Gaps", JSON.stringify(qwenPlan.gaps, null, 2)],
+    ["Target Sections", qwenPlan.targetSections.map((section) => `- ${section}`).join("\n")],
+    ["Suggested Evidence", qwenPlan.evidenceFiles.map((file) => `- ${file}`).join("\n")]
   ] as Array<[string, string]>;
   const prioritized = [
-    ["Current AI Draft - Target Sections", selectRelevantMarkdown(draft, plan), 5],
-    ["Relevant Page Evidence", selectRelevantMarkdown(evidence, plan), 5],
-    ["Qwen Page Semantics", pageSemantics, 2],
-    ["Qwen Interaction Semantics", interactionSemantics, 2],
-    ["Page Context Pack", pageContext, 1]
+    ["Current AI Draft - Target Sections", selectRelevantMarkdown(draft, qwenPlan), 5],
+    ["Relevant Page Evidence", selectRelevantMarkdown(evidence, qwenPlan), 5],
+    ["Page Flow", pageFlow, 3],
+    ["Page Context Pack", selectRelevantMarkdown(pageContext, qwenPlan), 2]
   ] as Array<[string, string, number]>;
 
   return assembleWeightedContext(fixed, prioritized, maxCharacters);
+}
+
+function withoutQwenSemanticArtifacts(plan: PageGapRepairPlan): PageGapRepairPlan {
+  const keep = (file: string) => !/^qwen-(?:page|interaction)-semantics\.(?:json|jsonl)$/i.test(path.basename(file));
+  const gaps = plan.gaps.map((gap) => ({
+    ...gap,
+    suggestedEvidence: gap.suggestedEvidence.filter(keep)
+  }));
+  return {
+    gaps,
+    targetSections: [...plan.targetSections],
+    evidenceFiles: plan.evidenceFiles.filter(keep)
+  };
 }
 
 function assembleWeightedContext(

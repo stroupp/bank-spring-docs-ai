@@ -53,10 +53,13 @@ export async function sourceContextFromFiles(
   maxFileCharacters: number,
   maxTotalCharacters: number
 ): Promise<FocusedSourceContextResult> {
-  const chunks: string[] = [];
-  const included: string[] = [];
-  let used = 0;
-  for (const file of dedupe(files.map(normalizeRelativePath).filter((value): value is string => Boolean(value)))) {
+  if (maxFileCharacters <= 0 || maxTotalCharacters <= 0) {
+    return { content: "", files: [] };
+  }
+
+  const readable: Array<{ file: string; content: string }> = [];
+  const prioritizedFiles = dedupe(files.map(normalizeRelativePath).filter((value): value is string => Boolean(value)));
+  for (const file of prioritizedFiles.slice(0, maxCandidateFiles)) {
     const fullPath = path.resolve(repoRoot, file);
     if (!isWithin(repoRoot, fullPath)) {
       continue;
@@ -65,15 +68,81 @@ export async function sourceContextFromFiles(
     if (!content) {
       continue;
     }
-    const chunk = `### ${file}\n\`\`\`\n${content}\n\`\`\``;
-    if (used + chunk.length > maxTotalCharacters) {
-      break;
-    }
-    chunks.push(chunk);
-    included.push(file);
-    used += chunk.length;
+    readable.push({ file, content });
   }
-  return { content: chunks.join("\n\n"), files: included };
+
+  const candidates: Array<{ file: string; content: string }> = [];
+  let reserved = 0;
+  for (const candidate of readable) {
+    const separatorCharacters = candidates.length ? 2 : 0;
+    const usefulMinimum = Math.min(candidate.content.length, minimumFileContentCharacters);
+    const candidateReservation = fixedRenderingCharacters([candidate]) + separatorCharacters + usefulMinimum;
+    if (reserved + candidateReservation <= maxTotalCharacters) {
+      candidates.push(candidate);
+      reserved += candidateReservation;
+    }
+  }
+  if (!candidates.length) {
+    return { content: "", files: [] };
+  }
+
+  const contentBudget = maxTotalCharacters - fixedRenderingCharacters(candidates);
+  const allocations = fairAllocations(candidates.map((candidate) => candidate.content.length), contentBudget);
+  const chunks = candidates.map((candidate, index) => {
+    const content = boundedContent(candidate.content, allocations[index]);
+    return `### ${candidate.file}\n\`\`\`\n${content}\n\`\`\``;
+  });
+  return { content: chunks.join("\n\n"), files: candidates.map((candidate) => candidate.file) };
+}
+
+const maxCandidateFiles = 80;
+const minimumFileContentCharacters = 256;
+
+function fixedRenderingCharacters(candidates: Array<{ file: string }>): number {
+  const wrappers = candidates.reduce((total, candidate) => total + `### ${candidate.file}\n\`\`\`\n\n\`\`\``.length, 0);
+  return wrappers + Math.max(0, candidates.length - 1) * 2;
+}
+
+function fairAllocations(capacities: number[], total: number): number[] {
+  const allocations = capacities.map(() => 0);
+  const remaining = new Set(capacities.map((_, index) => index));
+  let available = Math.max(0, total);
+
+  while (remaining.size > 0 && available > 0) {
+    const share = Math.floor(available / remaining.size);
+    let satisfied = false;
+    for (const index of [...remaining]) {
+      if (capacities[index] <= share) {
+        allocations[index] = capacities[index];
+        available -= capacities[index];
+        remaining.delete(index);
+        satisfied = true;
+      }
+    }
+    if (satisfied) {
+      continue;
+    }
+    const indexes = [...remaining];
+    indexes.forEach((index, position) => {
+      const extra = position < available % indexes.length ? 1 : 0;
+      allocations[index] = share + extra;
+    });
+    available = 0;
+  }
+  return allocations;
+}
+
+function boundedContent(content: string, maxCharacters: number): string {
+  if (content.length <= maxCharacters) {
+    return content;
+  }
+  const marker = "\n[FILE_EVIDENCE_TRUNCATED]";
+  if (maxCharacters <= marker.length) {
+    return content.slice(0, maxCharacters);
+  }
+  const available = maxCharacters - marker.length;
+  const head = Math.ceil(available * 0.75);
+  return `${content.slice(0, head)}${marker}${content.slice(content.length - (available - head))}`;
 }
 
 async function readIndexRecords(indexPath: string): Promise<Array<Record<string, unknown>>> {
@@ -353,5 +422,5 @@ function isWithin(parent: string, child: string): boolean {
 }
 
 function dedupe(values: string[]): string[] {
-  return [...new Set(values)].sort();
+  return [...new Set(values)];
 }

@@ -58,7 +58,7 @@ http://localhost:11434/v1/chat/completions
 Örnek model adları:
 
 ```text
-qwen3
+Qwen/Qwen3.6-27B
 qwen3-coder
 qwen2.5-coder
 ```
@@ -74,19 +74,25 @@ Method: POST
 Content-Type: application/json
 model: ONIKS
 temperature: 0.6
-max_tokens: 163849
+max_tokens: 16384
 Authorization: not sent
 ```
+
+Banking form presetleri yarım Qwen3.6-27B profili olarak `maxTokens=16384`, `contextWindowTokens=131072`, `generationMaxTokens=16384` ve analysis/reduce/synthesis `16384` değerlerini kullanır. Bunlar yalnız model-kapasitesi başlangıç değerleridir; endpoint deployment'ının gerçek limitleri daha düşükse özellikle `contextWindowTokens` o gerçek `max_model_len` değerine indirilmelidir.
 
 When the banking settings are saved or tested, the explicitly pasted host is approved only in machine-scoped VS Code settings. Banking mode validates HTTPS and the exact `/v1/chat/completions` path; ports, alternate paths, query strings, embedded credentials, and redirects are rejected. No institutional host is stored in the repository. `ONIKS` is treated as an approved Qwen3 deployment alias only inside this machine-scoped banking mode.
 
 `Qwen Bağlantısını Test Et` saves the visible settings and sends a real, short system/user probe that requests `{"ok":true}` with a fixed 64-token output cap. The result, effective model, and endpoint are displayed inside the modal. The probe does not include repository source and never inherits a very large configured generation cap. Full document generation keeps using the separate bounded `bankSpringDocs.qwen.generationMaxTokens` and `bankSpringDocs.qwen.contextWindowTokens` settings.
 
-## Selected-Page Qwen3-Only Mode
+## Selected-Page Qwen3.6-Only Mode
 
-The selected-page panel has a `Bu sayfanin tum AI adimlarini yalnizca Qwen3 ile calistir` checkbox. It is off by default and does not change `bankSpringDocs.ai.provider`. When enabled, the full-page command creates one explicit Qwen3 client snapshot for semantic analysis, drafting, and gap repair; every provider/model response is validated and the pipeline never falls back to Copilot. The existing deterministic context, final-document, and quality stages remain in place.
+The selected-page panel has a `Bu sayfanin tum AI adimlarini yalnizca Qwen3.6 ile calistir` checkbox. It is on by default for fresh installations and does not change `bankSpringDocs.ai.provider`. When enabled, the full-page command creates one explicit Qwen3.6 client snapshot and runs deterministic page-flow/context/evidence artifacts directly through evidence ledgers, bounded reduction, grouped synthesis, and evidence-backed gap repair. It never runs the Qwen semantic pre-pass and never falls back to Copilot. The existing deterministic final-document and quality stages remain in place.
+
+Copilot page analysis also has an advanced `Copilot sayfa analizinde Qwen semantik on adimini ve context'ini kullan` checkbox, backed by `bankSpringDocs.pageAnalysis.copilotQwenSemanticPrepassEnabled`. It is off by default. Enabling it lets Qwen enrich the separate Copilot workflow; disabling it keeps semantic artifacts out of Copilot draft/repair context. Qwen-only analysis always bypasses this semantic pre-pass and excludes old semantic artifacts from iterative context and repair. Copilot context is packed by balanced Markdown sections so late BFF, Feign/outbound, and BE evidence cannot be starved by a large leading UI section. Per-artifact source/sent/truncation decisions are recorded in `copilot-draft-context-selection.json`.
 
 Large UI/BFF/BE pages are processed as bounded evidence chunks. The pipeline reads only source files linked to the selected page flow, shares the raw-source budget fairly across UI, BFF, and BE, masks secrets, stores each masked prompt/context/output, recursively reduces evidence ledgers when needed, and resumes completed steps after cancellation or failure.
+
+Qwen-only publishing also creates an evidence-bound `UML ve Akış Diyagramları` section without another model request. Mermaid source and the local `page-flow-uml.svg` fallback are generated deterministically from `page-flow.json`, so the final Markdown preview can display UI → BFF → BE → repository/entity mappings even when Mermaid rendering is unavailable. Opening or completing a final page analysis opens the Markdown preview beside the source document.
 
 Generated artifacts are written under the selected page output:
 
@@ -98,19 +104,22 @@ copilot-draft.md                 # compatibility contract for gap/final/quality 
 .qwen3-page-draft/runs/<input-hash>/steps/*-prompt.md
 ```
 
-The advanced limits are `bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxTotalSourceCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxModelCalls`, and `bankSpringDocs.pageAnalysis.qwenMaxReduceLevels`. Input request size is derived conservatively from `bankSpringDocs.qwen.contextWindowTokens` and the largest phase-specific output budget.
+The advanced limits are `bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxTotalSourceCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxModelCalls`, and `bankSpringDocs.pageAnalysis.qwenMaxReduceLevels`. Input request size is derived conservatively from `bankSpringDocs.qwen.contextWindowTokens` and the largest phase-specific output budget. Every Qwen path shares one FIFO request gate in the VS Code extension host, so separate commands and client instances cannot overlap HTTP requests. `bankSpringDocs.qwen.interRequestDelaySeconds` starts after a response/error settles and delays only the next queued Qwen call; its default is 15 seconds and `0` disables it. Retries re-enter the same queue.
 
-Qwen-only page analysis uses separate bounded output budgets for semantic/chunk analysis, ledger reduction, and grouped final synthesis. Transient `429`, `502`, `503`, `504`, and network-timeout failures are retried with bounded exponential backoff. Size-correlated `413`, context-window, output-length, and exhausted timeout/504 failures split only the affected evidence chunk into smaller overlapping children; capacity errors such as persistent `503` are not multiplied through adaptive splitting. Final section groups also subdivide after a size-correlated failure. Completed sibling steps remain resumable, and synthesis-only tuning reuses unchanged evidence maps.
+Qwen-only page analysis uses separate bounded output budgets for evidence chunk analysis, ledger reduction, and grouped final synthesis. Transient `429`, `502`, `503`, `504`, and network-timeout failures are retried with bounded exponential backoff. Size-correlated `413`, context-window, output-length, and exhausted timeout/504 failures split only the affected evidence chunk into smaller overlapping children; capacity errors such as persistent `503` are not multiplied through adaptive splitting. Final section groups also subdivide after a size-correlated failure. Completed sibling steps remain resumable, and synthesis-only tuning reuses unchanged evidence maps.
+
+For Qwen3.6, evidence and ledger-reduce requests use the official non-thinking profile (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `presence_penalty=1.5`); synthesis and genuine gap repair use the precise-coding thinking profile (`temperature=0.6`, `top_p=0.95`, `top_k=20`, `presence_penalty=0`). Local/banking vLLM requests send `chat_template_kwargs.enable_thinking`; DashScope-compatible endpoints use top-level `enable_thinking`.
 
 Extracted findings are retained as facts only when their source reference is the supplied chunk label or a visible path in that chunk; otherwise they are demoted to uncertainties. Aggregate source references and uncertainties are projected into their final canonical sections. Qwen gap repair uses one target section per request with the full configured synthesis ceiling, and a missing repair heading is omitted so it cannot overwrite a useful existing draft section. The Copilot page-draft and repair paths do not use these Qwen-only controls.
 
-For a deployment whose real total model context is 16K, a conservative starting point is:
+For a deployment whose real total model context is still 16K, use this lower compatibility profile instead of the Qwen3.6 half-capacity defaults:
 
 ```json
 {
-  "bankSpringDocs.qwen.contextWindowTokens": 16384,
+  "bankSpringDocs.qwen.contextWindowTokens": 16000,
   "bankSpringDocs.qwen.generationMaxTokens": 4096,
   "bankSpringDocs.qwen.maxTokens": 4096,
+  "bankSpringDocs.qwen.interRequestDelaySeconds": 15,
   "bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens": 2048,
   "bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens": 3072,
   "bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens": 4096
@@ -129,14 +138,22 @@ All model-backed documentation stages can use either GitHub Copilot or the confi
   "bankSpringDocs.qwen.enabled": true,
   "bankSpringDocs.qwen.endpoint": "http://localhost:8000/v1/chat/completions",
   "bankSpringDocs.qwen.allowedHosts": ["localhost", "127.0.0.1", "::1"],
-  "bankSpringDocs.qwen.model": "qwen3-30b-a3b-instruct",
+  "bankSpringDocs.qwen.model": "Qwen/Qwen3.6-27B",
+  "bankSpringDocs.qwen.temperature": 0.6,
   "bankSpringDocs.qwen.contextWindowTokens": 131072,
+  "bankSpringDocs.qwen.maxTokens": 16384,
   "bankSpringDocs.qwen.generationMaxTokens": 16384,
-  "bankSpringDocs.qwen.generationTimeoutSeconds": 600
+  "bankSpringDocs.qwen.interRequestDelaySeconds": 15,
+  "bankSpringDocs.qwen.generationTimeoutSeconds": 600,
+  "bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens": 16384,
+  "bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens": 16384,
+  "bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens": 16384
 }
 ```
 
-The default provider remains `copilot`. There is no automatic fallback between providers. Existing Copilot command IDs and artifact filenames are retained for compatibility, while audits record the provider and model actually used.
+Fresh installations default to the Qwen provider, enable Qwen, select `Qwen/Qwen3.6-27B`, and enable selected-page Qwen-only mode. There is no automatic fallback between providers. Existing Copilot selections and command IDs remain available and artifact filenames are retained for compatibility, while audits record the provider and model actually used.
+
+Qwen3.6 supports a native 262144-token context and recommends 32768 output tokens for most queries. The defaults intentionally use half of both capacities: 131072 context and 16384 output. `bankSpringDocs.qwen.contextWindowTokens` must still reflect the endpoint deployment's real `max_model_len`; do not use 131072 when an internal gateway or vLLM deployment exposes a smaller limit.
 
 Qwen calls require a trusted VS Code workspace. The endpoint and exact-host allowlist are machine-scoped settings, so repository workspace settings cannot redirect evidence. Saving or testing banking mode approves the explicitly pasted host there; non-banking hosts can be managed through `bankSpringDocs.qwen.allowedHosts`, and loopback hosts are allowed by default.
 

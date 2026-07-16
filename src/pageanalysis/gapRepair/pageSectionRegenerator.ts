@@ -9,7 +9,11 @@ import { atomicWriteFile } from "../../storage/atomicFile";
 import { PageDocGap } from "../gapDetection/pageDocGapDetector";
 import { qwenPageDocumentSections } from "../qwenPageDraftPrompts";
 import { buildRepairContext } from "./pageGapEvidenceSelector";
-import { buildPageGapRepairPlan, PageGapRepairPlan } from "./pageGapRepairPlanner";
+import {
+  buildPageGapRepairPlan,
+  PageGapRepairPlan,
+  selectGenuinelyWeakQwenGaps
+} from "./pageGapRepairPlanner";
 
 export interface PageSectionRepairResult {
   repairedContextPath: string;
@@ -28,6 +32,8 @@ export interface Qwen3PageSectionRepairOptions {
   retryBaseDelayMs?: number;
   onModelCall?: (phase: "repair") => void;
   expectedModelMarker?: string;
+  /** Optional bounded candidate set; Qwen auto-repair eligibility is still enforced deterministically. */
+  gaps?: readonly PageDocGap[];
 }
 
 interface NormalizedQwen3PageSectionRepairOptions {
@@ -38,6 +44,7 @@ interface NormalizedQwen3PageSectionRepairOptions {
   retryBaseDelayMs: number;
   onModelCall?: (phase: "repair") => void;
   expectedModelMarker: string;
+  gaps?: readonly PageDocGap[];
 }
 
 interface QwenRepairGroup {
@@ -100,7 +107,13 @@ export class PageSectionRegenerator {
     await fs.mkdir(pageRoot, { recursive: true });
     const gaps = JSON.parse(await fs.readFile(path.join(pageRoot, "detected-gaps.json"), "utf8")) as PageDocGap[];
     const plan = buildPageGapRepairPlan(gaps);
-    const rawContext = await buildRepairContext(pageRoot, plan);
+    const config = vscode.workspace.getConfiguration("bankSpringDocs");
+    const rawContext = await buildRepairContext(pageRoot, plan, {
+      mode: "configured-provider",
+      includeQwenSemantics: this.client.provider === "copilot"
+        && config.get<boolean>("pageAnalysis.copilotQwenSemanticPrepassEnabled", false),
+      maxCharacters: config.get<number>("copilot.maxContextCharacters", 24000)
+    });
     const safe = maskSecretsWithStats(rawContext);
     const repairedContextPath = path.join(pageRoot, "repaired-context-pack.md");
     const repairedSectionsPath = path.join(pageRoot, "repaired-sections.md");
@@ -172,7 +185,10 @@ export class PageSectionRegenerator {
   ): Promise<PageSectionRepairResult> {
     await fs.mkdir(pageRoot, { recursive: true });
     ensureRepairNotCancelled(token);
-    const gaps = JSON.parse(await fs.readFile(path.join(pageRoot, "detected-gaps.json"), "utf8")) as PageDocGap[];
+    const candidateGaps = options.gaps
+      ? [...options.gaps]
+      : JSON.parse(await fs.readFile(path.join(pageRoot, "detected-gaps.json"), "utf8")) as PageDocGap[];
+    const gaps = selectGenuinelyWeakQwenGaps(candidateGaps);
     const plan = buildPageGapRepairPlan(gaps);
     const groups = buildQwenRepairGroups(plan, options.maxOutputTokens);
     const repairedContextPath = path.join(pageRoot, "repaired-context-pack.md");
@@ -444,10 +460,13 @@ function buildQwenRepairGroups(plan: PageGapRepairPlan, maxOutputTokens?: number
 }
 
 function qwenSectionsPerRequest(maxOutputTokens?: number): number {
-  // Gap sections are quality-sensitive and can be much denser than ordinary
-  // prose. One target per request prevents a long section from starving its
-  // siblings and lets it use the complete configured synthesis ceiling.
-  return 1;
+  // Two sections amortize request overhead even with a small completion
+  // budget. A third section is used only when the configured ceiling leaves
+  // roughly 900 tokens per section plus a fixed response allowance.
+  if (maxOutputTokens === undefined) {
+    return 2;
+  }
+  return maxOutputTokens >= 3212 ? 3 : 2;
 }
 
 function qwenRequestOutputTokens(sectionCount: number, maxOutputTokens?: number): number | undefined {
@@ -683,9 +702,10 @@ function normalizeQwenOptions(options: Qwen3PageSectionRepairOptions): Normalize
     maxInputCharacters: options.maxInputCharacters,
     maxOutputTokens: configuredOutputTokens,
     maxGatewayRetries: boundedNonNegativeInteger(options.maxGatewayRetries ?? 2, "Qwen3 gap repair maxGatewayRetries", 5),
-    retryBaseDelayMs: boundedPositiveInteger(options.retryBaseDelayMs ?? 750, "Qwen3 gap repair retryBaseDelayMs", 30000),
+    retryBaseDelayMs: boundedPositiveInteger(options.retryBaseDelayMs ?? 1000, "Qwen3 gap repair retryBaseDelayMs", 30000),
     onModelCall: options.onModelCall,
-    expectedModelMarker
+    expectedModelMarker,
+    gaps: options.gaps ? [...options.gaps] : undefined
   };
 }
 

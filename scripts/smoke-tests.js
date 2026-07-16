@@ -47,12 +47,29 @@ async function main() {
 async function testAiProviderConfigurationAndUi() {
   const packageJson = JSON.parse(await fs.readFile(path.join(__dirname, "..", "package.json"), "utf8"));
   const properties = packageJson.contributes.configuration.properties;
-  assert.strictEqual(properties["bankSpringDocs.ai.provider"].default, "copilot");
+  assert.strictEqual(properties["bankSpringDocs.ai.provider"].default, "qwen");
   assert.deepStrictEqual(properties["bankSpringDocs.ai.provider"].enum, ["copilot", "qwen"]);
+  assert.strictEqual(properties["bankSpringDocs.qwen.enabled"].default, true);
+  assert.strictEqual(properties["bankSpringDocs.qwen.model"].default, "Qwen/Qwen3.6-27B");
+  assert.strictEqual(properties["bankSpringDocs.qwen.temperature"].default, 0.6);
   assert.strictEqual(properties["bankSpringDocs.qwen.generationTimeoutSeconds"].default, 600);
+  assert.strictEqual(properties["bankSpringDocs.qwen.maxTokens"].default, 16384);
   assert.strictEqual(properties["bankSpringDocs.qwen.generationMaxTokens"].default, 16384);
   assert.strictEqual(properties["bankSpringDocs.qwen.contextWindowTokens"].default, 131072);
+  assert.match(properties["bankSpringDocs.qwen.contextWindowTokens"].description, /262144.*max_model_len/i);
+  assert.strictEqual(properties["bankSpringDocs.qwen.interRequestDelaySeconds"].default, 15);
+  assert.strictEqual(properties["bankSpringDocs.qwen.interRequestDelaySeconds"].minimum, 0);
+  assert.strictEqual(properties["bankSpringDocs.qwen.interRequestDelaySeconds"].maximum, 300);
   assert.strictEqual(properties["bankSpringDocs.qwen.bankingEnvironment"].default, false);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenOnly"].default, true);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.copilotQwenSemanticPrepassEnabled"].default, false);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenMaxModelCalls"].default, 32);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenMaxReduceLevels"].default, 3);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens"].default, 16384);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens"].default, 16384);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens"].default, 16384);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenFinalSectionGroupSize"].default, 6);
+  assert.strictEqual(properties["bankSpringDocs.pageAnalysis.qwenRetryBaseDelayMs"].default, 1000);
   assert.strictEqual(properties["bankSpringDocs.qwen.endpoint"].scope, "machine");
   assert.deepStrictEqual(properties["bankSpringDocs.qwen.allowedHosts"].default, ["localhost", "127.0.0.1", "::1"]);
 
@@ -71,6 +88,16 @@ async function testAiProviderConfigurationAndUi() {
     assert.match(source, /qwenModel\.value = "ONIKS"/);
     assert.match(source, /qwenEnabled\.checked = true/);
     assert.match(source, /qwenUseApiKey\.checked = false/);
+    assert.match(source, /id="qwenInterRequestDelaySeconds"[^>]*type="number"[^>]*min="0"[^>]*max="300"/);
+    assert.match(source, /interRequestDelaySeconds: Number\(qwenInterRequestDelaySeconds\.value/);
+    assert.match(source, /qwenInterRequestDelaySeconds\.value = String\(message\.qwen\.interRequestDelaySeconds \?\? 15\)/);
+    assert.match(source, /qwenMaxTokens\.value = "16384"/);
+    assert.match(source, /qwenContextWindowTokens\.value = "131072"/);
+    assert.match(source, /qwenGenerationMaxTokens\.value = "16384"/);
+    assert.match(source, /qwenSynthesisMaxOutputTokens\.value = "16384"/);
+    assert.match(source, /id="copilotQwenSemanticPrepassEnabled"[^>]*type="checkbox"/);
+    assert.match(source, /saveCopilotQwenSemanticPrepass/);
+    assert.match(source, /Qwen-only akışı semantic ön adımı ve eski semantic artifact'leri her zaman atlar/);
   }
 }
 

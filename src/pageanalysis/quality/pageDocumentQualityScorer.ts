@@ -5,6 +5,7 @@ import { buildPageArtifactMetadata, PageArtifactMetadata } from "../pageArtifact
 import { ArtifactFreshnessService } from "../artifactFreshnessService";
 import { PageOutputFreshnessService } from "../pageOutputFreshnessService";
 import { atomicWriteJson } from "../../storage/atomicFile";
+import { sha256 } from "../../utils/hash";
 
 export interface PageQualityMetricExplanation {
   metric: string;
@@ -78,7 +79,18 @@ export class PageDocumentQualityScorer {
     const qwenInteractionAvailable = await exists(path.join(pageRoot, "qwen-interaction-semantics.jsonl"));
     const pageFlow = await readJson(pageFlowPath);
     const selectedPage = pageFlow.selectedPage as Record<string, unknown> | undefined;
-    const finalDoc = await readOptional(finalDocPath) || await readOptional(path.join(pageRoot, "copilot-draft.md"));
+    const draft = await readOptional(path.join(pageRoot, "copilot-draft.md"));
+    const finalDoc = await readOptional(finalDocPath) || draft;
+    const storedContextSelection = await readJson(path.join(pageRoot, "copilot-draft-context-selection.json"));
+    const contextSelection = storedContextSelection.draftHash === sha256(draft)
+      ? storedContextSelection
+      : {};
+    const semanticUsage = resolveSemanticUsage(
+      contextSelection,
+      draft,
+      qwenPageAvailable,
+      qwenInteractionAvailable
+    );
     const finalDocAvailable = await exists(finalDocPath);
     const outputFreshnessDependencies = [
       "page-context-pack.md",
@@ -94,14 +106,14 @@ export class PageDocumentQualityScorer {
     const draftDependencies = [
       "page-context-pack.md",
       "page-evidence-pack.md",
-      ...(qwenPageAvailable ? ["qwen-page-semantics.json"] : []),
-      ...(qwenInteractionAvailable ? ["qwen-interaction-semantics.jsonl"] : [])
+      ...(semanticUsage.pageUsed ? ["qwen-page-semantics.json"] : []),
+      ...(semanticUsage.interactionUsed ? ["qwen-interaction-semantics.jsonl"] : [])
     ];
     outputChecks.push({ target: "copilot-draft.md", dependencies: draftDependencies });
-    if (qwenPageAvailable) {
+    if (semanticUsage.pageUsed) {
       outputChecks.push({ target: "qwen-page-semantics.json", dependencies: ["page-context-pack.md", "page-evidence-pack.md"] });
     }
-    if (qwenInteractionAvailable) {
+    if (semanticUsage.interactionUsed) {
       outputChecks.push({ target: "qwen-interaction-semantics.jsonl", dependencies: ["page-context-pack.md", "page-evidence-pack.md", "page-flow.json"] });
     }
     const outputFreshness = await new PageOutputFreshnessService().checkMany(pageRoot, outputChecks);
@@ -113,7 +125,11 @@ export class PageDocumentQualityScorer {
     const sourceReferenceCount = (finalDoc.match(/src[\\/][^\s)`]+?\.(?:java|ts|tsx|js|jsx|properties|ya?ml|json)/g) ?? []).length;
     const highSeverityGapCount = gaps.filter((gap) => gap.severity === "high").length;
     const qwenFreshnessIssues = outputFreshness.issues.filter((issue) => issue.target.startsWith("qwen-")).length;
-    const qwenSemanticCoverage = qwenPageAvailable ? (qwenFreshnessIssues ? 0.5 : 1) : null;
+    const qwenSemanticCoverage = semanticUsage.disabled
+      ? 0
+      : semanticUsage.pageUsed
+        ? (qwenFreshnessIssues ? 0.5 : 1)
+        : null;
     const finalDocumentLength = finalDoc.length;
     const metricsWithUnknownData = new Set<string>([
       ...(!pageFlowAvailable ? ["page-flow"] : []),
@@ -151,7 +167,18 @@ export class PageDocumentQualityScorer {
       { name: "validation-coverage", value: validationCoverage, weight: 5, reason: validationRecords.length ? `${validationRecords.length} extracted validation records were checked against document text.` : "No selected-page validation evidence is available." },
       { name: "service-flow-coverage", value: serviceFlowCoverage, weight: 4, reason: matchedBeCount ? `${trustedBeServiceFlowCount}/${matchedBeCount} BE matches have non-low-confidence service flows.` : "Service-flow coverage has no matched BE denominator." },
       { name: "repository-entity-coverage", value: repositoryEntityCoverage, weight: 4, reason: trustedBeServiceFlowCount ? `${repositoryEntityRecords.length} trusted repository/entity records were checked against document text.` : "No trusted BE service flow is available." },
-      { name: "qwen-semantic-coverage", value: qwenSemanticCoverage, weight: 2, reason: qwenPageAvailable ? (qwenFreshnessIssues ? "Qwen semantics exist but are stale." : "Fresh Qwen page semantics are available.") : "Qwen semantics are optional and unavailable." }
+      {
+        name: "qwen-semantic-coverage",
+        value: qwenSemanticCoverage,
+        weight: 2,
+        reason: semanticUsage.disabled
+          ? "Qwen semantics were intentionally disabled for the Copilot page flow."
+          : semanticUsage.pageUsed
+            ? (qwenFreshnessIssues ? "Qwen semantics were used but are stale." : "Fresh Qwen page semantics were used by the draft flow.")
+            : semanticUsage.known
+              ? "Qwen semantics are optional and were not used by the draft flow."
+              : "Qwen semantic usage is unknown because draft-bound context-selection metadata is unavailable."
+      }
     ];
     for (const metric of coverageMetrics) {
       if (metric.value === null) {
@@ -279,6 +306,62 @@ export class PageDocumentQualityScorer {
     await atomicWriteJson(path.join(pageRoot, "quality-score.json"), result);
     await appendQuality(multiRepoRoot, result);
     return result;
+  }
+}
+
+function resolveSemanticUsage(
+  selection: Record<string, unknown>,
+  draft: string,
+  pageArtifactAvailable: boolean,
+  interactionArtifactAvailable: boolean
+): { known: boolean; disabled: boolean; pageUsed: boolean; interactionUsed: boolean } {
+  const generation = parseGenerationMetadata(draft);
+  const qwenIterativeDraft = generation.pipeline?.startsWith("qwen3-") ?? false;
+  if (qwenIterativeDraft && typeof generation.qwenSemanticArtifactsUsed === "boolean") {
+    return {
+      known: true,
+      disabled: !generation.qwenSemanticArtifactsUsed,
+      pageUsed: generation.qwenSemanticArtifactsUsed && pageArtifactAvailable,
+      interactionUsed: generation.qwenSemanticArtifactsUsed && interactionArtifactAvailable
+    };
+  }
+  if (qwenIterativeDraft || typeof selection.qwenSemanticArtifactsEnabled !== "boolean") {
+    return {
+      known: qwenIterativeDraft,
+      disabled: false,
+      pageUsed: qwenIterativeDraft && pageArtifactAvailable,
+      interactionUsed: qwenIterativeDraft && interactionArtifactAvailable
+    };
+  }
+  if (!selection.qwenSemanticArtifactsEnabled) {
+    return { known: true, disabled: true, pageUsed: false, interactionUsed: false };
+  }
+  const usedFiles = new Set(asRecords(selection.parts)
+    .filter((part) => part.status === "included" && Number(part.sentCharacters ?? 0) > 0)
+    .map((part) => String(part.fileName ?? "")));
+  return {
+    known: true,
+    disabled: false,
+    pageUsed: pageArtifactAvailable && usedFiles.has("qwen-page-semantics.json"),
+    interactionUsed: interactionArtifactAvailable && usedFiles.has("qwen-interaction-semantics.jsonl")
+  };
+}
+
+function parseGenerationMetadata(markdown: string): { pipeline?: string; qwenSemanticArtifactsUsed?: boolean } {
+  const match = markdown.match(/<!--\s*bank-spring-docs-generation\s+({[^\r\n]*})\s*-->/);
+  if (!match) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(match[1]) as Record<string, unknown>;
+    return {
+      pipeline: parsed.pipeline === undefined ? undefined : String(parsed.pipeline),
+      qwenSemanticArtifactsUsed: typeof parsed.qwenSemanticArtifactsUsed === "boolean"
+        ? parsed.qwenSemanticArtifactsUsed
+        : undefined
+    };
+  } catch {
+    return {};
   }
 }
 

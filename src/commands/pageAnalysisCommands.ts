@@ -17,6 +17,7 @@ import { PagePipelineFreshnessService } from "../pageanalysis/pagePipelineFreshn
 import { QwenPageSemanticAnalyzer } from "../pageanalysis/qwenPageSemanticAnalyzer";
 import { QwenIterativePageDraftGenerator, QwenIterativePageDraftResult } from "../pageanalysis/qwenIterativePageDraftGenerator";
 import { PageSectionRegenerator, Qwen3PageSectionRepairOptions } from "../pageanalysis/gapRepair/pageSectionRegenerator";
+import { selectGenuinelyWeakQwenGaps } from "../pageanalysis/gapRepair/pageGapRepairPlanner";
 import { PageDocumentQualityScorer } from "../pageanalysis/quality/pageDocumentQualityScorer";
 import { PageDocumentQualityReportWriter } from "../pageanalysis/quality/pageDocumentQualityReportWriter";
 import { SelectedPageStateService } from "../pageanalysis/selectedPageStateService";
@@ -159,7 +160,7 @@ export async function generateSelectedPageQwenSemanticsCommand(context: vscode.E
     vscode.window.showWarningMessage("Bank Spring Docs: Ã–nce sayfa listesinden bir sayfa seÃ§.");
     return;
   }
-  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
+  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", true)) {
     vscode.window.showWarningMessage("Bank Spring Docs: Qwen semantik analiz aktif deÄŸil. Panelden etkinleÅŸtirip ayarlarÄ± kaydet.");
     return;
   }
@@ -222,8 +223,17 @@ export async function generateSelectedPageCopilotDraftCommand(context: vscode.Ex
       },
       async (progress, token) => {
         const providerName = modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+        const includeQwenSemanticArtifacts = modelClient.provider === "copilot"
+          && vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>(
+            "pageAnalysis.copilotQwenSemanticPrepassEnabled",
+            false
+          );
         progress.report({ message: `${providerName} taslak doküman isteği gönderiliyor...` });
-        const result = await new CopilotPageDraftGenerator(modelClient).generate(multiRepoRoot, pageRoot, token);
+        const result = await new CopilotPageDraftGenerator(
+          modelClient,
+          undefined,
+          includeQwenSemanticArtifacts
+        ).generate(multiRepoRoot, pageRoot, token);
         const document = await vscode.workspace.openTextDocument(result.draftPath);
         await vscode.window.showTextDocument(document, { preview: false });
         vscode.window.showInformationMessage(`Bank Spring Docs: ${providerName} taslak dokümanı oluşturuldu. Yaklaşık token: ${result.estimatedTotalTokens}.`);
@@ -325,8 +335,7 @@ export async function buildFinalSelectedPageDocumentCommand(context: vscode.Exte
     return;
   }
   const result = await new FinalPageDocumentBuilder().build(pageRoot);
-  const document = await vscode.workspace.openTextDocument(result.finalDocumentPath);
-  await vscode.window.showTextDocument(document, { preview: false });
+  await showMarkdownWithPreview(result.finalDocumentPath);
   vscode.window.showInformationMessage("Bank Spring Docs: Final sayfa teknik analiz dokÃ¼manÄ± oluÅŸturuldu.");
 }
 
@@ -342,8 +351,7 @@ export async function openFinalSelectedPageDocumentCommand(context: vscode.Exten
   const target = path.join(pageRoot, "final-page-technical-analysis.md");
   try {
     await warnIfOutputStale(pageRoot, "final-page-technical-analysis.md", ["page-context-pack.md", "page-evidence-pack.md", "copilot-draft.md", "repaired-sections.md"]);
-    const document = await vscode.workspace.openTextDocument(target);
-    await vscode.window.showTextDocument(document, { preview: false });
+    await showMarkdownWithPreview(target);
   } catch {
     vscode.window.showWarningMessage("Bank Spring Docs: Final sayfa dokÃ¼manÄ± bulunamadÄ±. Ã–nce final dokÃ¼manÄ± oluÅŸtur.");
   }
@@ -397,8 +405,13 @@ export async function runFullSelectedPageAnalysisCommand(
   }
 
   const multiRepoRoot = manifestService.getMultiRepoRoot(manifest);
+  const configuration = vscode.workspace.getConfiguration("bankSpringDocs");
   const qwenOnly = options?.qwenOnly
-    ?? vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("pageAnalysis.qwenOnly", false);
+    ?? configuration.get<boolean>("pageAnalysis.qwenOnly", true);
+  const copilotQwenSemanticPrepassEnabled = configuration.get<boolean>(
+    "pageAnalysis.copilotQwenSemanticPrepassEnabled",
+    false
+  );
   const runKey = fullPageAnalysisRunKey(selectedPageRoot(multiRepoRoot, selectedPage));
   if (activeFullPageAnalysisRuns.has(runKey)) {
     vscode.window.showWarningMessage("Bank Spring Docs: Bu sayfa icin tam analiz zaten calisiyor. Mevcut calismanin tamamlanmasini bekleyin.");
@@ -409,13 +422,19 @@ export async function runFullSelectedPageAnalysisCommand(
     const modelClient = qwenOnly
       ? createQwenDocumentationModelClient(context)
       : createDocumentationModelClient(context);
-    const providerName = qwenOnly ? "Qwen3" : modelClient.provider === "qwen" ? "Qwen" : "Copilot";
+    const providerName = qwenOnly ? "Qwen3.6" : modelClient.provider === "qwen" ? "Qwen3.6" : "Copilot";
+    const includeQwenSemanticArtifacts = !qwenOnly && modelClient.provider === "copilot"
+      && copilotQwenSemanticPrepassEnabled;
+    const runQwenSemanticPrepass = !qwenOnly && modelClient.provider === "copilot" && (
+      configuration.get<boolean>("qwen.enabled", true)
+      && includeQwenSemanticArtifacts
+    );
     const qwenIdentity = qwenOnly ? getResumableQwenPageModelIdentity(context) : undefined;
     const qwenDraftOptions = qwenIdentity
       ? qwenIterativeOptions(qwenIdentity.model, qwenIdentity.configurationFingerprint, qwenIdentity.family)
       : undefined;
     const qwenCallBudget = qwenOnly
-      ? new QwenPageModelCallBudget(qwenDraftOptions?.maxModelCalls ?? 96)
+      ? new QwenPageModelCallBudget(qwenDraftOptions?.maxModelCalls ?? 32)
       : undefined;
     const qwenRuntimeDraftOptions = qwenDraftOptions && qwenCallBudget
       ? { ...qwenDraftOptions, onModelCall: (phase: "analysis" | "reduce" | "synthesis") => qwenCallBudget.consume(phase) }
@@ -444,21 +463,10 @@ export async function runFullSelectedPageAnalysisCommand(
       progress.report({ message: "3/9 Evidence paketi olusturuluyor..." });
       await new EvidencePackBuilder().build(contextResult.pageRoot, manifest);
 
-      if (qwenOnly || vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
+      if (runQwenSemanticPrepass) {
         try {
           progress.report({ message: "4/9 Qwen semantigi olusturuluyor..." });
-          const semanticAnalyzer = qwenOnly
-            ? new QwenPageSemanticAnalyzer(undefined, qwenIdentity?.model, undefined, {
-              client: modelClient,
-              cacheIdentity: `${qwenDraftOptions?.modelIdentity ?? qwenIdentity?.model ?? "qwen3"}` +
-                `@semantic-output-${qwenDraftOptions?.analysisMaxOutputTokens ?? 2048}`,
-              expectedModelMarker: "qwen3",
-              maxOutputTokens: qwenDraftOptions?.analysisMaxOutputTokens,
-              maxGatewayRetries: qwenDraftOptions?.maxGatewayRetries,
-              retryBaseDelayMs: qwenDraftOptions?.retryBaseDelayMs,
-              onModelCall: () => qwenCallBudget?.consumeSemantic()
-            })
-            : new QwenPageSemanticAnalyzer();
+          const semanticAnalyzer = new QwenPageSemanticAnalyzer();
           const semanticResult = await semanticAnalyzer.analyze(contextResult.pageRoot, context, token);
           if (semanticResult.failures || semanticResult.skippedInteractions) {
             vscode.window.showWarningMessage(
@@ -469,17 +477,20 @@ export async function runFullSelectedPageAnalysisCommand(
         } catch (error) {
           if (
             token.isCancellationRequested ||
-            (qwenOnly && error instanceof Error && (
-              error.name === "Qwen3PageSemanticBoundaryError" ||
-              error.name === "QwenPageCallBudgetExceededError"
-            ))
+            (error instanceof Error && error.name === "QwenPageCallBudgetExceededError")
           ) {
             throw error;
           }
           vscode.window.showWarningMessage(`Bank Spring Docs: Qwen sayfa semantiÄŸi atlandÄ±: ${error instanceof Error ? error.message : String(error)}`);
         }
       } else {
-        progress.report({ message: "4/9 Qwen kapali, semantik adimi atlaniyor..." });
+        progress.report({
+          message: qwenOnly
+            ? "4/9 Qwen-only akisi semantik on adimi kullanmaz; deterministik artifact'lerle devam ediliyor..."
+            : configuration.get<boolean>("qwen.enabled", true)
+              ? "4/9 Gelismis Copilot Qwen semantik on adimi kapali; atlaniyor..."
+              : "4/9 Qwen kapali, semantik adimi atlaniyor..."
+        });
       }
 
       progress.report({ message: `5/9 ${providerName} taslak dokümanı oluşturuluyor...` });
@@ -495,23 +506,41 @@ export async function runFullSelectedPageAnalysisCommand(
           onProgress: (update) => progress.report({ message: `5/9 ${update.message}` })
         });
       } else {
-        await new CopilotPageDraftGenerator(modelClient).generate(multiRepoRoot, contextResult.pageRoot, token);
+        await new CopilotPageDraftGenerator(
+          modelClient,
+          undefined,
+          includeQwenSemanticArtifacts
+        ).generate(multiRepoRoot, contextResult.pageRoot, token);
       }
 
       progress.report({ message: "6/9 Gap analizi yapiliyor..." });
       const gaps = await new PageDocGapDetector().detect(contextResult.pageRoot, multiRepoRoot);
+      const repairableGaps = qwenOnly
+        ? selectGenuinelyWeakQwenGaps(gaps, iterativeResult?.evidenceBackedSections)
+        : gaps;
 
-      if (gaps.length) {
-        progress.report({ message: "7/9 Gap repair calistiriliyor..." });
-        const repairResult = await new PageSectionRegenerator(modelClient, qwenRepairOptions).repair(multiRepoRoot, contextResult.pageRoot, token);
+      if (repairableGaps.length) {
+        progress.report({
+          message: qwenOnly
+            ? `7/9 ${repairableGaps.length} kanitla iyilestirilebilir zayif bolum gruplanarak onariliyor...`
+            : "7/9 Gap repair calistiriliyor..."
+        });
+        const repairOptions = qwenRepairOptions
+          ? { ...qwenRepairOptions, gaps: repairableGaps }
+          : undefined;
+        const repairResult = await new PageSectionRegenerator(modelClient, repairOptions).repair(multiRepoRoot, contextResult.pageRoot, token);
         if (qwenOnly && repairResult.missingSections?.length) {
           vscode.window.showWarningMessage(
-            `Bank Spring Docs: Qwen3 gap repair ${repairResult.missingSections.length} bolumu tamamlayamadi; ` +
+            `Bank Spring Docs: Qwen3.6 gap repair ${repairResult.missingSections.length} bolumu tamamlayamadi; ` +
             "mevcut taslak bolumleri korunarak final dokuman olusturulacak."
           );
         }
       } else {
-        progress.report({ message: "7/9 Gap bulunmadi, repair atlaniyor..." });
+        progress.report({
+          message: gaps.length
+            ? "7/9 Yalniz dogru belirsizlik veya kanitsiz gap bulundu; gereksiz Qwen repair cagrisi atlaniyor..."
+            : "7/9 Gap bulunmadi, repair atlaniyor..."
+        });
       }
 
       progress.report({ message: "8/9 Final dokuman olusturuluyor..." });
@@ -523,10 +552,9 @@ export async function runFullSelectedPageAnalysisCommand(
       await writer.write(contextResult.pageRoot, score);
       await writer.writeAggregate(multiRepoRoot);
 
-      const document = await vscode.workspace.openTextDocument(finalResult.finalDocumentPath);
-      await vscode.window.showTextDocument(document, { preview: false });
+      await showMarkdownWithPreview(finalResult.finalDocumentPath);
       const iterationSummary = iterativeResult
-        ? ` Qwen3 chunk: ${iterativeResult.chunkCount}, toplam istek denemesi: ${qwenCallBudget?.used ?? iterativeResult.newModelCallCount}/${qwenCallBudget?.maximum ?? iterativeResult.newModelCallCount}, taslak yeni istegi: ${iterativeResult.newModelCallCount}, yeniden kullanilan adim: ${iterativeResult.reusedStepCount}, coverage uyarisi: ${iterativeResult.warnings?.length ?? 0}.${iterativeResult.runManifestPath ? ` Resume manifesti: ${iterativeResult.runManifestPath}.` : ""}`
+        ? ` Qwen3.6 chunk: ${iterativeResult.chunkCount}, toplam istek denemesi: ${qwenCallBudget?.used ?? iterativeResult.newModelCallCount}/${qwenCallBudget?.maximum ?? iterativeResult.newModelCallCount}, taslak yeni istegi: ${iterativeResult.newModelCallCount}, yeniden kullanilan adim: ${iterativeResult.reusedStepCount}, coverage uyarisi: ${iterativeResult.warnings?.length ?? 0}.${iterativeResult.runManifestPath ? ` Resume manifesti: ${iterativeResult.runManifestPath}.` : ""}`
         : "";
       vscode.window.showInformationMessage(`Bank Spring Docs: TÃ¼m sayfa analizi tamamlandÄ±. Skor: ${score.score} (${score.grade}).${iterationSummary}`);
     }
@@ -567,15 +595,15 @@ function qwenIterativeOptions(
   const generationMaxTokens = config.get<number>("qwen.generationMaxTokens", 16384);
   const analysisMaxOutputTokens = Math.min(
     generationMaxTokens,
-    readBoundedIntegerSetting(config, "pageAnalysis.qwenAnalysisMaxOutputTokens", 2048, 256, 65536)
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenAnalysisMaxOutputTokens", 16384, 256, 65536)
   );
   const reduceMaxOutputTokens = Math.min(
     generationMaxTokens,
-    readBoundedIntegerSetting(config, "pageAnalysis.qwenReduceMaxOutputTokens", 3072, 256, 65536)
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenReduceMaxOutputTokens", 16384, 256, 65536)
   );
   const synthesisMaxOutputTokens = Math.min(
     generationMaxTokens,
-    readBoundedIntegerSetting(config, "pageAnalysis.qwenSynthesisMaxOutputTokens", 4096, 256, 65536)
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenSynthesisMaxOutputTokens", 16384, 256, 65536)
   );
   const reservedTokens = 2048;
   const largestPhaseOutputTokens = Math.max(
@@ -584,7 +612,7 @@ function qwenIterativeOptions(
     synthesisMaxOutputTokens
   );
   const safeInputTokens = Math.floor(contextWindowTokens - largestPhaseOutputTokens - reservedTokens);
-  const maxInputCharacters = Math.min(60000, safeInputTokens * 3);
+  const maxInputCharacters = Math.min(240000, safeInputTokens * 3);
   if (!Number.isSafeInteger(maxInputCharacters) || maxInputCharacters < 8001) {
     throw new Error(
       "Qwen3 iteratif sayfa analizi icin context penceresi yetersiz. " +
@@ -597,22 +625,39 @@ function qwenIterativeOptions(
   // without changing the model value sent to the server.
   const attestedModel = [modelFamily, model].filter(Boolean).join("/");
   const modelIdentity = [attestedModel, configurationFingerprint].filter(Boolean).join("@");
+  const maxChunkCharacters = Math.min(180000, maxInputCharacters - 12000);
+  const maxModelCalls = readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxModelCalls", 32, 12, 200);
+  const configuredSourceCharacters = readBoundedIntegerSetting(
+    config,
+    "pageAnalysis.qwenMaxTotalSourceCharacters",
+    720000,
+    30000,
+    5000000
+  );
+  // Deterministic artifacts are never sacrificed. Raw source is supplemental
+  // and is capped to roughly twelve map windows so the default 32-call ceiling
+  // still leaves room for ledgers, grouped synthesis, retries and weak-gap repair.
+  const sourceWindowCharacters = Math.max(1000, Math.min(60000, maxChunkCharacters - 1000));
+  const maxTotalSourceCharacters = Math.min(
+    configuredSourceCharacters,
+    Math.max(30000, sourceWindowCharacters * 12)
+  );
   return {
     maxInputCharacters,
-    maxChunkCharacters: Math.min(42000, maxInputCharacters - 7000),
+    maxChunkCharacters,
     maxSourceFileCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxSourceFileCharacters", 180000, 12000, 1000000),
-    maxTotalSourceCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxTotalSourceCharacters", 720000, 30000, 5000000),
-    maxModelCalls: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxModelCalls", 96, 12, 200),
-    maxReduceLevels: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxReduceLevels", 5, 1, 10),
+    maxTotalSourceCharacters,
+    maxModelCalls,
+    maxReduceLevels: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxReduceLevels", 3, 1, 10),
     analysisMaxOutputTokens,
     reduceMaxOutputTokens,
     synthesisMaxOutputTokens,
-    maxGatewayRetries: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxGatewayRetries", 2, 0, 5),
-    retryBaseDelayMs: readBoundedIntegerSetting(config, "pageAnalysis.qwenRetryBaseDelayMs", 750, 100, 30000),
-    maxAdaptiveSplitDepth: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxAdaptiveSplitDepth", 3, 0, 8),
+    maxGatewayRetries: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxGatewayRetries", 1, 0, 5),
+    retryBaseDelayMs: readBoundedIntegerSetting(config, "pageAnalysis.qwenRetryBaseDelayMs", 1000, 100, 30000),
+    maxAdaptiveSplitDepth: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxAdaptiveSplitDepth", 2, 0, 8),
     minAdaptiveSplitCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMinAdaptiveSplitCharacters", 4000, 1000, 100000),
     adaptiveSplitOverlapCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenAdaptiveSplitOverlapCharacters", 600, 0, 20000),
-    finalSectionGroupSize: readBoundedIntegerSetting(config, "pageAnalysis.qwenFinalSectionGroupSize", 4, 1, 17),
+    finalSectionGroupSize: readBoundedIntegerSetting(config, "pageAnalysis.qwenFinalSectionGroupSize", 6, 1, 17),
     modelIdentity: modelIdentity || "qwen3",
     expectedModelMarker: "qwen3"
   };
@@ -639,28 +684,10 @@ function qwenRepairOptionsFrom(
 
 class QwenPageModelCallBudget {
   used = 0;
-  private semanticUsed = 0;
-  private readonly semanticMaximum: number;
 
-  constructor(readonly maximum: number) {
-    // Semantic enrichment is optional. Preserve enough attempts for bounded
-    // evidence mapping, grouped synthesis and a small repair pass.
-    this.semanticMaximum = Math.min(9, Math.max(0, maximum - 12));
-  }
+  constructor(readonly maximum: number) {}
 
-  consumeSemantic(): void {
-    if (this.semanticUsed >= this.semanticMaximum) {
-      const error = new Error(
-        `Qwen3 semantik zenginlestirme ${this.semanticMaximum} istek denemesi sinirina ulasti; zorunlu dokuman asamalari icin kapasite korundu.`
-      );
-      error.name = "QwenSemanticCallBudgetReservedError";
-      throw error;
-    }
-    this.consume("semantic");
-    this.semanticUsed += 1;
-  }
-
-  consume(phase: "semantic" | "analysis" | "reduce" | "synthesis" | "repair"): void {
+  consume(phase: "analysis" | "reduce" | "synthesis" | "repair"): void {
     if (this.used >= this.maximum) {
       const error = new Error(
         `Qwen3 tam sayfa pipeline'i ${this.maximum} toplam model istek denemesi sinirina ulasti (${phase}). Ara ciktilar korundu.`
@@ -724,6 +751,17 @@ async function warnIfPageArtifactsStale(pageRoot: string): Promise<void> {
   if (result.warnings.length) {
     vscode.window.showWarningMessage(
       `Bank Spring Docs: Sayfa artifactlerinde ${result.warnings.length} eksik/eski girdi uyarisi var. Islem devam edecek. Detay: ${result.reportPath}`
+    );
+  }
+}
+
+async function showMarkdownWithPreview(filePath: string): Promise<void> {
+  const document = await vscode.workspace.openTextDocument(filePath);
+  await vscode.window.showTextDocument(document, { preview: false });
+  if (document.uri) {
+    await vscode.commands.executeCommand("markdown.showPreviewToSide", document.uri).then(
+      () => undefined,
+      () => undefined
     );
   }
 }

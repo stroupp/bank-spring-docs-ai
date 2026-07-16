@@ -11,7 +11,7 @@ export async function generateQwenSemanticAnalysisCommand(context: vscode.Extens
     vscode.window.showWarningMessage("Bank Spring Docs: Önce bir repository analizi çalıştırmalısın.");
     return;
   }
-  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", false)) {
+  if (!vscode.workspace.getConfiguration("bankSpringDocs").get<boolean>("qwen.enabled", true)) {
     vscode.window.showWarningMessage("Bank Spring Docs: Qwen semantik analiz aktif değil. Panelden etkinleştirip ayarları kaydet.");
     return;
   }

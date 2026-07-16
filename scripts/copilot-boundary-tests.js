@@ -24,6 +24,8 @@ Module._load = function patchedLoad(request, parent, isMain) {
 };
 
 const { CopilotPageDraftGenerator } = require("../dist/pageanalysis/copilotPageDraftGenerator");
+const { FinalPageDocumentBuilder } = require("../dist/pageanalysis/finalPageDocumentBuilder");
+const { PageDocumentQualityScorer } = require("../dist/pageanalysis/quality/pageDocumentQualityScorer");
 const { maskSecretsWithStats } = require("../dist/ai/safeContextFilter");
 const { MultiRepoCopilotAgenticDocumentationGenerator } = require("../dist/docs/multiRepoCopilotAgenticDocumentationGenerator");
 const { MultiRepoAgenticRunStatusWriter } = require("../dist/docs/multiRepoAgenticRunStatus");
@@ -33,6 +35,9 @@ const token = { isCancellationRequested: false, onCancellationRequested: () => (
 async function main() {
   testSecretMaskingDirectly();
   await testContextBudgetEvidenceSemanticsAndSuccessAudit();
+  await testLargeContextBudgetPreservesLateCrossLayerEvidence();
+  await testMarkdownBalancingIgnoresHeadingsInsideSourceFences();
+  await testSemanticArtifactInclusionCanBeDisabled();
   await testFailureAndCancellationAudits();
   await testAgenticEmptyResponsePersistsFailureStatusAndAudit();
   await testAgenticResumeReusesCompletedPrefix();
@@ -247,6 +252,195 @@ async function testContextBudgetEvidenceSemanticsAndSuccessAudit() {
   assert.ok(audits[0].includedIndexes.includes("page-evidence-pack.md"));
 }
 
+async function testLargeContextBudgetPreservesLateCrossLayerEvidence() {
+  const { multiRoot, pageRoot } = await createPage("copilot-cross-layer-budget");
+  await fs.writeFile(path.join(pageRoot, "page-context-pack.md"), [
+    "# Page Context Pack",
+    "## Component Kayitlari",
+    "UI_COMPONENT_FILLER_START",
+    "U".repeat(12000),
+    "## UI -> BFF Eslesmeleri",
+    "UI_TO_BFF_LATE_SENTINEL",
+    "## BFF -> BE Eslesmeleri",
+    "BFF_TO_BE_LATE_SENTINEL"
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(pageRoot, "page-evidence-pack.md"), [
+    "# Page Evidence Pack",
+    "## React Page Evidence",
+    "REACT_FILLER_START",
+    "R".repeat(10000),
+    "## BFF Endpoint Evidence",
+    "BFF_ENDPOINT_LATE_SENTINEL",
+    "## BFF Outbound Client Evidence",
+    "FEIGN_CLIENT_LATE_SENTINEL",
+    "## Backend Endpoint Evidence",
+    "BE_ENDPOINT_LATE_SENTINEL"
+  ].join("\n"), "utf8");
+  await fs.rm(path.join(pageRoot, "qwen-page-semantics.json"), { force: true });
+
+  const requests = [];
+  const mock = successfulPageDraftClient(requests);
+  const budget = 6000;
+  const result = await new CopilotPageDraftGenerator(mock, budget).generate(multiRoot, pageRoot, token);
+  const context = await fs.readFile(result.contextPath, "utf8");
+
+  assert.ok(context.length <= budget, `cross-layer context length ${context.length} exceeded budget ${budget}`);
+  for (const sentinel of [
+    "UI_TO_BFF_LATE_SENTINEL",
+    "BFF_TO_BE_LATE_SENTINEL",
+    "BFF_ENDPOINT_LATE_SENTINEL",
+    "FEIGN_CLIENT_LATE_SENTINEL",
+    "BE_ENDPOINT_LATE_SENTINEL"
+  ]) {
+    assert.match(context, new RegExp(sentinel), `${sentinel} must survive unrelated leading UI content`);
+    assert.match(requests[0].userPrompt, new RegExp(sentinel), `${sentinel} must be present in the request sent to Copilot`);
+  }
+
+  const audits = await readAudit(multiRoot);
+  assert.ok(audits[0].includedIndexes.includes("page-context-pack.md"));
+  assert.ok(audits[0].includedIndexes.includes("page-evidence-pack.md"));
+  assert.strictEqual(audits[0].contextSelectionPath, path.relative(multiRoot, result.contextSelectionPath));
+  const selection = JSON.parse(await fs.readFile(result.contextSelectionPath, "utf8"));
+  assert.strictEqual(selection.maxCharacters, budget);
+  assert.match(selection.draftHash, /^[a-f0-9]{64}$/);
+  for (const fileName of ["page-context-pack.md", "page-evidence-pack.md"]) {
+    const part = selection.parts.find((item) => item.fileName === fileName);
+    assert.ok(part?.sentCharacters > 0, `${fileName} must receive a non-zero balanced context allocation`);
+    assert.ok(part.sentCharacters <= part.safeCharacters, `${fileName} sentCharacters must describe the final masked selection`);
+    assert.strictEqual(part.truncated, true, `${fileName} truncation must be auditable`);
+  }
+  assert.strictEqual(selection.parts.find((item) => item.fileName === "qwen-page-semantics.json").status, "missing");
+}
+
+async function testMarkdownBalancingIgnoresHeadingsInsideSourceFences() {
+  const { multiRoot, pageRoot } = await createPage("copilot-fenced-headings");
+  await fs.writeFile(path.join(pageRoot, "page-context-pack.md"), [
+    "# Page Context Pack",
+    "## Secili Sayfa Ozeti",
+    "api_key=x",
+    "C".repeat(9000),
+    "## BFF -> BE Eslesmeleri",
+    "REAL_CONTEXT_BE_SENTINEL"
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(pageRoot, "page-evidence-pack.md"), [
+    "# Page Evidence Pack",
+    "## React Page Evidence",
+    "```markdown",
+    "## Metadata",
+    "FENCED_METADATA_SENTINEL",
+    "## BFF Outbound Client Evidence",
+    "F".repeat(9000),
+    "```",
+    "## Backend Endpoint Evidence",
+    "REAL_BACKEND_SENTINEL"
+  ].join("\n"), "utf8");
+  await fs.rm(path.join(pageRoot, "qwen-page-semantics.json"), { force: true });
+
+  const budget = 4000;
+  const result = await new CopilotPageDraftGenerator(
+    successfulPageDraftClient([]),
+    budget
+  ).generate(multiRoot, pageRoot, token);
+  const context = await fs.readFile(result.contextPath, "utf8");
+  assert.ok(context.length <= budget, "secret masking must not expand the packed context beyond its exact ceiling");
+  assert.match(context, /api_key=\[MASKED_SECRET\]/);
+  assert.match(context, /FENCED_METADATA_SENTINEL/, "a source line named Metadata inside a fence must not drop its enclosing evidence section");
+  assert.match(context, /REAL_CONTEXT_BE_SENTINEL/);
+  assert.match(context, /REAL_BACKEND_SENTINEL/);
+}
+
+async function testSemanticArtifactInclusionCanBeDisabled() {
+  const defaultFixture = await createPage("copilot-semantics-default");
+  await writeSemanticSentinels(defaultFixture.pageRoot);
+  const defaultRequests = [];
+  const defaultResult = await new CopilotPageDraftGenerator(
+    successfulPageDraftClient(defaultRequests),
+    8000
+  ).generate(defaultFixture.multiRoot, defaultFixture.pageRoot, token);
+  const defaultContext = await fs.readFile(defaultResult.contextPath, "utf8");
+  assert.match(defaultContext, /QWEN_PAGE_SEMANTIC_SENTINEL/, "the default constructor must retain page semantics");
+  assert.match(defaultContext, /QWEN_INTERACTION_SEMANTIC_SENTINEL/, "the default constructor must retain interaction semantics");
+  const defaultAudit = (await readAudit(defaultFixture.multiRoot))[0];
+  assert.ok(defaultAudit.includedIndexes.includes("qwen-page-semantics.json"));
+  assert.ok(defaultAudit.includedIndexes.includes("qwen-interaction-semantics.jsonl"));
+
+  const disabledFixture = await createPage("copilot-semantics-disabled");
+  await writeSemanticSentinels(disabledFixture.pageRoot);
+  const disabledRequests = [];
+  const disabledResult = await new CopilotPageDraftGenerator(
+    successfulPageDraftClient(disabledRequests),
+    8000,
+    false
+  ).generate(disabledFixture.multiRoot, disabledFixture.pageRoot, token);
+  const disabledContext = await fs.readFile(disabledResult.contextPath, "utf8");
+  assert.doesNotMatch(disabledContext, /QWEN_PAGE_SEMANTIC_SENTINEL|QWEN_INTERACTION_SEMANTIC_SENTINEL/);
+  assert.doesNotMatch(disabledContext, /## Qwen Page Semantics|## Qwen Interaction Semantics/);
+  assert.match(disabledContext, /CustomerSearch/, "disabling semantics must not remove the deterministic page context");
+  assert.match(disabledContext, /React Page Evidence/, "disabling semantics must not remove source evidence");
+  assert.doesNotMatch(disabledRequests[0].userPrompt, /QWEN_PAGE_SEMANTIC_SENTINEL|QWEN_INTERACTION_SEMANTIC_SENTINEL/);
+
+  const disabledAudit = (await readAudit(disabledFixture.multiRoot))[0];
+  assert.ok(disabledAudit.includedIndexes.includes("page-context-pack.md"));
+  assert.ok(disabledAudit.includedIndexes.includes("page-evidence-pack.md"));
+  assert.ok(!disabledAudit.includedIndexes.includes("qwen-page-semantics.json"));
+  assert.ok(!disabledAudit.includedIndexes.includes("qwen-interaction-semantics.jsonl"));
+  const disabledSelection = JSON.parse(await fs.readFile(disabledResult.contextSelectionPath, "utf8"));
+  assert.strictEqual(disabledSelection.qwenSemanticArtifactsEnabled, false);
+  assert.ok(disabledSelection.parts
+    .filter((item) => item.fileName.startsWith("qwen-"))
+    .every((item) => item.status === "disabled"));
+  await fs.appendFile(path.join(disabledFixture.pageRoot, "qwen-page-semantics.json"), "\n", "utf8");
+  const disabledScore = await new PageDocumentQualityScorer().score(
+    disabledFixture.multiRoot,
+    disabledFixture.pageRoot
+  );
+  assert.strictEqual(disabledScore.qwenSemanticCoverage, 0, "disabled semantics must not earn existence-only quality credit");
+  assert.ok(disabledScore.metricExplanations.some((item) =>
+    item.metric === "qwen-semantic-coverage" && /intentionally disabled/i.test(item.reason)
+  ));
+  await fs.writeFile(path.join(disabledFixture.pageRoot, "detected-gaps.json"), "[]", "utf8");
+  const finalResult = await new FinalPageDocumentBuilder().build(disabledFixture.pageRoot);
+  const finalDocument = await fs.readFile(finalResult.finalDocumentPath, "utf8");
+  assert.match(finalDocument, /Qwen semantik kullanimi: devre disi/);
+  assert.ok(await exists(path.join(disabledFixture.pageRoot, "qwen-page-semantics.json")), "the option must not delete semantic artifacts");
+  assert.ok(await exists(path.join(disabledFixture.pageRoot, "qwen-interaction-semantics.jsonl")), "the option must not delete semantic artifacts");
+}
+
+function successfulPageDraftClient(requests) {
+  return {
+    provider: "copilot",
+    async send(prompt) {
+      requests.push(prompt);
+      return {
+        text: "# Sayfa Amaci\nDeterministic Copilot boundary response.",
+        usage: {
+          inputCharacters: prompt.combinedText.length,
+          outputCharacters: 52,
+          estimatedInputTokens: Math.ceil(prompt.combinedText.length / 4),
+          estimatedOutputTokens: 13,
+          estimatedTotalTokens: Math.ceil(prompt.combinedText.length / 4) + 13
+        },
+        model: { id: "mock-copilot", name: "Mock Copilot", vendor: "copilot", family: "mock", version: "1", maxInputTokens: 32000 },
+        provider: "copilot",
+        finishReason: "stop"
+      };
+    }
+  };
+}
+
+async function writeSemanticSentinels(pageRoot) {
+  await fs.writeFile(
+    path.join(pageRoot, "qwen-page-semantics.json"),
+    JSON.stringify({ businessPurpose: "QWEN_PAGE_SEMANTIC_SENTINEL", confidence: "high" }),
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(pageRoot, "qwen-interaction-semantics.jsonl"),
+    `${JSON.stringify({ interaction: "QWEN_INTERACTION_SEMANTIC_SENTINEL", confidence: "high" })}\n`,
+    "utf8"
+  );
+}
+
 async function testFailureAndCancellationAudits() {
   const failed = await createPage("copilot-failed");
   const throwingMock = { async send() { throw new Error("api_key=boundary-audit-secret deterministic mock failure"); } };
@@ -256,9 +450,39 @@ async function testFailureAndCancellationAudits() {
   );
   const failedAudits = await readAudit(failed.multiRoot);
   assert.strictEqual(failedAudits[0].status, "failed");
+  assert.strictEqual(failedAudits[0].contextSelectionPath, undefined);
+  assert.ok(!await exists(path.join(failed.pageRoot, "copilot-draft-context-selection.json")));
   assert.match(failedAudits[0].error, /deterministic mock failure/);
   assert.doesNotMatch(failedAudits[0].error, /boundary-audit-secret/);
   assert.match(failedAudits[0].error, /\[MASKED_SECRET\]/);
+
+  const retained = await createPage("copilot-failed-after-success");
+  await new CopilotPageDraftGenerator(successfulPageDraftClient([]), 2000)
+    .generate(retained.multiRoot, retained.pageRoot, token);
+  const retainedSelectionPath = path.join(retained.pageRoot, "copilot-draft-context-selection.json");
+  const selectionBeforeFailure = await fs.readFile(retainedSelectionPath, "utf8");
+  await assert.rejects(
+    new CopilotPageDraftGenerator(throwingMock, 2000, false).generate(retained.multiRoot, retained.pageRoot, token),
+    /deterministic mock failure/
+  );
+  assert.strictEqual(
+    await fs.readFile(retainedSelectionPath, "utf8"),
+    selectionBeforeFailure,
+    "a failed attempt must not pair its context-selection metadata with the retained older draft"
+  );
+  assert.strictEqual((await readAudit(retained.multiRoot)).at(-1).contextSelectionPath, undefined);
+
+  const mismatchedSelection = JSON.parse(selectionBeforeFailure);
+  mismatchedSelection.draftHash = "0".repeat(64);
+  await fs.writeFile(retainedSelectionPath, `${JSON.stringify(mismatchedSelection)}\n`, "utf8");
+  const unknownUsageScore = await new PageDocumentQualityScorer().score(retained.multiRoot, retained.pageRoot);
+  assert.strictEqual(unknownUsageScore.qwenSemanticCoverage, null, "unbound selection metadata must not earn existence-only Qwen credit");
+  assert.ok(unknownUsageScore.metricExplanations.some((item) =>
+    item.metric === "qwen-semantic-coverage" && /usage is unknown/i.test(item.reason)
+  ));
+  await fs.writeFile(path.join(retained.pageRoot, "detected-gaps.json"), "[]", "utf8");
+  const unknownUsageFinal = await new FinalPageDocumentBuilder().build(retained.pageRoot);
+  assert.match(await fs.readFile(unknownUsageFinal.finalDocumentPath, "utf8"), /Qwen semantik kullanimi: bilinmiyor/);
 
   const cancelled = await createPage("copilot-cancelled");
   const cancelledToken = { ...token, isCancellationRequested: true };
