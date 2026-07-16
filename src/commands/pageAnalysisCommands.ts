@@ -414,8 +414,14 @@ export async function runFullSelectedPageAnalysisCommand(
     const qwenDraftOptions = qwenIdentity
       ? qwenIterativeOptions(qwenIdentity.model, qwenIdentity.configurationFingerprint, qwenIdentity.family)
       : undefined;
+    const qwenCallBudget = qwenOnly
+      ? new QwenPageModelCallBudget(qwenDraftOptions?.maxModelCalls ?? 96)
+      : undefined;
+    const qwenRuntimeDraftOptions = qwenDraftOptions && qwenCallBudget
+      ? { ...qwenDraftOptions, onModelCall: (phase: "analysis" | "reduce" | "synthesis") => qwenCallBudget.consume(phase) }
+      : qwenDraftOptions;
     const qwenRepairOptions: Qwen3PageSectionRepairOptions | undefined = qwenOnly
-      ? qwenRepairOptionsFrom(qwenDraftOptions)
+      ? qwenRepairOptionsFrom(qwenDraftOptions, qwenCallBudget)
       : undefined;
     let iterativeResult: QwenIterativePageDraftResult | undefined;
     await vscode.window.withProgress(
@@ -444,15 +450,29 @@ export async function runFullSelectedPageAnalysisCommand(
           const semanticAnalyzer = qwenOnly
             ? new QwenPageSemanticAnalyzer(undefined, qwenIdentity?.model, undefined, {
               client: modelClient,
-              cacheIdentity: qwenDraftOptions?.modelIdentity ?? qwenIdentity?.model ?? "qwen3",
-              expectedModelMarker: "qwen3"
+              cacheIdentity: `${qwenDraftOptions?.modelIdentity ?? qwenIdentity?.model ?? "qwen3"}` +
+                `@semantic-output-${qwenDraftOptions?.analysisMaxOutputTokens ?? 2048}`,
+              expectedModelMarker: "qwen3",
+              maxOutputTokens: qwenDraftOptions?.analysisMaxOutputTokens,
+              maxGatewayRetries: qwenDraftOptions?.maxGatewayRetries,
+              retryBaseDelayMs: qwenDraftOptions?.retryBaseDelayMs,
+              onModelCall: () => qwenCallBudget?.consumeSemantic()
             })
             : new QwenPageSemanticAnalyzer();
-          await semanticAnalyzer.analyze(contextResult.pageRoot, context, token);
+          const semanticResult = await semanticAnalyzer.analyze(contextResult.pageRoot, context, token);
+          if (semanticResult.failures || semanticResult.skippedInteractions) {
+            vscode.window.showWarningMessage(
+              `Bank Spring Docs: Qwen sayfa semantigi kismi tamamlandi; hata: ${semanticResult.failures}, ` +
+              `circuit-breaker ile atlanan interaction: ${semanticResult.skippedInteractions}. Ana iterative dokuman pipeline'i devam ediyor.`
+            );
+          }
         } catch (error) {
           if (
             token.isCancellationRequested ||
-            (qwenOnly && error instanceof Error && error.name === "Qwen3PageSemanticBoundaryError")
+            (qwenOnly && error instanceof Error && (
+              error.name === "Qwen3PageSemanticBoundaryError" ||
+              error.name === "QwenPageCallBudgetExceededError"
+            ))
           ) {
             throw error;
           }
@@ -466,7 +486,7 @@ export async function runFullSelectedPageAnalysisCommand(
       if (qwenOnly) {
         iterativeResult = await new QwenIterativePageDraftGenerator(
           modelClient,
-          qwenDraftOptions
+          qwenRuntimeDraftOptions
         ).generate({
           multiRepoRoot,
           pageRoot: contextResult.pageRoot,
@@ -483,7 +503,13 @@ export async function runFullSelectedPageAnalysisCommand(
 
       if (gaps.length) {
         progress.report({ message: "7/9 Gap repair calistiriliyor..." });
-        await new PageSectionRegenerator(modelClient, qwenRepairOptions).repair(multiRepoRoot, contextResult.pageRoot, token);
+        const repairResult = await new PageSectionRegenerator(modelClient, qwenRepairOptions).repair(multiRepoRoot, contextResult.pageRoot, token);
+        if (qwenOnly && repairResult.missingSections?.length) {
+          vscode.window.showWarningMessage(
+            `Bank Spring Docs: Qwen3 gap repair ${repairResult.missingSections.length} bolumu tamamlayamadi; ` +
+            "mevcut taslak bolumleri korunarak final dokuman olusturulacak."
+          );
+        }
       } else {
         progress.report({ message: "7/9 Gap bulunmadi, repair atlaniyor..." });
       }
@@ -500,14 +526,14 @@ export async function runFullSelectedPageAnalysisCommand(
       const document = await vscode.workspace.openTextDocument(finalResult.finalDocumentPath);
       await vscode.window.showTextDocument(document, { preview: false });
       const iterationSummary = iterativeResult
-        ? ` Qwen3 chunk: ${iterativeResult.chunkCount}, yeni istek: ${iterativeResult.newModelCallCount}, yeniden kullanilan adim: ${iterativeResult.reusedStepCount}, coverage uyarisi: ${iterativeResult.warnings?.length ?? 0}.${iterativeResult.runManifestPath ? ` Resume manifesti: ${iterativeResult.runManifestPath}.` : ""}`
+        ? ` Qwen3 chunk: ${iterativeResult.chunkCount}, toplam istek denemesi: ${qwenCallBudget?.used ?? iterativeResult.newModelCallCount}/${qwenCallBudget?.maximum ?? iterativeResult.newModelCallCount}, taslak yeni istegi: ${iterativeResult.newModelCallCount}, yeniden kullanilan adim: ${iterativeResult.reusedStepCount}, coverage uyarisi: ${iterativeResult.warnings?.length ?? 0}.${iterativeResult.runManifestPath ? ` Resume manifesti: ${iterativeResult.runManifestPath}.` : ""}`
         : "";
       vscode.window.showInformationMessage(`Bank Spring Docs: TÃ¼m sayfa analizi tamamlandÄ±. Skor: ${score.score} (${score.grade}).${iterationSummary}`);
     }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/cancel/i.test(message)) {
+    if (/cancel|iptal/i.test(message)) {
       vscode.window.showWarningMessage("Bank Spring Docs: Tum sayfa analizi kullanici tarafindan iptal edildi. Olusan ara dosyalar korundu.");
       return;
     }
@@ -539,8 +565,25 @@ function qwenIterativeOptions(
   const config = vscode.workspace.getConfiguration("bankSpringDocs");
   const contextWindowTokens = config.get<number>("qwen.contextWindowTokens", 131072);
   const generationMaxTokens = config.get<number>("qwen.generationMaxTokens", 16384);
+  const analysisMaxOutputTokens = Math.min(
+    generationMaxTokens,
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenAnalysisMaxOutputTokens", 2048, 256, 65536)
+  );
+  const reduceMaxOutputTokens = Math.min(
+    generationMaxTokens,
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenReduceMaxOutputTokens", 3072, 256, 65536)
+  );
+  const synthesisMaxOutputTokens = Math.min(
+    generationMaxTokens,
+    readBoundedIntegerSetting(config, "pageAnalysis.qwenSynthesisMaxOutputTokens", 4096, 256, 65536)
+  );
   const reservedTokens = 2048;
-  const safeInputTokens = Math.floor(contextWindowTokens - generationMaxTokens - reservedTokens);
+  const largestPhaseOutputTokens = Math.max(
+    analysisMaxOutputTokens,
+    reduceMaxOutputTokens,
+    synthesisMaxOutputTokens
+  );
+  const safeInputTokens = Math.floor(contextWindowTokens - largestPhaseOutputTokens - reservedTokens);
   const maxInputCharacters = Math.min(60000, safeInputTokens * 3);
   if (!Number.isSafeInteger(maxInputCharacters) || maxInputCharacters < 8001) {
     throw new Error(
@@ -559,15 +602,25 @@ function qwenIterativeOptions(
     maxChunkCharacters: Math.min(42000, maxInputCharacters - 7000),
     maxSourceFileCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxSourceFileCharacters", 180000, 12000, 1000000),
     maxTotalSourceCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxTotalSourceCharacters", 720000, 30000, 5000000),
-    maxModelCalls: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxModelCalls", 48, 2, 200),
+    maxModelCalls: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxModelCalls", 96, 12, 200),
     maxReduceLevels: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxReduceLevels", 5, 1, 10),
+    analysisMaxOutputTokens,
+    reduceMaxOutputTokens,
+    synthesisMaxOutputTokens,
+    maxGatewayRetries: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxGatewayRetries", 2, 0, 5),
+    retryBaseDelayMs: readBoundedIntegerSetting(config, "pageAnalysis.qwenRetryBaseDelayMs", 750, 100, 30000),
+    maxAdaptiveSplitDepth: readBoundedIntegerSetting(config, "pageAnalysis.qwenMaxAdaptiveSplitDepth", 3, 0, 8),
+    minAdaptiveSplitCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenMinAdaptiveSplitCharacters", 4000, 1000, 100000),
+    adaptiveSplitOverlapCharacters: readBoundedIntegerSetting(config, "pageAnalysis.qwenAdaptiveSplitOverlapCharacters", 600, 0, 20000),
+    finalSectionGroupSize: readBoundedIntegerSetting(config, "pageAnalysis.qwenFinalSectionGroupSize", 4, 1, 17),
     modelIdentity: modelIdentity || "qwen3",
     expectedModelMarker: "qwen3"
   };
 }
 
 function qwenRepairOptionsFrom(
-  draftOptions: ConstructorParameters<typeof QwenIterativePageDraftGenerator>[1]
+  draftOptions: ConstructorParameters<typeof QwenIterativePageDraftGenerator>[1],
+  callBudget?: QwenPageModelCallBudget
 ): Qwen3PageSectionRepairOptions {
   const maxInputCharacters = draftOptions?.maxInputCharacters;
   if (!Number.isSafeInteger(maxInputCharacters) || !maxInputCharacters) {
@@ -576,8 +629,47 @@ function qwenRepairOptionsFrom(
   return {
     mode: "qwen3",
     maxInputCharacters,
+    maxOutputTokens: draftOptions?.synthesisMaxOutputTokens,
+    maxGatewayRetries: draftOptions?.maxGatewayRetries,
+    retryBaseDelayMs: draftOptions?.retryBaseDelayMs,
+    onModelCall: () => callBudget?.consume("repair"),
     expectedModelMarker: draftOptions?.expectedModelMarker ?? "qwen3"
   };
+}
+
+class QwenPageModelCallBudget {
+  used = 0;
+  private semanticUsed = 0;
+  private readonly semanticMaximum: number;
+
+  constructor(readonly maximum: number) {
+    // Semantic enrichment is optional. Preserve enough attempts for bounded
+    // evidence mapping, grouped synthesis and a small repair pass.
+    this.semanticMaximum = Math.min(9, Math.max(0, maximum - 12));
+  }
+
+  consumeSemantic(): void {
+    if (this.semanticUsed >= this.semanticMaximum) {
+      const error = new Error(
+        `Qwen3 semantik zenginlestirme ${this.semanticMaximum} istek denemesi sinirina ulasti; zorunlu dokuman asamalari icin kapasite korundu.`
+      );
+      error.name = "QwenSemanticCallBudgetReservedError";
+      throw error;
+    }
+    this.consume("semantic");
+    this.semanticUsed += 1;
+  }
+
+  consume(phase: "semantic" | "analysis" | "reduce" | "synthesis" | "repair"): void {
+    if (this.used >= this.maximum) {
+      const error = new Error(
+        `Qwen3 tam sayfa pipeline'i ${this.maximum} toplam model istek denemesi sinirina ulasti (${phase}). Ara ciktilar korundu.`
+      );
+      error.name = "QwenPageCallBudgetExceededError";
+      throw error;
+    }
+    this.used += 1;
+  }
 }
 
 function readBoundedIntegerSetting(

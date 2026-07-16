@@ -10,6 +10,11 @@ type AiProviderUiValue = AiProvider | "invalid";
 type QwenUiSettings = {
   enabled: boolean;
   bankingEnvironment: boolean;
+  qwenContextWindowTokens: number;
+  qwenGenerationMaxTokens: number;
+  qwenAnalysisMaxOutputTokens: number;
+  qwenReduceMaxOutputTokens: number;
+  qwenSynthesisMaxOutputTokens: number;
   endpoint: string;
   model: string;
   temperature: number;
@@ -126,8 +131,16 @@ export class BankSpringDocsPanel {
     }
 
     if (message.type === "saveQwenSettings") {
-      await vscode.commands.executeCommand("bankSpringDocs.saveQwenSettings", message.settings);
-      this.postSettings();
+      try {
+        await saveQwenLimitSettings(message.settings);
+        await vscode.commands.executeCommand("bankSpringDocs.saveQwenSettings", message.settings);
+        this.postSettings();
+      } catch (error) {
+        this.panel.webview.postMessage({
+          type: "error",
+          message: `Qwen ayarları kaydedilemedi: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
       return;
     }
 
@@ -138,6 +151,7 @@ export class BankSpringDocsPanel {
         message: "Qwen endpoint'ine kısa test isteği gönderiliyor..."
       });
       try {
+        await saveQwenLimitSettings(message.settings);
         const result = await vscode.commands.executeCommand<QwenConnectionResult>("bankSpringDocs.testQwenConnection", message.settings);
         this.panel.webview.postMessage({
           type: "qwenTestResult",
@@ -189,7 +203,14 @@ export class BankSpringDocsPanel {
       ai: {
         provider: normalizeAiProvider(config.get<string>("ai.provider", "copilot"))
       },
-      qwen: new QwenSettingsService(this.context).getSettings(),
+      qwen: {
+        ...new QwenSettingsService(this.context).getSettings(),
+        qwenContextWindowTokens: config.get<number>("qwen.contextWindowTokens", 131072),
+        qwenGenerationMaxTokens: config.get<number>("qwen.generationMaxTokens", 16384),
+        qwenAnalysisMaxOutputTokens: config.get<number>("pageAnalysis.qwenAnalysisMaxOutputTokens", 2048),
+        qwenReduceMaxOutputTokens: config.get<number>("pageAnalysis.qwenReduceMaxOutputTokens", 3072),
+        qwenSynthesisMaxOutputTokens: config.get<number>("pageAnalysis.qwenSynthesisMaxOutputTokens", 4096)
+      },
       semantic: {
         cacheEnabled: config.get<boolean>("semantic.cacheEnabled", true),
         maxFilesPerRun: config.get<number>("semantic.maxFilesPerRun", 50),
@@ -614,6 +635,27 @@ export class BankSpringDocsPanel {
             Semantik Timeout
             <input id="qwenTimeoutSeconds" type="number" min="5" step="5">
           </label>
+          <div class="muted wide"><strong>Qwen-only context ve aşama limitleri</strong><br>Bu alanlar Copilot'u etkilemez. Banking için başlangıç önerisi: context 16384, tam üretim 4096, analysis 2048, reduce 3072, synthesis 4096.</div>
+          <label>
+            Toplam context window (token)
+            <input id="qwenContextWindowTokens" type="number" min="8192" step="1024">
+          </label>
+          <label>
+            Tam doküman üretim üst sınırı (token)
+            <input id="qwenGenerationMaxTokens" type="number" min="256" step="256">
+          </label>
+          <label>
+            Sayfa analysis çıktı bütçesi (token)
+            <input id="qwenAnalysisMaxOutputTokens" type="number" min="256" max="65536" step="256">
+          </label>
+          <label>
+            Sayfa reduce çıktı bütçesi (token)
+            <input id="qwenReduceMaxOutputTokens" type="number" min="256" max="65536" step="256">
+          </label>
+          <label class="wide">
+            Sayfa synthesis çıktı bütçesi (token)
+            <input id="qwenSynthesisMaxOutputTokens" type="number" min="256" max="65536" step="256">
+          </label>
           <label class="checkLabel wide">
             <input id="qwenUseApiKey" type="checkbox">
             API Key kullan
@@ -666,6 +708,11 @@ export class BankSpringDocsPanel {
     const qwenTemperature = document.getElementById("qwenTemperature");
     const qwenMaxTokens = document.getElementById("qwenMaxTokens");
     const qwenTimeoutSeconds = document.getElementById("qwenTimeoutSeconds");
+    const qwenContextWindowTokens = document.getElementById("qwenContextWindowTokens");
+    const qwenGenerationMaxTokens = document.getElementById("qwenGenerationMaxTokens");
+    const qwenAnalysisMaxOutputTokens = document.getElementById("qwenAnalysisMaxOutputTokens");
+    const qwenReduceMaxOutputTokens = document.getElementById("qwenReduceMaxOutputTokens");
+    const qwenSynthesisMaxOutputTokens = document.getElementById("qwenSynthesisMaxOutputTokens");
     const qwenUseApiKey = document.getElementById("qwenUseApiKey");
     const qwenApiKey = document.getElementById("qwenApiKey");
     const semanticCacheEnabled = document.getElementById("semanticCacheEnabled");
@@ -716,6 +763,11 @@ export class BankSpringDocsPanel {
         temperature: Number(qwenTemperature.value || "0.1"),
         maxTokens: Number(qwenMaxTokens.value || "4096"),
         timeoutSeconds: Number(qwenTimeoutSeconds.value || "120"),
+        qwenContextWindowTokens: Number(qwenContextWindowTokens.value || "131072"),
+        qwenGenerationMaxTokens: Number(qwenGenerationMaxTokens.value || "16384"),
+        qwenAnalysisMaxOutputTokens: Number(qwenAnalysisMaxOutputTokens.value || "2048"),
+        qwenReduceMaxOutputTokens: Number(qwenReduceMaxOutputTokens.value || "3072"),
+        qwenSynthesisMaxOutputTokens: Number(qwenSynthesisMaxOutputTokens.value || "4096"),
         useApiKey: qwenUseApiKey.checked,
         semanticCacheEnabled: semanticCacheEnabled.checked,
         semanticMaxFilesPerRun: Number(semanticMaxFilesPerRun.value || "50"),
@@ -793,6 +845,11 @@ export class BankSpringDocsPanel {
           qwenTemperature.value = String(message.qwen.temperature ?? 0.1);
           qwenMaxTokens.value = String(message.qwen.maxTokens ?? 4096);
           qwenTimeoutSeconds.value = String(message.qwen.timeoutSeconds ?? 120);
+          qwenContextWindowTokens.value = String(message.qwen.qwenContextWindowTokens ?? 131072);
+          qwenGenerationMaxTokens.value = String(message.qwen.qwenGenerationMaxTokens ?? 16384);
+          qwenAnalysisMaxOutputTokens.value = String(message.qwen.qwenAnalysisMaxOutputTokens ?? 2048);
+          qwenReduceMaxOutputTokens.value = String(message.qwen.qwenReduceMaxOutputTokens ?? 3072);
+          qwenSynthesisMaxOutputTokens.value = String(message.qwen.qwenSynthesisMaxOutputTokens ?? 4096);
           qwenUseApiKey.checked = Boolean(message.qwen.useApiKey);
           applyBankingEnvironmentState(qwenBankingEnvironment.checked);
         }
@@ -840,4 +897,42 @@ function createNonce(): string {
 
 function normalizeAiProvider(value: unknown): AiProviderUiValue {
   return value === "copilot" || value === "qwen" ? value : "invalid";
+}
+
+async function saveQwenLimitSettings(settings: QwenUiSettings): Promise<void> {
+  const config = vscode.workspace.getConfiguration("bankSpringDocs");
+  const contextWindow = qwenLimitValue(settings.qwenContextWindowTokens, "Qwen context window", 8192);
+  const generationCap = qwenLimitValue(settings.qwenGenerationMaxTokens, "Qwen generation cap", 256);
+  const analysisOutput = qwenLimitValue(settings.qwenAnalysisMaxOutputTokens, "Qwen analysis output", 256, 65536);
+  const reduceOutput = qwenLimitValue(settings.qwenReduceMaxOutputTokens, "Qwen reduce output", 256, 65536);
+  const synthesisOutput = qwenLimitValue(settings.qwenSynthesisMaxOutputTokens, "Qwen synthesis output", 256, 65536);
+  validateQwenPageBudgets(contextWindow, generationCap, [analysisOutput, reduceOutput, synthesisOutput]);
+  const updates: Array<[string, number]> = [
+    ["qwen.contextWindowTokens", contextWindow],
+    ["qwen.generationMaxTokens", generationCap],
+    ["pageAnalysis.qwenAnalysisMaxOutputTokens", analysisOutput],
+    ["pageAnalysis.qwenReduceMaxOutputTokens", reduceOutput],
+    ["pageAnalysis.qwenSynthesisMaxOutputTokens", synthesisOutput]
+  ];
+  for (const [key, value] of updates) {
+    await config.update(key, value, vscode.ConfigurationTarget.Global);
+  }
+}
+
+function validateQwenPageBudgets(contextWindow: number, generationCap: number, phaseOutputs: number[]): void {
+  const largestPhaseOutput = Math.max(...phaseOutputs);
+  if (largestPhaseOutput > generationCap) {
+    throw new Error("Qwen sayfa aşaması çıktı bütçeleri tam doküman üretim üst sınırını aşamaz.");
+  }
+  const safeInputCharacters = Math.min(60000, Math.floor(contextWindow - largestPhaseOutput - 2048) * 3);
+  if (safeInputCharacters < 8001) {
+    throw new Error("Qwen context window, çıktı bütçeleri ve 2048 token güvenlik rezervi için yetersiz.");
+  }
+}
+
+function qwenLimitValue(value: number, label: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`${label} değeri ${minimum}-${maximum} aralığında olmalıdır.`);
+  }
+  return Math.floor(value);
 }

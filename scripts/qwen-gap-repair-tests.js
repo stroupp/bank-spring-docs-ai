@@ -42,6 +42,7 @@ global.fetch = async () => {
 const { buildRepairContext } = require("../dist/pageanalysis/gapRepair/pageGapEvidenceSelector");
 const { buildPageGapRepairPlan } = require("../dist/pageanalysis/gapRepair/pageGapRepairPlanner");
 const { PageSectionRegenerator } = require("../dist/pageanalysis/gapRepair/pageSectionRegenerator");
+const { FinalPageDocumentBuilder } = require("../dist/pageanalysis/finalPageDocumentBuilder");
 
 const token = {
   isCancellationRequested: false,
@@ -70,6 +71,220 @@ function model(id, name = id, family = id) {
     version: "test",
     maxInputTokens: 131072
   };
+}
+
+async function writeGroupedRepairFixture(pageRoot, gaps) {
+  await fs.mkdir(pageRoot, { recursive: true });
+  const sections = [...new Set(gaps.map((gap) => gap.section))];
+  await fs.writeFile(path.join(pageRoot, "page-context-pack.md"), "Grouped repair context", "utf8");
+  await fs.writeFile(path.join(pageRoot, "page-evidence-pack.md"), [
+    "# Page Evidence Pack",
+    ...sections.flatMap((section) => [
+      `## ${section}`,
+      `${section} evidence src/main/java/example/GroupedRepair.java`
+    ])
+  ].join("\n"), "utf8");
+  await fs.writeFile(path.join(pageRoot, "copilot-draft.md"), sections.flatMap((section) => [
+    `## ${section}`,
+    `Weak ${section} draft src/main/java/example/GroupedRepair.java`
+  ]).join("\n\n"), "utf8");
+  await fs.writeFile(path.join(pageRoot, "detected-gaps.json"), JSON.stringify(gaps), "utf8");
+}
+
+async function testGroupedQwenRepair(multiRepoRoot) {
+  const pageRoot = path.join(multiRepoRoot, "page-analysis", "pages", "grouped-repair");
+  const sectionNames = [
+    "Guvenlik Gozlemleri",
+    "Backend Endpoint Eslesmesi",
+    "Belirsizlikler",
+    "BFF Endpoint Eslesmesi",
+    "Validasyon ve Hata Yonetimi"
+  ];
+  const gaps = sectionNames.map((section, index) => ({
+    id: `group-gap-${index + 1}`,
+    pageName: "GroupedRepair",
+    section,
+    gapType: "not-visible",
+    description: `${section} needs bounded repair.`,
+    suggestedEvidence: ["page-evidence-pack.md"],
+    severity: "medium"
+  }));
+  await writeGroupedRepairFixture(pageRoot, gaps);
+
+  const calls = [];
+  const client = {
+    provider: "qwen",
+    async send(prompt) {
+      const targetBlock = prompt.userPrompt.match(/<TARGET_SECTIONS>\n([\s\S]*?)\n<\/TARGET_SECTIONS>/)?.[1] ?? "";
+      const targets = [...targetBlock.matchAll(/^##\s+(.+)$/gm)].map((match) => match[1]);
+      calls.push({ prompt, targets });
+      return {
+        text: [
+          ...targets.slice().reverse().flatMap((section) => [
+            `## ${section}`,
+            `Repaired ${section} with src/main/java/example/GroupedRepair.java.`
+          ]),
+          "## Untargeted Model Section",
+          "This section must not enter the canonical repair artifact."
+        ].join("\n\n"),
+        usage: usage(),
+        model: model("local/qwen3-32b", "Qwen3 32B", "qwen3"),
+        provider: "qwen"
+      };
+    }
+  };
+
+  settings["qwen.generationMaxTokens"] = 4000;
+  try {
+    await new PageSectionRegenerator(client, {
+      mode: "qwen3",
+      maxInputCharacters: 9000,
+      expectedModelMarker: "qwen3"
+    }).repair(multiRepoRoot, pageRoot, token);
+  } finally {
+    delete settings["qwen.generationMaxTokens"];
+  }
+
+  assert.strictEqual(calls.length, 5, "quality-sensitive Qwen repair must isolate every target section");
+  assert.ok(calls.every((call) => call.targets.length === 1));
+  assert.ok(calls.every((call) => call.prompt.combinedText.length <= 9000));
+  assert.deepStrictEqual(
+    calls.map((call) => call.prompt.maxOutputTokens),
+    [4000, 4000, 4000, 4000, 4000],
+    "each isolated section must receive the complete configured synthesis ceiling"
+  );
+  const repaired = await fs.readFile(path.join(pageRoot, "repaired-sections.md"), "utf8");
+  const expectedHeadings = [
+    "BFF Endpoint E\u015fle\u015fmesi",
+    "Backend Endpoint E\u015fle\u015fmesi",
+    "Validasyon ve Hata Y\u00f6netimi",
+    "G\u00fcvenlik G\u00f6zlemleri",
+    "Belirsizlikler"
+  ];
+  const actualHeadings = [...repaired.matchAll(/^##\s+(.+)$/gm)].map((match) => match[1]);
+  assert.deepStrictEqual(actualHeadings, expectedHeadings, "group outputs must be assembled in canonical page-section order");
+  assert.doesNotMatch(repaired, /Untargeted Model Section/);
+
+  const audits = (await fs.readFile(path.join(multiRepoRoot, "gap-repair", "repair-audit.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const audit = audits.at(-1);
+  assert.strictEqual(audit.status, "success");
+  assert.strictEqual(audit.groupCount, 5);
+  assert.strictEqual(audit.completedGroupCount, 5);
+  assert.strictEqual(audit.requestCount, 5);
+  assert.strictEqual(audit.maxOutputTokens, 4000);
+  assert.deepStrictEqual(audit.requestOutputTokenBudgets, [4000, 4000, 4000, 4000, 4000]);
+  assert.strictEqual(audit.estimatedTotalTokens, 190);
+  assert.strictEqual(audit.canonicalOutputPaths.length, 5);
+  for (const relativePath of [...audit.rawOutputPaths, ...audit.canonicalOutputPaths]) {
+    await fs.access(path.join(multiRepoRoot, relativePath));
+  }
+}
+
+async function testGroupedQwenCancellation(multiRepoRoot) {
+  const pageRoot = path.join(multiRepoRoot, "page-analysis", "pages", "cancelled-grouped-repair");
+  const gaps = ["BFF Endpoint Eslesmesi", "Backend Endpoint Eslesmesi", "Guvenlik Gozlemleri"].map((section, index) => ({
+    id: `cancel-gap-${index + 1}`,
+    pageName: "CancelledGroupedRepair",
+    section,
+    gapType: "not-visible",
+    description: `${section} needs repair.`,
+    suggestedEvidence: ["page-evidence-pack.md"],
+    severity: "medium"
+  }));
+  await writeGroupedRepairFixture(pageRoot, gaps);
+  const cancellationToken = {
+    isCancellationRequested: false,
+    onCancellationRequested() { return { dispose() {} }; }
+  };
+  let calls = 0;
+  const client = {
+    provider: "qwen",
+    async send(prompt) {
+      calls += 1;
+      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+(.+)\n<\/TARGET_SECTIONS>/)?.[1] ?? "Belirsizlikler";
+      cancellationToken.isCancellationRequested = true;
+      return {
+        text: `## ${target}\nUseful completed output before cancellation.`,
+        usage: usage(),
+        model: model("local/qwen3-32b", "Qwen3 32B", "qwen3"),
+        provider: "qwen"
+      };
+    }
+  };
+
+  await assert.rejects(
+    () => new PageSectionRegenerator(client, {
+      mode: "qwen3",
+      maxInputCharacters: 9000,
+      maxOutputTokens: 2000
+    }).repair(multiRepoRoot, pageRoot, cancellationToken),
+    /cancelled by the user/i
+  );
+  assert.strictEqual(calls, 1, "cancellation after a completed response must prevent the next group request");
+  const audits = (await fs.readFile(path.join(multiRepoRoot, "gap-repair", "repair-audit.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const audit = audits.at(-1);
+  assert.strictEqual(audit.status, "cancelled");
+  assert.strictEqual(audit.completedGroupCount, 1);
+  assert.strictEqual(audit.requestCount, 1);
+  assert.strictEqual(audit.rawOutputPaths.length, 1);
+  assert.strictEqual(audit.canonicalOutputPaths.length, 1);
+  await fs.access(path.join(multiRepoRoot, audit.rawOutputPaths[0]));
+  await fs.access(path.join(multiRepoRoot, audit.canonicalOutputPaths[0]));
+}
+
+async function testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot) {
+  const pageRoot = path.join(multiRepoRoot, "page-analysis", "pages", "missing-group-heading");
+  const gaps = ["BFF Endpoint Eslesmesi", "Backend Endpoint Eslesmesi"].map((section, index) => ({
+    id: `missing-heading-gap-${index + 1}`,
+    pageName: "MissingHeading",
+    section,
+    gapType: "not-visible",
+    description: `${section} needs repair.`,
+    suggestedEvidence: ["page-evidence-pack.md"],
+    severity: "medium"
+  }));
+  await writeGroupedRepairFixture(pageRoot, gaps);
+
+  let calls = 0;
+  const client = {
+    provider: "qwen",
+    async send(prompt) {
+      calls += 1;
+      const target = prompt.userPrompt.match(/<TARGET_SECTIONS>\n##\s+(.+)\n<\/TARGET_SECTIONS>/)?.[1];
+      const text = calls === 1
+        ? `## ${target}\nRepaired first section src/main/java/example/GroupedRepair.java.`
+        : "## Untargeted Model Heading\nThis must not replace the original backend section.";
+      return {
+        text,
+        usage: usage(),
+        model: model("local/qwen3-32b", "Qwen3 32B", "qwen3"),
+        provider: "qwen"
+      };
+    }
+  };
+
+  const result = await new PageSectionRegenerator(client, {
+    mode: "qwen3",
+    maxInputCharacters: 9000,
+    maxOutputTokens: 4000
+  }).repair(multiRepoRoot, pageRoot, token);
+  assert.strictEqual(calls, 2);
+  assert.deepStrictEqual(result.missingSections, ["Backend Endpoint Eşleşmesi"]);
+  const repaired = await fs.readFile(result.repairedSectionsPath, "utf8");
+  assert.match(repaired, /^## BFF Endpoint Eşleşmesi$/m);
+  assert.doesNotMatch(repaired, /^## Backend Endpoint Eşleşmesi$/m, "missing model headings must be omitted from the merge artifact");
+  assert.doesNotMatch(repaired, /Untargeted Model Heading/);
+
+  const finalResult = await new FinalPageDocumentBuilder().build(pageRoot);
+  const finalDocument = await fs.readFile(finalResult.finalDocumentPath, "utf8");
+  assert.match(finalDocument, /Repaired first section/);
+  assert.match(
+    finalDocument,
+    /Weak Backend Endpoint Eslesmesi draft/,
+    "a missing repair must preserve the useful original draft section"
+  );
 }
 
 async function main() {
@@ -209,7 +424,7 @@ async function main() {
   assert.ok(capturedPrompt.combinedText.length <= qwenBudget, "repair request must fit the provider-derived input budget");
   assert.ok(capturedPrompt.combinedText.includes("TARGET_DRAFT_SENTINEL"), "sanitized request must retain target-first evidence");
   const repaired = await fs.readFile(path.join(pageRoot, "repaired-sections.md"), "utf8");
-  assert.ok(repaired.startsWith("## Backend Endpoint Eslesmesi"));
+  assert.ok(repaired.startsWith("## Backend Endpoint E\u015fle\u015fmesi"));
   assert.ok(!repaired.includes("<think>"), "leading Qwen reasoning blocks must not reach the final document");
   assert.ok(!repaired.includes("```"), "an outer Markdown fence must be unwrapped");
   assert.ok(!repaired.includes("raw-output-secret"), "secret-shaped response text must not be persisted");
@@ -223,6 +438,10 @@ async function main() {
     .split(/\r?\n/)
     .map((line) => JSON.parse(line));
   assert.strictEqual(audits.at(-1).maskedResponseSecrets, 3);
+
+  await testGroupedQwenRepair(multiRepoRoot);
+  await testGroupedQwenCancellation(multiRepoRoot);
+  await testMissingQwenRepairPreservesOriginalDraft(multiRepoRoot);
 
   let wrongClientCalls = 0;
   await assert.rejects(
@@ -256,7 +475,7 @@ async function main() {
 
   assert.strictEqual(languageModelSelections, 0);
   assert.strictEqual(networkCalls, 0);
-  console.log("Qwen3 gap-repair tests passed (legacy default, target-first budget, sanitation, model boundary; offline). ");
+  console.log("Qwen3 gap-repair tests passed (legacy default, bounded groups, canonical assembly, cancellation, sanitation, model boundary; offline). ");
   await fs.rm(multiRepoRoot, { recursive: true, force: true });
 }
 

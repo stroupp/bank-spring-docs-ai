@@ -160,17 +160,23 @@ export class QwenPageDraftContextChunker {
         try {
           const bounded = await readContainedSource(selection.repoRoot, relativeFile, fileBudget);
           const label = `raw-source:${selection.role}:${relativeFile}`;
-          const blocks = sourceFileBlocks(selection.role, relativeFile, bounded.content, bounded.truncated);
+          const blocks = sourceFileBlocks(
+            selection.role,
+            relativeFile,
+            bounded.content,
+            bounded.truncated,
+            this.options.maxChunkCharacters
+          );
           chunks.push(...this.toChunks("source-file", label, blocks, { role: selection.role, file: relativeFile }));
-          includedSourceFiles.push(`${selection.role}:${relativeFile}`);
+          includedSourceFiles.push(maskSecretsWithStats(`${selection.role}:${relativeFile}`).text);
           if (bounded.truncated) {
-            warnings.push(`${selection.role}:${relativeFile} ${fileBudget} karakterlik adil dosya butcesiyle bas/son orneklenerek eklendi.`);
+            warnings.push(maskSecretsWithStats(`${selection.role}:${relativeFile} ${fileBudget} karakterlik adil dosya butcesiyle bas/son orneklenerek eklendi.`).text);
           }
         } catch (error) {
-          warnings.push(`${selection.role}:${relativeFile} okunamadi: ${error instanceof Error ? error.message : String(error)}`);
+          warnings.push(maskSecretsWithStats(`${selection.role}:${relativeFile} okunamadi: ${error instanceof Error ? error.message : String(error)}`).text);
         }
       }
-      warnings.push(...selection.uncertaintyNotes.map((note) => `${selection.role}: ${note}`));
+      warnings.push(...selection.uncertaintyNotes.map((note) => maskSecretsWithStats(`${selection.role}: ${note}`).text));
     }
     return { chunks, warnings, includedSourceFiles };
   }
@@ -330,19 +336,229 @@ function markdownHeadingBlocks(fileName: string, content: string): string[] {
   return blocks.filter((block) => block.trim());
 }
 
-function sourceFileBlocks(role: "ui" | "bff" | "be", relativeFile: string, content: string, truncated: boolean): string[] {
+interface SourceEvidenceWindow {
+  content: string;
+  startOffset: number;
+  endOffset: number;
+  startLine: number;
+  endLine: number;
+  overlapCharacters: number;
+  boundary: "structure" | "line" | "character" | "end-of-source";
+}
+
+const maxSourceBodyCharacters = 12000;
+const maxSourceOverlapCharacters = 800;
+
+function sourceFileBlocks(
+  role: "ui" | "bff" | "be",
+  relativeFile: string,
+  content: string,
+  truncated: boolean,
+  maxChunkCharacters: number
+): string[] {
   const header = [
     `## Raw ${role.toUpperCase()} source evidence`,
     `- File: ${relativeFile}`,
     `- Sampling: ${truncated ? "bounded head and tail; middle omitted explicitly" : "complete selected file"}`
   ].join("\n");
-  return splitByLines(content, 12000).map((part, index, all) => [
+  // Reserve enough room for deterministic range/overlap metadata and fences.
+  // This keeps the complete source window intact when the generic block packer
+  // applies the configured per-request budget later.
+  const reservedWrapperCharacters = [
     header,
-    `- Source part: ${index + 1}/${all.length}`,
+    "- Source window: 999999999999/999999999999",
+    "- Evidence range: lines 999999999999-999999999999",
+    "- Character range: 99999999999999999999-99999999999999999999 (end exclusive)",
+    "- Split boundary: end-of-source",
+    "- Overlap with previous source window: 999999999999 characters (context only; do not duplicate findings)",
     "```",
-    part,
+    "```"
+  ].join("\n").length + 16;
+  const bodyBudget = Math.max(1, Math.min(
+    maxSourceBodyCharacters,
+    maxChunkCharacters - reservedWrapperCharacters
+  ));
+  const normalized = content.replace(/\r\n?/g, "\n");
+  const windows = splitSourceEvidence(normalized, bodyBudget);
+  // Range metadata remains inside the hashed content. Repeated code bodies at
+  // different source positions therefore cannot be collapsed as duplicates.
+  return windows.map((window, index) => [
+    header,
+    `- Source window: ${index + 1}/${windows.length}`,
+    `- Evidence range: lines ${window.startLine}-${window.endLine}`,
+    `- Character range: ${window.startOffset}-${window.endOffset} (end exclusive)`,
+    `- Split boundary: ${window.boundary}`,
+    `- Overlap with previous source window: ${window.overlapCharacters} characters (context only; do not duplicate findings)`,
+    "```",
+    window.content,
     "```"
   ].join("\n"));
+}
+
+/**
+ * Split sampled source before it is wrapped in Markdown. Windows prefer a
+ * nearby code-structure boundary, then a line boundary, and use a raw
+ * character boundary only for an oversized source line. A small overlap is
+ * carried into the next window, but its exact range is disclosed so reducers
+ * can treat it as context rather than a second finding.
+ */
+function splitSourceEvidence(value: string, maxCharacters: number): SourceEvidenceWindow[] {
+  if (!value) {
+    return [{
+      content: "",
+      startOffset: 0,
+      endOffset: 0,
+      startLine: 1,
+      endLine: 1,
+      overlapCharacters: 0,
+      boundary: "end-of-source"
+    }];
+  }
+  if (value.length <= maxCharacters) {
+    return [{
+      content: value,
+      startOffset: 0,
+      endOffset: value.length,
+      startLine: 1,
+      endLine: lineNumberAt(value, value.length, true),
+      overlapCharacters: 0,
+      boundary: "end-of-source"
+    }];
+  }
+
+  const overlapBudget = maxCharacters >= 40
+    ? Math.min(maxSourceOverlapCharacters, Math.max(1, Math.floor(maxCharacters * 0.1)))
+    : 0;
+  const breaks = sourceBreaks(value);
+  const windows: SourceEvidenceWindow[] = [];
+  let startOffset = 0;
+  let coveredEnd = 0;
+
+  while (coveredEnd < value.length) {
+    const choice = chooseSourceWindowEnd(value.length, startOffset, coveredEnd, maxCharacters, breaks);
+    const endOffset = choice.endOffset;
+    windows.push({
+      content: value.slice(startOffset, endOffset),
+      startOffset,
+      endOffset,
+      startLine: lineNumberAt(value, startOffset, false),
+      endLine: lineNumberAt(value, endOffset, true),
+      overlapCharacters: Math.max(0, coveredEnd - startOffset),
+      boundary: choice.boundary
+    });
+    if (endOffset >= value.length) {
+      break;
+    }
+    coveredEnd = endOffset;
+    startOffset = chooseSourceOverlapStart(startOffset, endOffset, overlapBudget, breaks.lineStarts);
+  }
+  return windows;
+}
+
+function sourceBreaks(value: string): {
+  structural: number[];
+  lines: number[];
+  lineStarts: number[];
+} {
+  const structural: number[] = [];
+  const lines: number[] = [];
+  const lineStarts = [0];
+  let lineStart = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "\n") {
+      continue;
+    }
+    const offset = index + 1;
+    const line = value.slice(lineStart, offset);
+    lines.push(offset);
+    if (isSourceStructureBoundary(line)) {
+      structural.push(offset);
+    }
+    if (offset < value.length) {
+      lineStarts.push(offset);
+    }
+    lineStart = offset;
+  }
+  return { structural, lines, lineStarts };
+}
+
+function isSourceStructureBoundary(line: string): boolean {
+  const trimmed = line.trim();
+  return !trimmed
+    || /^[}\])]+[;,]?$/.test(trimmed)
+    || /^(?:end|fi|done)\b/i.test(trimmed);
+}
+
+function chooseSourceWindowEnd(
+  valueLength: number,
+  startOffset: number,
+  coveredEnd: number,
+  maxCharacters: number,
+  breaks: { structural: number[]; lines: number[] }
+): { endOffset: number; boundary: SourceEvidenceWindow["boundary"] } {
+  const hardEnd = Math.min(valueLength, startOffset + maxCharacters);
+  if (hardEnd >= valueLength) {
+    return { endOffset: valueLength, boundary: "end-of-source" };
+  }
+
+  // Overlap must never prevent forward progress. Prefer a boundary in the
+  // latter half of the window, but always require at least one new character.
+  const minimumUsefulEnd = Math.max(coveredEnd + 1, startOffset + Math.floor(maxCharacters * 0.4));
+  const structural = lastBreakWithin(breaks.structural, minimumUsefulEnd, hardEnd);
+  if (structural !== undefined) {
+    return { endOffset: structural, boundary: "structure" };
+  }
+  const line = lastBreakWithin(
+    breaks.lines,
+    Math.max(coveredEnd + 1, startOffset + Math.floor(maxCharacters * 0.25)),
+    hardEnd
+  );
+  if (line !== undefined) {
+    return { endOffset: line, boundary: "line" };
+  }
+  return { endOffset: hardEnd, boundary: "character" };
+}
+
+function lastBreakWithin(values: number[], minimum: number, maximum: number): number | undefined {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (value > maximum) {
+      continue;
+    }
+    return value >= minimum ? value : undefined;
+  }
+  return undefined;
+}
+
+function chooseSourceOverlapStart(
+  previousStart: number,
+  endOffset: number,
+  overlapBudget: number,
+  lineStarts: number[]
+): number {
+  if (overlapBudget <= 0) {
+    return endOffset;
+  }
+  const minimum = Math.max(previousStart + 1, endOffset - overlapBudget);
+  // Prefer whole-line overlap. If the window ended inside one oversized line,
+  // fall back to an explicitly ranged character overlap.
+  for (const lineStart of lineStarts) {
+    if (lineStart >= minimum && lineStart < endOffset) {
+      return lineStart;
+    }
+  }
+  return Math.min(endOffset, minimum);
+}
+
+function lineNumberAt(value: string, offset: number, endExclusive: boolean): number {
+  const target = endExclusive && offset > 0 ? offset - 1 : Math.min(offset, value.length);
+  let line = 1;
+  for (let index = 0; index < target; index += 1) {
+    if (value[index] === "\n") {
+      line += 1;
+    }
+  }
+  return line;
 }
 
 function packSemanticBlocks(blocks: string[], maxCharacters: number): string[] {
@@ -410,18 +626,20 @@ function makeChunk(input: {
   partCount: number;
 }): QwenPageDraftContextChunk {
   const safe = maskSecretsWithStats(input.content);
+  const safeLabel = maskSecretsWithStats(input.sourceLabel);
+  const safeSourceFile = input.sourceFile ? maskSecretsWithStats(input.sourceFile) : undefined;
   const contentHash = sha256(safe.text);
-  const stem = safeName(`${input.kind}-${input.sourceLabel}`) || "page-evidence";
+  const stem = safeName(`${input.kind}-${safeLabel.text}`) || "page-evidence";
   return {
     id: `${stem.slice(0, 70)}-${input.part}-${contentHash.slice(0, 12)}`,
     kind: input.kind,
-    sourceLabel: input.sourceLabel,
+    sourceLabel: safeLabel.text,
     content: safe.text,
     contentHash,
     characters: safe.text.length,
-    maskedSecrets: safe.maskedSecrets,
+    maskedSecrets: safe.maskedSecrets + safeLabel.maskedSecrets + (safeSourceFile?.maskedSecrets ?? 0),
     role: input.role,
-    sourceFile: input.sourceFile,
+    sourceFile: safeSourceFile?.text,
     part: input.part,
     partCount: input.partCount
   };

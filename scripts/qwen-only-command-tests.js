@@ -29,8 +29,9 @@ const settings = {
   "pageAnalysis.qwenOnly": false,
   "qwen.enabled": true,
   "qwen.bankingEnvironment": false,
-  "qwen.contextWindowTokens": 131072,
-  "qwen.generationMaxTokens": 16384
+  "qwen.contextWindowTokens": 16384,
+  "qwen.generationMaxTokens": 16384,
+  "pageAnalysis.qwenMaxModelCalls": 96
 };
 let currentRun;
 let networkCalls = 0;
@@ -116,17 +117,21 @@ const dependencyMocks = {
   },
   "../pageanalysis/qwenPageSemanticAnalyzer": {
     QwenPageSemanticAnalyzer: class {
-      constructor(...args) { currentRun.semanticConstructorArgs.push(args); }
+      constructor(...args) { this.args = args; currentRun.semanticConstructorArgs.push(args); }
       async analyze() {
         record("qwen-semantics");
         if (currentRun.semanticError) { throw currentRun.semanticError; }
-        return { analyzedInteractions: 0, cacheHits: 0, failures: 0 };
+        for (let index = 0; index < currentRun.semanticHookCalls; index += 1) {
+          this.args[3]?.onModelCall?.("semantic");
+        }
+        return { analyzedInteractions: 0, cacheHits: 0, failures: 0, skippedInteractions: 0 };
       }
     }
   },
   "../pageanalysis/qwenIterativePageDraftGenerator": {
     QwenIterativePageDraftGenerator: class {
       constructor(client, options) {
+        this.options = options;
         currentRun.iterativeClients.push(client);
         currentRun.iterativeOptions.push(options);
       }
@@ -134,6 +139,9 @@ const dependencyMocks = {
         record("qwen-iterative-draft");
         assert.strictEqual(input.pageRoot, "/mock/page");
         assert.strictEqual(input.manifest, manifest);
+        for (let index = 0; index < currentRun.draftHookCalls; index += 1) {
+          this.options?.onModelCall?.("analysis");
+        }
         return {
           draftPath: "/mock/page/copilot-draft.md",
           chunkCount: 3,
@@ -146,10 +154,17 @@ const dependencyMocks = {
   "../pageanalysis/gapRepair/pageSectionRegenerator": {
     PageSectionRegenerator: class {
       constructor(client, options) {
+        this.options = options;
         currentRun.repairClients.push(client);
         currentRun.repairOptions.push(options);
       }
-      async repair() { record("repair"); return { repairedGapCount: 1 }; }
+      async repair() {
+        record("repair");
+        for (let index = 0; index < currentRun.repairHookCalls; index += 1) {
+          this.options?.onModelCall?.("repair");
+        }
+        return { repairedGapCount: 1 };
+      }
     }
   },
   "../pageanalysis/quality/pageDocumentQualityScorer": {
@@ -242,6 +257,9 @@ function newRun(name) {
     iterativeOptions: [],
     semanticConstructorArgs: [],
     semanticError: undefined,
+    semanticHookCalls: 0,
+    draftHookCalls: 0,
+    repairHookCalls: 0,
     repairClients: [],
     repairOptions: [],
     events: []
@@ -266,13 +284,28 @@ async function main() {
   assert.strictEqual(qwenRun.semanticConstructorArgs.length, 1);
   assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].client, qwenClient, "Qwen-only semantics must reuse the explicit client snapshot");
   assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].expectedModelMarker, "qwen3");
+  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].maxOutputTokens, 2048);
+  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].maxGatewayRetries, 2);
+  assert.strictEqual(qwenRun.semanticConstructorArgs[0][3].retryBaseDelayMs, 750);
+  assert.strictEqual(typeof qwenRun.semanticConstructorArgs[0][3].onModelCall, "function");
   assert.match(qwenRun.semanticConstructorArgs[0][3].cacheIdentity, /qwen3/i);
   assert.deepStrictEqual(qwenRun.iterativeClients, [qwenClient]);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxInputCharacters, 30720, "16K context must reserve only the largest phase output budget");
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxChunkCharacters, 23720);
+  assert.strictEqual(qwenRun.iterativeOptions[0].analysisMaxOutputTokens, 2048);
+  assert.strictEqual(qwenRun.iterativeOptions[0].reduceMaxOutputTokens, 3072);
+  assert.strictEqual(qwenRun.iterativeOptions[0].synthesisMaxOutputTokens, 4096);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxGatewayRetries, 2);
+  assert.strictEqual(qwenRun.iterativeOptions[0].maxModelCalls, 96);
+  assert.strictEqual(typeof qwenRun.iterativeOptions[0].onModelCall, "function");
   assert.deepStrictEqual(qwenRun.copilotDraftClients, [], "Qwen-only mode must not construct the existing Copilot draft generator");
   assert.deepStrictEqual(qwenRun.repairClients, [qwenClient], "Qwen-only gap repair must receive the explicit Qwen client");
   assert.strictEqual(qwenRun.repairOptions[0].mode, "qwen3", "Qwen-only gap repair must enable its hardened Qwen3 mode");
   assert.strictEqual(qwenRun.repairOptions[0].maxInputCharacters, qwenRun.iterativeOptions[0].maxInputCharacters, "repair must reuse the provider-derived Qwen input budget");
+  assert.strictEqual(qwenRun.repairOptions[0].maxOutputTokens, 4096);
+  assert.strictEqual(qwenRun.repairOptions[0].maxGatewayRetries, 2);
   assert.strictEqual(qwenRun.repairOptions[0].expectedModelMarker, "qwen3");
+  assert.strictEqual(typeof qwenRun.repairOptions[0].onModelCall, "function");
   assert.deepStrictEqual(qwenRun.events, [
     "freshness", "context", "evidence", "qwen-semantics", "qwen-iterative-draft",
     "gap", "repair", "final", "quality", "quality-write", "quality-aggregate"
@@ -307,6 +340,29 @@ async function main() {
   );
   assert.ok(errors.some((message) => /unexpected model notqwen3fake/i.test(message)));
   errors.length = 0;
+
+  settings["pageAnalysis.qwenMaxModelCalls"] = 12;
+  const reservedBudgetRun = newRun("semantic-budget-reservation");
+  reservedBudgetRun.semanticHookCalls = 1;
+  reservedBudgetRun.draftHookCalls = 10;
+  reservedBudgetRun.repairHookCalls = 2;
+  await execute({ qwenOnly: true }, reservedBudgetRun);
+  assert.ok(
+    warnings.some((message) => /zorunlu dokuman asamalari icin kapasite korundu/i.test(message)),
+    "optional semantics must yield its budget when required phases need the full small cap"
+  );
+  assert.ok(reservedBudgetRun.events.includes("final"), "reserved draft/repair capacity must let the required pipeline finish");
+
+  settings["pageAnalysis.qwenMaxModelCalls"] = 14;
+  const exhaustedBudgetRun = newRun("global-budget-exhaustion");
+  exhaustedBudgetRun.semanticHookCalls = 1;
+  exhaustedBudgetRun.draftHookCalls = 13;
+  exhaustedBudgetRun.repairHookCalls = 1;
+  await execute({ qwenOnly: true }, exhaustedBudgetRun);
+  assert.ok(errors.some((message) => /14 toplam model istek denemesi sinirina ulasti \(repair\)/i.test(message)));
+  assert.ok(!exhaustedBudgetRun.events.includes("final"), "global attempt exhaustion must stop before publishing a misleading final document");
+  errors.length = 0;
+  settings["pageAnalysis.qwenMaxModelCalls"] = 96;
 
   // Explicit false must override a persisted true setting and preserve the old path.
   settings["pageAnalysis.qwenOnly"] = true;

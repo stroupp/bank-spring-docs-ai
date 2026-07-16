@@ -56,23 +56,24 @@ export class QwenDocumentationModelClient implements IDocumentationModelClient {
     const messages = buildMessages(prompt);
     const usageText = requestText(prompt);
     const estimatedInputTokens = estimateConservativeInputTokens(usageText.length);
+    const requestMaxOutputTokens = resolveRequestMaxOutputTokens(prompt, this.maxOutputTokens);
 
-    if (estimatedInputTokens + this.maxOutputTokens > this.contextWindowTokens) {
+    if (estimatedInputTokens + requestMaxOutputTokens > this.contextWindowTokens) {
       throw new Error(
-        `Qwen bağlam bütçesi aşıldı: korumalı yaklaşık ${estimatedInputTokens} giriş + ${this.maxOutputTokens} çıkış token, ` +
+        `Qwen bağlam bütçesi aşıldı: korumalı yaklaşık ${estimatedInputTokens} giriş + ${requestMaxOutputTokens} çıkış token, ` +
         `yapılandırılan pencere ${this.contextWindowTokens} token. Bağlamı veya generationMaxTokens ayarını küçültün.`
       );
     }
 
     const result = await this.client.complete(messages, {
       temperature: this.settings.temperature,
-      maxTokens: this.maxOutputTokens,
+      maxTokens: requestMaxOutputTokens,
       timeoutSeconds: this.timeoutSeconds
     }, token);
     if (result.finishReason?.toLowerCase() === "length") {
       throw new Error(
-        "Qwen doküman yanıtı maksimum token sınırında kesildi. " +
-        "bankSpringDocs.qwen.generationMaxTokens ayarını artırın veya bağlamı küçültün."
+        `Qwen doküman yanıtı ${requestMaxOutputTokens} token çıktı sınırında kesildi. ` +
+        "İlgili Qwen aşamasının çıktı bütçesini artırın veya bağlamı küçültün."
       );
     }
     if (!result.content.trim()) {
@@ -135,6 +136,19 @@ function requestText(prompt: string | DocumentationModelRequest): string {
     return prompt;
   }
   return prompt.combinedText ?? [prompt.instructions, prompt.userPrompt].filter(Boolean).join("\n\n");
+}
+
+function resolveRequestMaxOutputTokens(
+  prompt: string | DocumentationModelRequest,
+  configuredMaxOutputTokens: number
+): number {
+  if (typeof prompt === "string" || prompt.maxOutputTokens === undefined) {
+    return configuredMaxOutputTokens;
+  }
+  return Math.min(
+    positiveInteger(prompt.maxOutputTokens, "Qwen istek maxOutputTokens"),
+    configuredMaxOutputTokens
+  );
 }
 
 function buildUsage(

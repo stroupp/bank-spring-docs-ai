@@ -38,6 +38,8 @@ async function main() {
   testContextBudgetAndSecretMasking();
   await testPageContextEvidenceCacheAndArtifacts();
   await testVerifiedQwen3SemanticClientAndSanitation();
+  await testVerifiedQwen3SemanticTransientRetry();
+  await testVerifiedQwen3SemanticOutageCircuitBreaker();
   await testApprovedBankingAliasAcceptedViaQwen3Family();
   await testVerifiedQwen3SemanticBoundaryRejection();
   await testVerifiedQwen3DebugSanitation();
@@ -191,6 +193,61 @@ async function testApprovedBankingAliasAcceptedViaQwen3Family() {
     expectedModelMarker: "qwen3"
   }).analyze(pageRoot, {}, token);
   assert.strictEqual(result.failures, 0, "the approved banking alias must pass selected-page validation via response family=qwen3");
+  assert.strictEqual(result.analyzedInteractions, 0);
+}
+
+async function testVerifiedQwen3SemanticTransientRetry() {
+  const pageRoot = await createPageRoot("qwen3-semantic-retry", false);
+  let calls = 0;
+  const prompts = [];
+  const client = {
+    provider: "qwen",
+    async send(prompt) {
+      calls += 1;
+      prompts.push(prompt);
+      if (calls === 1) {
+        throw new Error("Qwen bağlantısı kurulamadı. Endpoint çalışıyor mu kontrol edin.");
+      }
+      return documentationResponse(
+        '{"page":"CustomerSearch","confidence":"high","uncertainties":[]}',
+        "qwen3-32b",
+        "qwen"
+      );
+    }
+  };
+  const result = await new QwenPageSemanticAnalyzer(undefined, "qwen3-32b", undefined, {
+    client,
+    cacheIdentity: "qwen3-32b@semantic-retry",
+    expectedModelMarker: "qwen3",
+    maxOutputTokens: 1536,
+    maxGatewayRetries: 1,
+    retryBaseDelayMs: 1
+  }).analyze(pageRoot, {}, token);
+  assert.strictEqual(result.failures, 0);
+  assert.strictEqual(calls, 2, "normalized transient connection errors must be retried once");
+  assert.ok(prompts.every((prompt) => prompt.maxOutputTokens === 1536));
+}
+
+async function testVerifiedQwen3SemanticOutageCircuitBreaker() {
+  const pageRoot = await createPageRoot("qwen3-semantic-circuit", true);
+  let calls = 0;
+  const client = {
+    provider: "qwen",
+    async send() {
+      calls += 1;
+      throw new Error("Qwen HTTP hatası: 504 Gateway Time-out. Sunucu hata gövdesi güvenlik nedeniyle kaydedilmedi.");
+    }
+  };
+  const result = await new QwenPageSemanticAnalyzer(undefined, "qwen3-32b", undefined, {
+    client,
+    cacheIdentity: "qwen3-32b@semantic-circuit",
+    expectedModelMarker: "qwen3",
+    maxGatewayRetries: 2,
+    retryBaseDelayMs: 1
+  }).analyze(pageRoot, {}, token);
+  assert.strictEqual(calls, 3, "page probe must exhaust only its own bounded retry sequence");
+  assert.strictEqual(result.failures, 1);
+  assert.strictEqual(result.skippedInteractions, 1, "page-level transport failure must circuit-break interaction fan-out");
   assert.strictEqual(result.analyzedInteractions, 0);
 }
 

@@ -453,7 +453,7 @@
           "type": "number",
           "default": 4096,
           "minimum": 256,
-          "description": "Qwen yanıtları için maksimum token değeri."
+          "description": "Genel/legacy Qwen yanıtları için maksimum token değeri. Kısa bağlantı testi sabit 64 token, Qwen-only sayfa analizi ise aşama bazlı bütçeler kullanır."
         },
         "bankSpringDocs.qwen.timeoutSeconds": {
           "type": "number",
@@ -471,7 +471,7 @@
           "type": "number",
           "default": 16384,
           "minimum": 256,
-          "description": "Qwen doküman üretim yanıtları için maksimum token değeri."
+          "description": "Qwen doküman üretim yanıtları için global üst token sınırı. Qwen-only sayfa aşaması bütçeleri bu değeri aşamaz."
         },
         "bankSpringDocs.qwen.contextWindowTokens": {
           "type": "number",
@@ -565,10 +565,10 @@
         },
         "bankSpringDocs.pageAnalysis.qwenMaxModelCalls": {
           "type": "number",
-          "default": 48,
-          "minimum": 2,
+          "default": 96,
+          "minimum": 12,
           "maximum": 200,
-          "description": "Bir Qwen3-only sayfa analizi calistirmasinda yapilabilecek yeni model cagrilarinin ust siniri. Tamamlanan adimlar resume sirasinda bu limite dahil edilmez."
+          "description": "Bir Qwen3-only tam sayfa calistirmasindaki toplam yeni Qwen istek denemesi siniri. Semantik, chunk, reduce, bolum sentezi, retry ve gap repair dahildir; resume edilen tamamlanmis adimlar dahil degildir. Opsiyonel semantik asama zorunlu dokuman asamalari icin kapasite birakir."
         },
         "bankSpringDocs.pageAnalysis.qwenMaxReduceLevels": {
           "type": "number",
@@ -576,6 +576,69 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Chunk analizleri final sentez contextine sigmazsa kullanilabilecek hiyerarsik Qwen3 ledger birlestirme seviyesi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 256,
+          "maximum": 65536,
+          "description": "Qwen3-only semantik ve evidence chunk analizlerinin istek basina maksimum cikti token butcesi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens": {
+          "type": "number",
+          "default": 3072,
+          "minimum": 256,
+          "maximum": 65536,
+          "description": "Qwen3-only hiyerarsik ledger reduce isteklerinin maksimum cikti token butcesi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 256,
+          "maximum": 65536,
+          "description": "Qwen3-only bolum grubu final sentez isteklerinin maksimum cikti token butcesi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxGatewayRetries": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 5,
+          "description": "429/502/503/504 ve gecici ag timeout hatalarinda adaptif bolmeden once yapilacak kontrollu retry sayisi."
+        },
+        "bankSpringDocs.pageAnalysis.qwenRetryBaseDelayMs": {
+          "type": "number",
+          "default": 750,
+          "minimum": 100,
+          "maximum": 30000,
+          "description": "Gecici Qwen gateway hatalarindaki exponential backoff baslangic gecikmesi (milisaniye)."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMaxAdaptiveSplitDepth": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 8,
+          "description": "Timeout/504 veya 413/context/output-length gibi boyuta bagli hatalarda yalnizca basarisiz evidence chunk'i icin kullanilacak maksimum adaptif bolme derinligi. Kalici 429/502/503 hatalari parcacik sayisini artirmaz."
+        },
+        "bankSpringDocs.pageAnalysis.qwenMinAdaptiveSplitCharacters": {
+          "type": "number",
+          "default": 4000,
+          "minimum": 1000,
+          "maximum": 100000,
+          "description": "Adaptif bolme sonrasi her alt evidence parcasinda hedeflenen minimum karakter."
+        },
+        "bankSpringDocs.pageAnalysis.qwenAdaptiveSplitOverlapCharacters": {
+          "type": "number",
+          "default": 600,
+          "minimum": 0,
+          "maximum": 20000,
+          "description": "Adaptif bolunen evidence parcalari arasinda baglami koruyacak maksimum overlap karakteri."
+        },
+        "bankSpringDocs.pageAnalysis.qwenFinalSectionGroupSize": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 17,
+          "description": "Tek bir Qwen3 final sentez isteginde hedeflenecek kanonik dokuman bolumu sayisi. Boyut veya output-length hatasinda grup otomatik olarak daha kucuk isteklere ayrilir."
         },
         "bankSpringDocs.pageAnalysis.maxEvidenceCharacters": {
           "type": "number",

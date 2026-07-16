@@ -220,7 +220,10 @@ export class QwenClient implements IQwenClient {
           content: "You are a Qwen connection test. Return only the exact JSON requested by the user, without explanation."
         },
         { role: "user", content: "Return exactly this JSON: {\"ok\":true}" }
-      ]);
+      ], {
+        maxTokens: 64,
+        timeoutSeconds: settings.timeoutSeconds
+      });
       const output = result.content;
       if (!/\{\s*"ok"\s*:\s*true\s*\}/i.test(output)) {
         throw new Error("Qwen connection test did not return the expected {\"ok\":true} JSON response.");

@@ -42,6 +42,19 @@ export interface QwenIterativePageDraftOptions {
   maxModelCalls?: number;
   /** Maximum hierarchical ledger-reduction depth. */
   maxReduceLevels?: number;
+  /** Output budgets are phase-specific so short map calls do not reserve final-document capacity. */
+  analysisMaxOutputTokens?: number;
+  reduceMaxOutputTokens?: number;
+  synthesisMaxOutputTokens?: number;
+  /** Number of bounded retries for transient gateway/network failures before adaptive splitting. */
+  maxGatewayRetries?: number;
+  retryBaseDelayMs?: number;
+  /** Repeatedly failing evidence chunks may be split into deterministic overlapping children. */
+  maxAdaptiveSplitDepth?: number;
+  minAdaptiveSplitCharacters?: number;
+  adaptiveSplitOverlapCharacters?: number;
+  /** Number of canonical sections rendered by one bounded synthesis request. */
+  finalSectionGroupSize?: number;
   /** Qwen deployment identity included in resume compatibility. */
   modelIdentity?: string;
   /** Every response model id/name must contain this marker. */
@@ -50,6 +63,10 @@ export interface QwenIterativePageDraftOptions {
   now?: () => Date;
   /** Deterministic injection seam for tests. */
   runIdFactory?: () => string;
+  /** Deterministic no-sleep seam for retry tests. */
+  delay?: (milliseconds: number, token: vscode.CancellationToken) => Promise<void>;
+  /** Optional run-wide budget hook shared with semantic and repair phases. */
+  onModelCall?: (phase: "analysis" | "reduce" | "synthesis") => void;
 }
 
 export interface QwenIterativePageDraftInput {
@@ -110,6 +127,8 @@ interface QwenPageDraftRunStep {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  resolution?: "adaptive-split";
+  splitInto?: string[];
 }
 
 interface QwenPageDraftRunManifest {
@@ -142,6 +161,13 @@ interface QwenPageDraftRunManifest {
   includedSourceFiles: string[];
   warnings: string[];
   steps: Record<string, QwenPageDraftRunStep>;
+  adaptiveSplits?: Record<string, {
+    inputHash: string;
+    depth: number;
+    childHashes: string[];
+    reason: string;
+    createdAt: string;
+  }>;
   qwenDraftPath?: string;
   compatibilityDraftPath?: string;
   error?: string;
@@ -154,10 +180,21 @@ interface NormalizedOptions {
   maxTotalSourceCharacters: number;
   maxModelCalls: number;
   maxReduceLevels: number;
+  analysisMaxOutputTokens: number;
+  reduceMaxOutputTokens: number;
+  synthesisMaxOutputTokens: number;
+  maxGatewayRetries: number;
+  retryBaseDelayMs: number;
+  maxAdaptiveSplitDepth: number;
+  minAdaptiveSplitCharacters: number;
+  adaptiveSplitOverlapCharacters: number;
+  finalSectionGroupSize: number;
   modelIdentity: string;
   expectedModelMarker: string;
   now: () => Date;
   runIdFactory: () => string;
+  delay: (milliseconds: number, token: vscode.CancellationToken) => Promise<void>;
+  onModelCall?: (phase: "analysis" | "reduce" | "synthesis") => void;
 }
 
 interface InvocationCounters {
@@ -176,8 +213,17 @@ const defaults = {
   maxChunkCharacters: 42000,
   maxSourceFileCharacters: 180000,
   maxTotalSourceCharacters: 720000,
-  maxModelCalls: 48,
+  maxModelCalls: 96,
   maxReduceLevels: 5,
+  analysisMaxOutputTokens: 2048,
+  reduceMaxOutputTokens: 3072,
+  synthesisMaxOutputTokens: 4096,
+  maxGatewayRetries: 2,
+  retryBaseDelayMs: 750,
+  maxAdaptiveSplitDepth: 3,
+  minAdaptiveSplitCharacters: 4000,
+  adaptiveSplitOverlapCharacters: 600,
+  finalSectionGroupSize: 4,
   modelIdentity: "qwen3",
   expectedModelMarker: "qwen3"
 };
@@ -275,12 +321,6 @@ export class QwenIterativePageDraftGenerator {
       for (let index = 0; index < context.chunks.length; index += 1) {
         ensureNotCancelled(input.token);
         const chunk = context.chunks[index];
-        const prompt = buildQwenPageChunkAnalysisPrompt({
-          chunkId: chunk.id,
-          sourceLabel: chunk.sourceLabel,
-          content: chunk.content
-        });
-        assertPromptBudget(prompt, this.options.maxInputCharacters, chunk.sourceLabel);
         input.onProgress?.({
           phase: "analysis",
           message: `Qwen3 evidence chunk ${index + 1}/${context.chunks.length} analiz ediliyor: ${chunk.sourceLabel}`,
@@ -289,16 +329,17 @@ export class QwenIterativePageDraftGenerator {
           modelCalls: counters.newModelCalls,
           reusedSteps: counters.reusedSteps
         });
-        const result = await this.runJsonLedgerStep({
+        const chunkLedgers = await this.analyzeChunkWithResilience({
           runRoot,
           statusRoot,
           manifest,
           counters,
-          stepId: `analysis-${chunk.id}`,
-          kind: "analysis",
-          contextText: chunk.content,
-          prompt,
+          chunkId: chunk.id,
+          sourceLabel: chunk.sourceLabel,
+          content: chunk.content,
+          depth: 0,
           token: input.token,
+          onProgress: input.onProgress,
           onUsage: (usage) => input.onProgress?.({
             phase: "analysis",
             message: `Qwen3 evidence chunk ${index + 1}/${context.chunks.length} tamamlandi.`,
@@ -309,7 +350,7 @@ export class QwenIterativePageDraftGenerator {
             usage
           })
         });
-        ledgers.push(result.value);
+        ledgers.push(...chunkLedgers);
       }
 
       const reduced = await this.reduceLedgers({
@@ -326,41 +367,122 @@ export class QwenIterativePageDraftGenerator {
       const page = asRecord(context.pageFlow.selectedPage);
       const pageName = maskSecretsWithStats(String(page.pageName ?? path.basename(input.pageRoot))).text;
       const route = page.route ? maskSecretsWithStats(String(page.route)).text : undefined;
-      const ledgerText = serializeLedgerList(reduced.ledgers);
-      const finalPrompt = buildQwenPageFinalSynthesisPrompt({ pageName, route, ledger: ledgerText });
-      assertPromptBudget(finalPrompt, this.options.maxInputCharacters, "final synthesis");
-      input.onProgress?.({
-        phase: "synthesis",
-        message: "Qwen3 nihai Turkce sayfa dokumanini sentezliyor.",
-        completed: 0,
-        total: 1,
-        modelCalls: counters.newModelCalls,
-        reusedSteps: counters.reusedSteps
-      });
-      const finalStep = await this.runMarkdownStep({
-        runRoot,
-        statusRoot,
-        manifest,
-        counters,
-        stepId: `final-synthesis-${sha256(ledgerText).slice(0, 16)}`,
-        kind: "synthesis",
-        contextText: ledgerText,
-        prompt: finalPrompt,
-        token: input.token,
-        onUsage: (usage) => input.onProgress?.({
+      const groups = sectionGroups(this.options.finalSectionGroupSize);
+      const finalParts: string[] = [];
+      for (let index = 0; index < groups.length; index += 1) {
+        ensureNotCancelled(input.token);
+        const sections = groups[index];
+        const groupId = `group-${index + 1}-of-${groups.length}`;
+        const ledgerText = serializeLedgerForSections(reduced.ledgers, sections);
+        const groupOutputTokens = sectionGroupOutputTokens(
+          sections.length,
+          this.options.synthesisMaxOutputTokens
+        );
+        const finalPrompt: DocumentationModelRequest = {
+          ...buildQwenPageFinalSynthesisPrompt({ pageName, route, ledger: ledgerText, sections, groupId }),
+          maxOutputTokens: groupOutputTokens
+        };
+        assertPromptBudget(finalPrompt, this.options.maxInputCharacters, `final synthesis ${groupId}`);
+        input.onProgress?.({
           phase: "synthesis",
-          message: "Qwen3 nihai sayfa dokumani sentezlendi.",
-          completed: 1,
-          total: 1,
+          message: `Qwen3 nihai dokuman bolum grubu ${index + 1}/${groups.length} sentezleniyor.`,
+          completed: index,
+          total: groups.length,
           modelCalls: counters.newModelCalls,
-          reusedSteps: counters.reusedSteps,
-          usage
-        })
-      });
+          reusedSteps: counters.reusedSteps
+        });
+        let finalStep: StepResult<string>;
+        try {
+          finalStep = await this.runMarkdownStepWithRetry({
+            runRoot,
+            statusRoot,
+            manifest,
+            counters,
+            stepId: `final-synthesis-${groupId}-${sha256(ledgerText).slice(0, 16)}`,
+            kind: "synthesis",
+            contextText: ledgerText,
+            prompt: finalPrompt,
+            token: input.token,
+            onUsage: (usage) => input.onProgress?.({
+              phase: "synthesis",
+              message: `Qwen3 nihai dokuman bolum grubu ${index + 1}/${groups.length} tamamlandi.`,
+              completed: index + 1,
+              total: groups.length,
+              modelCalls: counters.newModelCalls,
+              reusedSteps: counters.reusedSteps,
+              usage
+            })
+          });
+        } catch (error) {
+          if (isAdaptiveSplitQwenFailure(error) && sections.length > 1) {
+            const midpoint = Math.ceil(sections.length / 2);
+            const children = [sections.slice(0, midpoint), sections.slice(midpoint)]
+              .filter((group) => group.length) as Array<Array<(typeof qwenPageDocumentSections)[number]>>;
+            groups.splice(index, 1, ...children);
+            manifest.warnings = uniqueStrings([
+              ...manifest.warnings,
+              `Qwen3 final synthesis ${groupId} timeout veya boyut siniri nedeniyle ${children.length} daha kucuk bolum grubuna ayrildi.`
+            ]);
+            await this.persistManifest(statusRoot, runRoot, manifest);
+            index -= 1;
+            continue;
+          }
+          throw error;
+        }
+        const selected = selectCanonicalSections(finalStep.value, sections);
+        if (selected.markdown) {
+          finalParts.push(selected.markdown);
+        }
+        if (selected.missingSections.length) {
+          const missingNames = selected.missingSections.join(", ");
+          manifest.warnings = uniqueStrings([
+            ...manifest.warnings,
+            `Qwen3 final synthesis ${groupId} yaniti beklenen bolumleri atladı; hedefli ikinci istek calistirildi: ${missingNames}.`
+          ]);
+          await this.persistManifest(statusRoot, runRoot, manifest);
+          const repairLedgerText = serializeLedgerForSections(reduced.ledgers, selected.missingSections);
+          const repairPrompt: DocumentationModelRequest = {
+            ...buildQwenPageFinalSynthesisPrompt({
+              pageName,
+              route,
+              ledger: repairLedgerText,
+              sections: selected.missingSections,
+              groupId: `${groupId}-missing-sections`
+            }),
+            maxOutputTokens: sectionGroupOutputTokens(
+              selected.missingSections.length,
+              this.options.synthesisMaxOutputTokens
+            )
+          };
+          assertPromptBudget(repairPrompt, this.options.maxInputCharacters, `final synthesis ${groupId} missing sections`);
+          const repairStep = await this.runMarkdownStepWithRetry({
+            runRoot,
+            statusRoot,
+            manifest,
+            counters,
+            stepId: `final-synthesis-${groupId}-missing-${sha256(repairLedgerText).slice(0, 16)}`,
+            kind: "synthesis",
+            contextText: repairLedgerText,
+            prompt: repairPrompt,
+            token: input.token
+          });
+          const repaired = selectCanonicalSections(repairStep.value, selected.missingSections);
+          if (repaired.markdown) {
+            finalParts.push(repaired.markdown);
+          }
+          if (repaired.missingSections.length) {
+            manifest.warnings = uniqueStrings([
+              ...manifest.warnings,
+              `Qwen3 final synthesis ${groupId} hedefli ikinci istekte de bolum atladı: ${repaired.missingSections.join(", ")}. Placeholder korunarak gap repair'e birakildi.`
+            ]);
+            await this.persistManifest(statusRoot, runRoot, manifest);
+          }
+        }
+      }
 
       const canonicalMarkdown = appendCoverageWarnings(
-        ensureCanonicalSections(finalStep.value),
-        context.warnings
+        ensureCanonicalSections(finalParts.join("\n\n")),
+        manifest.warnings
       );
       const metadata = await buildPageArtifactMetadata(input.pageRoot, [
         "page-flow.json",
@@ -434,11 +556,11 @@ export class QwenIterativePageDraftGenerator {
         reduceLevels,
         estimatedTotalTokens: manifest.estimatedTotalTokens,
         includedSourceFiles: context.includedSourceFiles,
-        warnings: context.warnings,
+        warnings: manifest.warnings,
         modelIds: [...manifest.modelIds]
       };
     } catch (error) {
-      const cancelled = input.token.isCancellationRequested || /cancel/i.test(error instanceof Error ? error.message : String(error));
+      const cancelled = input.token.isCancellationRequested || /cancel|iptal/i.test(error instanceof Error ? error.message : String(error));
       manifest.status = cancelled ? "cancelled" : "failed";
       manifest.completedAt = this.timestamp();
       manifest.error = safeError(error);
@@ -450,6 +572,130 @@ export class QwenIterativePageDraftGenerator {
       }
       await this.persistManifest(statusRoot, runRoot, manifest).catch(() => undefined);
       throw error;
+    }
+  }
+
+  private async analyzeChunkWithResilience(input: {
+    runRoot: string;
+    statusRoot: string;
+    manifest: QwenPageDraftRunManifest;
+    counters: InvocationCounters;
+    chunkId: string;
+    sourceLabel: string;
+    content: string;
+    depth: number;
+    token: vscode.CancellationToken;
+    onProgress?: QwenIterativePageDraftInput["onProgress"];
+    onUsage?: (usage: DocumentationModelUsage) => void;
+  }): Promise<QwenPageFactLedger[]> {
+    const stepId = `analysis-${input.chunkId}`;
+    const prompt: DocumentationModelRequest = {
+      ...buildQwenPageChunkAnalysisPrompt({
+        chunkId: input.chunkId,
+        sourceLabel: input.sourceLabel,
+        content: input.content
+      }),
+      maxOutputTokens: this.options.analysisMaxOutputTokens
+    };
+    assertPromptBudget(prompt, this.options.maxInputCharacters, input.sourceLabel);
+    const promptHash = modelRequestHash(prompt);
+    const parts = splitAdaptiveChunk(
+      input.content,
+      this.options.minAdaptiveSplitCharacters,
+      this.options.adaptiveSplitOverlapCharacters
+    );
+    const childInputs = parts?.map((content, index) => ({
+      content,
+      chunkId: `${input.chunkId}-d${input.depth + 1}-p${index + 1}-${sha256(content).slice(0, 10)}`
+    }));
+    const decision = input.manifest.adaptiveSplits?.[stepId];
+    const reusableDecision = decision
+      && decision.inputHash === promptHash
+      && childInputs
+      && equalStringArrays(decision.childHashes, childInputs.map((child) => sha256(child.content)));
+
+    if (reusableDecision && childInputs) {
+      const reused: QwenPageFactLedger[] = [];
+      for (let index = 0; index < childInputs.length; index += 1) {
+        const child = childInputs[index];
+        reused.push(...await this.analyzeChunkWithResilience({
+          ...input,
+          chunkId: child.chunkId,
+          sourceLabel: `${input.sourceLabel} [adaptive ${index + 1}/${childInputs.length}]`,
+          content: child.content,
+          depth: input.depth + 1
+        }));
+      }
+      return reused;
+    }
+
+    try {
+      const result = await this.runJsonLedgerStepWithRetry({
+        runRoot: input.runRoot,
+        statusRoot: input.statusRoot,
+        manifest: input.manifest,
+        counters: input.counters,
+        stepId,
+        kind: "analysis",
+        contextText: input.content,
+        sourceLabel: input.sourceLabel,
+        prompt,
+        token: input.token,
+        onUsage: input.onUsage
+      });
+      return [result.value];
+    } catch (error) {
+      if (
+        !isAdaptiveSplitQwenFailure(error) ||
+        !childInputs ||
+        input.depth >= this.options.maxAdaptiveSplitDepth
+      ) {
+        throw error;
+      }
+      ensureNotCancelled(input.token);
+      const childHashes = childInputs.map((child) => sha256(child.content));
+      input.manifest.adaptiveSplits ??= {};
+      input.manifest.adaptiveSplits[stepId] = {
+        inputHash: promptHash,
+        depth: input.depth,
+        childHashes,
+        reason: boundedError(error),
+        createdAt: this.timestamp()
+      };
+      const parentStep = input.manifest.steps[safeName(stepId) || stepId];
+      if (parentStep) {
+        parentStep.status = "completed";
+        parentStep.completedAt = this.timestamp();
+        parentStep.error = undefined;
+        parentStep.resolution = "adaptive-split";
+        parentStep.splitInto = childInputs.map((child) => `analysis-${child.chunkId}`);
+      }
+      input.manifest.currentStep = undefined;
+      input.manifest.warnings = uniqueStrings([
+        ...input.manifest.warnings,
+        `${input.sourceLabel} timeout veya istek/yanit boyutu siniri nedeniyle ${childInputs.length} daha kucuk overlapping parcaya ayrildi.`
+      ]);
+      await this.persistManifest(input.statusRoot, input.runRoot, input.manifest);
+      input.onProgress?.({
+        phase: "analysis",
+        message: `Qwen3 ${input.sourceLabel} istegi timeout ya da boyut siniri sonrasi ${childInputs.length} parcaya ayriliyor.`,
+        completed: 0,
+        total: childInputs.length,
+        modelCalls: input.counters.newModelCalls,
+        reusedSteps: input.counters.reusedSteps
+      });
+      const splitLedgers: QwenPageFactLedger[] = [];
+      for (let index = 0; index < childInputs.length; index += 1) {
+        const child = childInputs[index];
+        splitLedgers.push(...await this.analyzeChunkWithResilience({
+          ...input,
+          chunkId: child.chunkId,
+          sourceLabel: `${input.sourceLabel} [adaptive ${index + 1}/${childInputs.length}]`,
+          content: child.content,
+          depth: input.depth + 1
+        }));
+      }
+      return splitLedgers;
     }
   }
 
@@ -466,7 +712,7 @@ export class QwenIterativePageDraftGenerator {
     let fragments = input.ledgers.flatMap((ledger) => splitLedgerForBudget(ledger, payloadBudget));
     let level = 0;
 
-    while (serializeLedgerList(fragments).length > payloadBudget) {
+    while (!ledgersFitFinalSectionGroups(fragments, payloadBudget, this.options.finalSectionGroupSize)) {
       if (level >= this.options.maxReduceLevels) {
         throw new Error(
           `Qwen3 evidence ledger ${this.options.maxReduceLevels} reduce seviyesinden sonra da context butcesine sigmadi.`
@@ -479,11 +725,14 @@ export class QwenIterativePageDraftGenerator {
         ensureNotCancelled(input.token);
         const ledgerText = serializeLedgerList(batches[index]);
         const batchHash = sha256(ledgerText).slice(0, 16);
-        const prompt = buildQwenPageLedgerReducePrompt({
-          level,
-          batchId: `${index + 1}/${batches.length}`,
-          ledgers: ledgerText
-        });
+        const prompt: DocumentationModelRequest = {
+          ...buildQwenPageLedgerReducePrompt({
+            level,
+            batchId: `${index + 1}/${batches.length}`,
+            ledgers: ledgerText
+          }),
+          maxOutputTokens: this.options.reduceMaxOutputTokens
+        };
         assertPromptBudget(prompt, this.options.maxInputCharacters, `reduce level ${level} batch ${index + 1}`);
         input.onProgress?.({
           phase: "reduce",
@@ -493,7 +742,7 @@ export class QwenIterativePageDraftGenerator {
           modelCalls: input.counters.newModelCalls,
           reusedSteps: input.counters.reusedSteps
         });
-        const result = await this.runJsonLedgerStep({
+        const result = await this.runJsonLedgerStepWithRetry({
           runRoot: input.runRoot,
           statusRoot: input.statusRoot,
           manifest: input.manifest,
@@ -519,6 +768,7 @@ export class QwenIterativePageDraftGenerator {
     stepId: string;
     kind: "analysis" | "reduce";
     contextText: string;
+    sourceLabel?: string;
     prompt: DocumentationModelRequest;
     token: vscode.CancellationToken;
     onUsage?: (usage: DocumentationModelUsage) => void;
@@ -526,9 +776,37 @@ export class QwenIterativePageDraftGenerator {
     return this.runModelStep({
       ...input,
       extension: "json",
-      parse: (raw) => normalizeLedger(parseStrictJson(cleanModelText(raw))),
+      parse: (raw) => {
+        const ledger = normalizeLedger(parseStrictJson(cleanModelText(raw)));
+        if (input.kind === "analysis") {
+          if (!input.sourceLabel) {
+            throw responseContractError("Qwen3 analysis ledger source label bilgisi eksik.");
+          }
+          return groundLedgerToSuppliedSource(ledger, input.sourceLabel, input.contextText);
+        }
+        return demoteUnreferencedFindings(ledger);
+      },
       serialize: (ledger) => `${JSON.stringify(ledger, null, 2)}\n`
     });
+  }
+
+  private async runJsonLedgerStepWithRetry(input: {
+    runRoot: string;
+    statusRoot: string;
+    manifest: QwenPageDraftRunManifest;
+    counters: InvocationCounters;
+    stepId: string;
+    kind: "analysis" | "reduce";
+    contextText: string;
+    sourceLabel?: string;
+    prompt: DocumentationModelRequest;
+    token: vscode.CancellationToken;
+    onUsage?: (usage: DocumentationModelUsage) => void;
+  }): Promise<StepResult<QwenPageFactLedger>> {
+    return this.withTransientRetry(
+      () => this.runJsonLedgerStep(input),
+      input.token
+    );
   }
 
   private async runMarkdownStep(input: {
@@ -557,6 +835,47 @@ export class QwenIterativePageDraftGenerator {
     });
   }
 
+  private async runMarkdownStepWithRetry(input: {
+    runRoot: string;
+    statusRoot: string;
+    manifest: QwenPageDraftRunManifest;
+    counters: InvocationCounters;
+    stepId: string;
+    kind: "synthesis";
+    contextText: string;
+    prompt: DocumentationModelRequest;
+    token: vscode.CancellationToken;
+    onUsage?: (usage: DocumentationModelUsage) => void;
+  }): Promise<StepResult<string>> {
+    return this.withTransientRetry(
+      () => this.runMarkdownStep(input),
+      input.token
+    );
+  }
+
+  private async withTransientRetry<T>(
+    operation: () => Promise<T>,
+    token: vscode.CancellationToken
+  ): Promise<T> {
+    let retry = 0;
+    while (true) {
+      ensureNotCancelled(token);
+      try {
+        return await operation();
+      } catch (error) {
+        if (!isTransientQwenFailure(error) || retry >= this.options.maxGatewayRetries) {
+          throw error;
+        }
+        retry += 1;
+        const delayMs = Math.min(30000, this.options.retryBaseDelayMs * (2 ** (retry - 1)));
+        await this.options.delay(delayMs, token);
+        ensureNotCancelled(token);
+        // The failed attempt is already persisted by runModelStep; the next
+        // invocation increments its attempt counter and preserves auditability.
+      }
+    }
+  }
+
   private async runModelStep<T>(input: {
     runRoot: string;
     statusRoot: string;
@@ -573,7 +892,7 @@ export class QwenIterativePageDraftGenerator {
     onUsage?: (usage: DocumentationModelUsage) => void;
   }): Promise<StepResult<T>> {
     const stepId = safeName(input.stepId) || `step-${sha256(input.stepId).slice(0, 12)}`;
-    const stepInputHash = sha256(input.prompt.combinedText ?? `${input.prompt.instructions}\n${input.prompt.userPrompt}`);
+    const stepInputHash = modelRequestHash(input.prompt);
     const existing = input.manifest.steps[stepId];
     if (existing?.status === "completed" && existing.inputHash === stepInputHash && existing.outputPath && existing.outputHash) {
       const outputPath = resolveRunArtifact(input.runRoot, existing.outputPath);
@@ -591,6 +910,7 @@ export class QwenIterativePageDraftGenerator {
       );
     }
     ensureNotCancelled(input.token);
+    this.options.onModelCall?.(input.kind);
     const stepRoot = path.join(input.runRoot, "steps");
     const contextPath = path.join(stepRoot, `${stepId}-context.md`);
     const promptPath = path.join(stepRoot, `${stepId}-prompt.md`);
@@ -716,8 +1036,9 @@ export class QwenIterativePageDraftGenerator {
         ...loaded,
         chunks: chunkSummaries(input.chunks),
         includedSourceFiles: input.includedSourceFiles,
-        warnings: input.warnings,
+        warnings: uniqueStrings([...(loaded.warnings ?? []), ...input.warnings]),
         steps: loaded.steps ?? {},
+        adaptiveSplits: loaded.adaptiveSplits ?? {},
         modelIds: loaded.modelIds ?? []
       };
     }
@@ -740,7 +1061,8 @@ export class QwenIterativePageDraftGenerator {
       chunks: chunkSummaries(input.chunks),
       includedSourceFiles: input.includedSourceFiles,
       warnings: input.warnings,
-      steps: {}
+      steps: {},
+      adaptiveSplits: {}
     };
   }
 
@@ -778,6 +1100,16 @@ function normalizeOptions(options: QwenIterativePageDraftOptions): NormalizedOpt
   if (!containsIdentitySegment(modelIdentity, expectedModelMarker)) {
     throw new Error(`Qwen3-only pipeline modelIdentity '${modelIdentity}' expected marker '${expectedModelMarker}' icermelidir.`);
   }
+  const minAdaptiveSplitCharacters = positiveInteger(
+    options.minAdaptiveSplitCharacters ?? defaults.minAdaptiveSplitCharacters,
+    "minAdaptiveSplitCharacters",
+    100000
+  );
+  const adaptiveSplitOverlapCharacters = nonNegativeInteger(
+    options.adaptiveSplitOverlapCharacters ?? defaults.adaptiveSplitOverlapCharacters,
+    "adaptiveSplitOverlapCharacters",
+    Math.max(0, minAdaptiveSplitCharacters - 1)
+  );
   return {
     maxInputCharacters,
     maxChunkCharacters: Math.min(requestedChunk, maxInputCharacters - promptOverheadReserve),
@@ -785,10 +1117,21 @@ function normalizeOptions(options: QwenIterativePageDraftOptions): NormalizedOpt
     maxTotalSourceCharacters: positiveInteger(options.maxTotalSourceCharacters ?? defaults.maxTotalSourceCharacters, "maxTotalSourceCharacters", 5000000),
     maxModelCalls: positiveInteger(options.maxModelCalls ?? defaults.maxModelCalls, "maxModelCalls", 200),
     maxReduceLevels: positiveInteger(options.maxReduceLevels ?? defaults.maxReduceLevels, "maxReduceLevels", 10),
+    analysisMaxOutputTokens: positiveInteger(options.analysisMaxOutputTokens ?? defaults.analysisMaxOutputTokens, "analysisMaxOutputTokens", 65536),
+    reduceMaxOutputTokens: positiveInteger(options.reduceMaxOutputTokens ?? defaults.reduceMaxOutputTokens, "reduceMaxOutputTokens", 65536),
+    synthesisMaxOutputTokens: positiveInteger(options.synthesisMaxOutputTokens ?? defaults.synthesisMaxOutputTokens, "synthesisMaxOutputTokens", 65536),
+    maxGatewayRetries: nonNegativeInteger(options.maxGatewayRetries ?? defaults.maxGatewayRetries, "maxGatewayRetries", 5),
+    retryBaseDelayMs: positiveInteger(options.retryBaseDelayMs ?? defaults.retryBaseDelayMs, "retryBaseDelayMs", 30000),
+    maxAdaptiveSplitDepth: nonNegativeInteger(options.maxAdaptiveSplitDepth ?? defaults.maxAdaptiveSplitDepth, "maxAdaptiveSplitDepth", 8),
+    minAdaptiveSplitCharacters,
+    adaptiveSplitOverlapCharacters,
+    finalSectionGroupSize: positiveInteger(options.finalSectionGroupSize ?? defaults.finalSectionGroupSize, "finalSectionGroupSize", qwenPageDocumentSections.length),
     modelIdentity,
     expectedModelMarker,
     now: options.now ?? (() => new Date()),
-    runIdFactory: options.runIdFactory ?? (() => `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`)
+    runIdFactory: options.runIdFactory ?? (() => `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`),
+    delay: options.delay ?? waitForRetryDelay,
+    onModelCall: options.onModelCall
   };
 }
 
@@ -818,13 +1161,21 @@ function chunkSummaries(chunks: QwenPageDraftContextChunk[]): QwenPageDraftRunMa
 
 function normalizeLedger(value: unknown): QwenPageFactLedger {
   const record = asRecord(value);
-  const rawSections = Array.isArray(record.sections) ? record.sections : [];
+  if (!Array.isArray(record.sections)) {
+    throw responseContractError("Qwen3 ledger yaniti 'sections' dizisini icermiyor.");
+  }
+  const rawSections = record.sections;
   const byHeading = new Map<string, QwenPageFactSection>();
   for (const item of rawSections) {
     const section = asRecord(item);
     const heading = canonicalHeading(String(section.heading ?? ""));
     if (!heading) {
-      continue;
+      throw responseContractError("Qwen3 ledger yaniti canonical olmayan veya bos bir section heading iceriyor.");
+    }
+    for (const field of ["findings", "sourceReferences", "uncertainties"] as const) {
+      if (!Array.isArray(section[field]) || section[field].some((entry) => typeof entry !== "string")) {
+        throw responseContractError(`Qwen3 ledger '${heading}' bolumunde '${field}' string dizisi degil.`);
+      }
     }
     const current = byHeading.get(heading) ?? {
       heading,
@@ -880,17 +1231,20 @@ function splitFactSectionForBudget(section: QwenPageFactSection, maxCharacters: 
   if (JSON.stringify({ sections: [section] }).length <= maxCharacters) {
     return [section];
   }
+  const sharedReferences = sharedReferencesForBudget(section, maxCharacters);
   const empty = (): QwenPageFactSection => ({
     heading: section.heading,
     findings: [],
-    sourceReferences: [],
+    sourceReferences: [...sharedReferences],
     uncertainties: []
   });
   const overhead = JSON.stringify({ sections: [empty()] }).length + 32;
   const maxItemCharacters = Math.max(64, maxCharacters - overhead);
   const items: Array<{ key: "findings" | "sourceReferences" | "uncertainties"; value: string }> = [
     ...section.findings.flatMap((value) => splitBoundedString(value, maxItemCharacters).map((part) => ({ key: "findings" as const, value: part }))),
-    ...section.sourceReferences.flatMap((value) => splitBoundedString(value, maxItemCharacters).map((part) => ({ key: "sourceReferences" as const, value: part }))),
+    ...section.sourceReferences
+      .filter((value) => !sharedReferences.includes(value))
+      .flatMap((value) => splitBoundedString(value, maxItemCharacters).map((part) => ({ key: "sourceReferences" as const, value: part }))),
     ...section.uncertainties.flatMap((value) => splitBoundedString(value, maxItemCharacters).map((part) => ({ key: "uncertainties" as const, value: part })))
   ];
   const result: QwenPageFactSection[] = [];
@@ -918,6 +1272,26 @@ function splitFactSectionForBudget(section: QwenPageFactSection, maxCharacters: 
     throw new Error("Qwen3 ledger alani bounded parcalamadan sonra context butcesini asiyor.");
   }
   return result;
+}
+
+function sharedReferencesForBudget(section: QwenPageFactSection, maxCharacters: number): string[] {
+  const references: string[] = [];
+  const target = Math.max(256, Math.floor(maxCharacters * 0.3));
+  for (const reference of uniqueStrings(section.sourceReferences)) {
+    const candidate = {
+      sections: [{
+        heading: section.heading,
+        findings: [],
+        sourceReferences: [...references, reference],
+        uncertainties: []
+      }]
+    };
+    if (JSON.stringify(candidate).length > target) {
+      break;
+    }
+    references.push(reference);
+  }
+  return references;
 }
 
 function splitBoundedString(value: string, maxCharacters: number): string[] {
@@ -955,6 +1329,227 @@ function packLedgers(ledgers: QwenPageFactLedger[], maxCharacters: number): Qwen
 
 function serializeLedgerList(ledgers: QwenPageFactLedger[]): string {
   return ledgers.map((ledger, index) => `LEDGER ${index + 1}\n${JSON.stringify(ledger, null, 2)}`).join("\n\n---\n\n");
+}
+
+function serializeLedgerForSections(
+  ledgers: QwenPageFactLedger[],
+  requestedSections: readonly (typeof qwenPageDocumentSections)[number][]
+): string {
+  const crossLayerSpine = new Set<string>([
+    "UI API Çağrıları",
+    "BFF Endpoint Eşleşmesi",
+    "Backend Endpoint Eşleşmesi",
+    "Belirsizlikler"
+  ]);
+  const included = new Set<string>([...requestedSections, ...crossLayerSpine]);
+  const aggregateHeadings = new Set<string>(["Kaynak Referansları", "Belirsizlikler"]);
+  const filtered = ledgers
+    .map((ledger) => ({
+      sections: ledger.sections.filter((section) =>
+        included.has(section.heading) &&
+        !(requestedSections.includes(section.heading as (typeof qwenPageDocumentSections)[number]) && aggregateHeadings.has(section.heading))
+      )
+    }))
+    .filter((ledger) => ledger.sections.length);
+  const aggregateSections: QwenPageFactSection[] = [];
+  if (requestedSections.includes("Kaynak Referansları")) {
+    aggregateSections.push({
+      heading: "Kaynak Referansları",
+      findings: [],
+      sourceReferences: uniqueStrings(ledgers.flatMap((ledger) =>
+        ledger.sections.flatMap((section) => section.sourceReferences)
+      )),
+      uncertainties: []
+    });
+  }
+  if (requestedSections.includes("Belirsizlikler")) {
+    aggregateSections.push({
+      heading: "Belirsizlikler",
+      findings: [],
+      sourceReferences: [],
+      uncertainties: uniqueStrings(ledgers.flatMap((ledger) =>
+        ledger.sections.flatMap((section) => section.uncertainties)
+      ))
+    });
+  }
+  const projected = aggregateSections.length ? [...filtered, { sections: aggregateSections }] : filtered;
+  return serializeLedgerList(projected.length ? projected : [{ sections: [] }]);
+}
+
+function sectionGroups(size: number): Array<Array<(typeof qwenPageDocumentSections)[number]>> {
+  const groups: Array<Array<(typeof qwenPageDocumentSections)[number]>> = [];
+  for (let index = 0; index < qwenPageDocumentSections.length; index += size) {
+    groups.push(qwenPageDocumentSections.slice(index, index + size) as Array<(typeof qwenPageDocumentSections)[number]>);
+  }
+  return groups;
+}
+
+function ledgersFitFinalSectionGroups(
+  ledgers: QwenPageFactLedger[],
+  payloadBudget: number,
+  groupSize: number
+): boolean {
+  return sectionGroups(groupSize).every((sections) =>
+    serializeLedgerForSections(ledgers, sections).length <= payloadBudget
+  );
+}
+
+function sectionGroupOutputTokens(sectionCount: number, maximum: number): number {
+  return Math.min(maximum, 512 + (Math.max(1, sectionCount) * 900));
+}
+
+function selectCanonicalSections(
+  markdown: string,
+  requestedSections: readonly (typeof qwenPageDocumentSections)[number][]
+): { markdown: string; missingSections: Array<(typeof qwenPageDocumentSections)[number]> } {
+  const matches = [...markdown.matchAll(/^##\s+(.+)$/gm)];
+  if (!matches.length) {
+    return { markdown: "", missingSections: [...requestedSections] };
+  }
+  const bodies = new Map<string, string[]>();
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    const heading = canonicalHeading(match[1]);
+    if (!heading || !requestedSections.includes(heading as (typeof qwenPageDocumentSections)[number])) {
+      continue;
+    }
+    const bodyStart = (match.index ?? 0) + match[0].length;
+    const bodyEnd = matches[index + 1]?.index ?? markdown.length;
+    const body = markdown.slice(bodyStart, bodyEnd).trim();
+    bodies.set(heading, [...(bodies.get(heading) ?? []), body].filter(Boolean));
+  }
+  const missingSections = requestedSections.filter((heading) => !(bodies.get(heading) ?? []).length);
+  const rendered = requestedSections
+    .filter((heading) => !missingSections.includes(heading))
+    .map((heading) => [
+      `## ${heading}`,
+      (bodies.get(heading) ?? []).join("\n\n")
+    ].join("\n\n"))
+    .join("\n\n");
+  return { markdown: rendered, missingSections };
+}
+
+function groundLedgerToSuppliedSource(
+  ledger: QwenPageFactLedger,
+  sourceLabel: string,
+  suppliedContent: string
+): QwenPageFactLedger {
+  return {
+    sections: ledger.sections.map((section) => {
+      const sourceReferences = uniqueStrings(section.sourceReferences)
+        .filter((reference) => isSuppliedSourceReference(reference, sourceLabel, suppliedContent));
+      if (!section.findings.length || sourceReferences.length) {
+        return { ...section, sourceReferences };
+      }
+      return {
+        ...section,
+        findings: [],
+        sourceReferences,
+        uncertainties: uniqueStrings([
+          ...section.uncertainties,
+          ...section.findings.map((finding) =>
+            `Model bulgusu gecerli bir supplied source reference ile eslesmedigi icin belirsizlige tasindi: ${finding}`
+          )
+        ])
+      };
+    })
+  };
+}
+
+function isSuppliedSourceReference(reference: string, sourceLabel: string, suppliedContent: string): boolean {
+  const trimmed = reference.trim();
+  if (!trimmed || trimmed.length > 800) {
+    return false;
+  }
+  if (trimmed === sourceLabel) {
+    return true;
+  }
+  const withoutLineRange = trimmed.replace(/:\d+(?:-\d+)?$/, "");
+  if (
+    withoutLineRange.length < 5 ||
+    !/(?:^|[\\/])[\w.@() -]+(?:[\\/][\w.@() -]+)*\.(?:java|kt|kts|groovy|xml|ya?ml|properties|jsonl?|md|tsx?|jsx?|vue|html|css|scss)$/i.test(withoutLineRange)
+  ) {
+    return false;
+  }
+  const normalizedReference = withoutLineRange.replace(/\\/g, "/");
+  const normalizedContent = suppliedContent.replace(/\\/g, "/");
+  return normalizedContent.includes(normalizedReference);
+}
+
+function responseContractError(message: string): Error {
+  const error = new Error(message);
+  error.name = "QwenResponseContractError";
+  return error;
+}
+
+function demoteUnreferencedFindings(ledger: QwenPageFactLedger): QwenPageFactLedger {
+  return {
+    sections: ledger.sections.map((section) => section.findings.length && !section.sourceReferences.length
+      ? {
+        ...section,
+        findings: [],
+        uncertainties: uniqueStrings([
+          ...section.uncertainties,
+          ...section.findings.map((finding) => `Kaynak referansi reduce sirasinda korunamadi: ${finding}`)
+        ])
+      }
+      : section)
+  };
+}
+
+function splitAdaptiveChunk(value: string, minCharacters: number, overlapCharacters: number): string[] | undefined {
+  if (value.length < minCharacters * 2) {
+    return undefined;
+  }
+  const midpoint = Math.floor(value.length / 2);
+  const previousBreak = value.lastIndexOf("\n", midpoint);
+  const nextBreak = value.indexOf("\n", midpoint);
+  const candidates = [previousBreak, nextBreak]
+    .filter((index) => index >= minCharacters && value.length - index >= minCharacters)
+    .sort((left, right) => Math.abs(left - midpoint) - Math.abs(right - midpoint));
+  const splitAt = candidates[0] ?? midpoint;
+  if (splitAt < minCharacters || value.length - splitAt < minCharacters) {
+    return undefined;
+  }
+  const overlap = Math.min(overlapCharacters, Math.floor(minCharacters / 2));
+  const left = value.slice(0, Math.min(value.length, splitAt + overlap));
+  const right = value.slice(Math.max(0, splitAt - overlap));
+  if (!left.trim() || !right.trim() || left.length >= value.length || right.length >= value.length) {
+    return undefined;
+  }
+  return [left, right];
+}
+
+function equalStringArrays(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function modelRequestHash(prompt: DocumentationModelRequest): string {
+  const combinedText = prompt.combinedText ?? `${prompt.instructions ?? ""}\n${prompt.userPrompt}`;
+  return sha256(JSON.stringify({ combinedText, maxOutputTokens: prompt.maxOutputTokens ?? null }));
+}
+
+function isTransientQwenFailure(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return name === "QwenRequestTimeoutError" ||
+    /Qwen HTTP hatası:\s*(?:429|502|503|504)\b/i.test(message) ||
+    /(?:ETIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|fetch failed|network error|gateway time-?out|Qwen bağlantısı kurulamadı)/i.test(message);
+}
+
+function isAdaptiveSplitQwenFailure(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  const folded = foldToAscii(message);
+  return name === "QwenRequestTimeoutError" ||
+    /qwen http hatasi:\s*(?:413|504)\b/i.test(folded) ||
+    /(?:etimedout|gateway time-?out)/i.test(folded) ||
+    /(?:qwen baglam butcesi asildi|context(?: length| window| budget)?.*(?:exceed|overflow|too large)|payload too large)/i.test(folded) ||
+    /(?:maksimum token sinirinda kesildi|token cikti sinirinda kesildi|finish.reason.?length|output limit)/i.test(folded);
+}
+
+function boundedError(error: unknown): string {
+  return safeError(error).slice(0, 800);
 }
 
 function ensureCanonicalSections(markdown: string): string {
@@ -1080,6 +1675,34 @@ function ensureNotCancelled(token: vscode.CancellationToken): void {
   }
 }
 
+function waitForRetryDelay(milliseconds: number, token: vscode.CancellationToken): Promise<void> {
+  ensureNotCancelled(token);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout: NodeJS.Timeout | undefined;
+    let cancellation: vscode.Disposable | undefined;
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      cancellation?.dispose();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    timeout = setTimeout(() => finish(), milliseconds);
+    cancellation = token.onCancellationRequested(() =>
+      finish(new Error("Qwen3 sayfa pipeline'i kullanici tarafindan iptal edildi."))
+    );
+  });
+}
+
 function safeError(error: unknown): string {
   return maskSecretsWithStats(error instanceof Error ? error.message : String(error)).text.slice(0, 4000);
 }
@@ -1143,6 +1766,13 @@ function uniqueStrings(values: string[]): string[] {
 function positiveInteger(value: number, name: string, maximum = Number.MAX_SAFE_INTEGER): number {
   if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
     throw new Error(`${name} must be a positive integer no greater than ${maximum}.`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, name: string, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new Error(`${name} must be a non-negative integer no greater than ${maximum}.`);
   }
   return value;
 }

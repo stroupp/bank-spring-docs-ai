@@ -98,7 +98,7 @@ const token = {
 async function main() {
   testCopilotDefaultWithoutLanguageModelAccess();
   testExplicitQwenFactoryKeepsConfiguredCopilot();
-  testResumableQwenIdentityIgnoresOnlyTimeout();
+  testResumableQwenIdentityIgnoresOperationalCeilings();
   testExplicitQwen3ModelPreflight();
   testExplicitQwenSecurityPreflights();
   testQwenEndpointNormalization();
@@ -117,6 +117,7 @@ async function main() {
   await testTruncatedQwenResponseRejected();
   await testQwenContextPreflight();
   await testConservativeQwenContextPreflight();
+  await testPerRequestQwenOutputBudget();
   testInvalidProviderRejected();
 
   assert.strictEqual(languageModelSelections, 0, "provider selection must not call vscode.lm until a Copilot request is sent");
@@ -326,7 +327,7 @@ function testExplicitQwenFactoryKeepsConfiguredCopilot() {
   );
 }
 
-function testResumableQwenIdentityIgnoresOnlyTimeout() {
+function testResumableQwenIdentityIgnoresOperationalCeilings() {
   settings = {
     ...qwenSettings(),
     "ai.provider": "copilot",
@@ -358,6 +359,19 @@ function testResumableQwenIdentityIgnoresOnlyTimeout() {
     getResumableQwenPageModelIdentity(context).configurationFingerprint,
     baselinePage,
     "changing only the retry timeout must preserve selected-page resume identity"
+  );
+
+  const timeoutGeneral = getQwenDocumentationModelIdentity(context).configurationFingerprint;
+  settings = { ...settings, "qwen.generationMaxTokens": 16000 };
+  assert.notStrictEqual(
+    getQwenDocumentationModelIdentity(context).configurationFingerprint,
+    timeoutGeneral,
+    "the general provider identity must continue to pin the global generation ceiling"
+  );
+  assert.strictEqual(
+    getResumableQwenPageModelIdentity(context).configurationFingerprint,
+    baselinePage,
+    "changing only the global ceiling must preserve page-map resume identity because per-step phase budgets remain hashed"
   );
 
   settings = { ...settings, "qwen.temperature": 0.2 };
@@ -541,7 +555,7 @@ async function testBankingConnectionProbeMatchesWireContract() {
   assert.strictEqual(requestUrls.at(-1), TEST_BANKING_ENDPOINT);
   assert.strictEqual(request.model, BANKING_QWEN_MODEL_ALIAS);
   assert.strictEqual(request.temperature, 0.6);
-  assert.strictEqual(request.max_tokens, 163849);
+  assert.strictEqual(request.max_tokens, 64, "connection probes must not inherit a huge configured generation cap");
   assert.strictEqual(request.stream, false);
   assert.deepStrictEqual(request.messages, [
     {
@@ -587,6 +601,45 @@ async function testConservativeQwenContextPreflight() {
   const client = createDocumentationModelClient(context);
   await assert.rejects(() => client.send("x".repeat(1800), token), /bağlam bütçesi|context/i);
   assert.strictEqual(networkCalls, before, "conservative context preflight must include dense-token and chat-template safety margin");
+}
+
+async function testPerRequestQwenOutputBudget() {
+  settings = {
+    ...qwenSettings(),
+    "qwen.contextWindowTokens": 16384,
+    "qwen.generationMaxTokens": 16384
+  };
+  responses.push({
+    model: "qwen3-30b-a3b-instruct",
+    choices: [{ message: { content: "bounded output" }, finish_reason: "stop" }]
+  });
+  const client = createDocumentationModelClient(context);
+  await client.send({
+    userPrompt: "x".repeat(1800),
+    combinedText: "x".repeat(1800),
+    maxOutputTokens: 4096
+  }, token);
+  assert.strictEqual(requestBodies.at(-1).max_tokens, 4096, "a phase budget must make a truthful 16K context usable");
+
+  settings = qwenSettings();
+  responses.push({
+    model: "qwen3-30b-a3b-instruct",
+    choices: [{ message: { content: "configured cap" }, finish_reason: "stop" }]
+  });
+  const cappedClient = createDocumentationModelClient(context);
+  await cappedClient.send({ userPrompt: "bounded prompt", maxOutputTokens: 50000 }, token);
+  assert.strictEqual(
+    requestBodies.at(-1).max_tokens,
+    12000,
+    "per-request output budget must not exceed configured generationMaxTokens"
+  );
+
+  const beforeInvalid = networkCalls;
+  await assert.rejects(
+    () => cappedClient.send({ userPrompt: "bounded prompt", maxOutputTokens: 0 }, token),
+    /maxOutputTokens.*sıfırdan büyük/i
+  );
+  assert.strictEqual(networkCalls, beforeInvalid, "invalid request output budget must reject before network access");
 }
 
 function testInvalidProviderRejected() {

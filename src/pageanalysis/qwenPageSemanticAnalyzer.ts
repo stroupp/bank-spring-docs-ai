@@ -18,6 +18,7 @@ export interface QwenPageSemanticResult {
   analyzedInteractions: number;
   cacheHits: number;
   failures: number;
+  skippedInteractions: number;
 }
 
 export interface Qwen3OnlyPageSemanticOptions {
@@ -25,6 +26,11 @@ export interface Qwen3OnlyPageSemanticOptions {
   /** Secret-free client/configuration snapshot used to isolate verified cache entries. */
   cacheIdentity: string;
   expectedModelMarker?: string;
+  /** Small JSON response budget; prevents semantic probes reserving final-document capacity. */
+  maxOutputTokens?: number;
+  maxGatewayRetries?: number;
+  retryBaseDelayMs?: number;
+  onModelCall?: (phase: "semantic") => void;
 }
 
 export class Qwen3PageSemanticBoundaryError extends Error {
@@ -73,6 +79,7 @@ export class QwenPageSemanticAnalyzer {
     const pagePrompt = buildPageSemanticPrompt(combinedContext);
     const pageCache = await readCache(cacheRoot, model, `page:${pageIdentity}`, pagePrompt);
     let failures = 0;
+    let pageProbeFailed = false;
     let pageSemantics: unknown;
     if (pageCache.hit) {
       pageSemantics = pageCache.value;
@@ -84,10 +91,11 @@ export class QwenPageSemanticAnalyzer {
         await writeCache(pageCache.path, pageSemantics);
       } catch (error) {
         ensureNotCancelled(token);
-        if (error instanceof Qwen3PageSemanticBoundaryError) {
+        if (error instanceof Qwen3PageSemanticBoundaryError || isQwenPageCallBudgetError(error)) {
           throw error;
         }
         failures += 1;
+        pageProbeFailed = true;
         if (rawOutput) {
           await writeDebug(cacheRoot, `page-${pageIdentity}`, rawOutput);
         }
@@ -98,9 +106,13 @@ export class QwenPageSemanticAnalyzer {
     await fs.writeFile(pageSemanticsPath, `${JSON.stringify(withMetadata(pageSemantics, metadata), null, 2)}\n`, "utf8");
 
     let cacheHits = pageCache.hit ? 1 : 0;
-    const interactionRecords = importantInteractions(pageFlow);
+    const interactionCandidates = importantInteractions(pageFlow);
+    const interactionRecords = pageProbeFailed ? [] : interactionCandidates;
     const interactionSemantics: unknown[] = [];
-    for (const interaction of interactionRecords) {
+    let skippedInteractions = pageProbeFailed ? interactionCandidates.length : 0;
+    let consecutiveInteractionFailures = 0;
+    for (let interactionIndex = 0; interactionIndex < interactionRecords.length; interactionIndex += 1) {
+      const interaction = interactionRecords[interactionIndex];
       ensureNotCancelled(token);
       let rawOutput = "";
       try {
@@ -113,25 +125,32 @@ export class QwenPageSemanticAnalyzer {
           bffToBeMatches: pageFlow.bffToBeMatches,
           evidence
         }, null, 2), maxContextCharacters));
-        const identity = `interaction:${pageIdentity}:${safeName(JSON.stringify(interaction).slice(0, 160))}`;
+        const identity = `interaction:${pageIdentity}:${sha256(maskSecrets(JSON.stringify(interaction)))}`;
         const cached = await readCache(cacheRoot, model, identity, prompt);
         if (cached.hit) {
           interactionSemantics.push(cached.value);
           cacheHits += 1;
+          consecutiveInteractionFailures = 0;
           continue;
         }
         rawOutput = await this.askSemantic(client, prompt, token);
         const parsed = parseStrictJson(rawOutput);
         await writeCache(cached.path, parsed);
         interactionSemantics.push(parsed);
+        consecutiveInteractionFailures = 0;
       } catch (error) {
         ensureNotCancelled(token);
-        if (error instanceof Qwen3PageSemanticBoundaryError) {
+        if (error instanceof Qwen3PageSemanticBoundaryError || isQwenPageCallBudgetError(error)) {
           throw error;
         }
         failures += 1;
+        consecutiveInteractionFailures += 1;
         if (rawOutput) {
           await writeDebug(cacheRoot, `interaction-${pageIdentity}`, rawOutput);
+        }
+        if (isSemanticCircuitBreakingFailure(error) || consecutiveInteractionFailures >= 2) {
+          skippedInteractions += interactionRecords.length - interactionIndex - 1;
+          break;
         }
       }
     }
@@ -142,7 +161,8 @@ export class QwenPageSemanticAnalyzer {
       interactionSemanticsPath,
       analyzedInteractions: interactionSemantics.length,
       cacheHits,
-      failures
+      failures,
+      skippedInteractions
     };
   }
 
@@ -160,9 +180,41 @@ export class QwenPageSemanticAnalyzer {
     if (!token) {
       throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic analysis requires a cancellation token.");
     }
-    const response = await this.qwen3Only.client.send(prompt, token);
+    const response = await this.sendQwen3SemanticWithRetry(prompt, token);
     validateQwen3SemanticResponse(response, this.qwen3Only.expectedModelMarker ?? "qwen3");
     return cleanAndMaskQwen3SemanticOutput(response.text);
+  }
+
+  private async sendQwen3SemanticWithRetry(
+    prompt: string,
+    token: vscode.CancellationToken
+  ): Promise<DocumentationModelResponse> {
+    if (!this.qwen3Only) {
+      throw new Qwen3PageSemanticBoundaryError("Qwen3-only semantic client is unavailable.");
+    }
+    const maxRetries = boundedNonNegativeInteger(this.qwen3Only.maxGatewayRetries ?? 2, "Qwen3 semantic maxGatewayRetries", 5);
+    const baseDelayMs = boundedPositiveInteger(this.qwen3Only.retryBaseDelayMs ?? 750, "Qwen3 semantic retryBaseDelayMs", 30000);
+    let retry = 0;
+    while (true) {
+      ensureNotCancelled(token);
+      try {
+        this.qwen3Only.onModelCall?.("semantic");
+        return await this.qwen3Only.client.send({
+          userPrompt: prompt,
+          combinedText: prompt,
+          maxOutputTokens: this.qwen3Only.maxOutputTokens
+        }, token);
+      } catch (error) {
+        if (isQwenPageCallBudgetError(error) || !isTransientSemanticFailure(error) || retry >= maxRetries) {
+          throw error;
+        }
+        retry += 1;
+        await waitForSemanticRetryDelay(
+          Math.min(30000, baseDelayMs * (2 ** (retry - 1))),
+          token
+        );
+      }
+    }
   }
 }
 
@@ -203,6 +255,69 @@ function containsIdentitySegment(identity: string, expectedMarker: string): bool
   }
   const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "i").test(identity);
+}
+
+function isTransientSemanticFailure(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return name === "QwenRequestTimeoutError" ||
+    /Qwen HTTP hatası:\s*(?:429|502|503|504)\b/i.test(message) ||
+    /(?:ETIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|fetch failed|network error|gateway time-?out|Qwen bağlantısı kurulamadı)/i.test(message);
+}
+
+function isQwenPageCallBudgetError(error: unknown): boolean {
+  return error instanceof Error && error.name === "QwenPageCallBudgetExceededError";
+}
+
+function isSemanticCircuitBreakingFailure(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return name === "QwenSemanticCallBudgetReservedError" ||
+    isTransientSemanticFailure(error) ||
+    /Qwen HTTP hatası:\s*(?:400|401|403|404|413)\b/i.test(message) ||
+    /(?:unauthorized|forbidden|authentication|api key|erişim|yetki)/i.test(message);
+}
+
+function waitForSemanticRetryDelay(milliseconds: number, token: vscode.CancellationToken): Promise<void> {
+  ensureNotCancelled(token);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout: NodeJS.Timeout | undefined;
+    let cancellation: vscode.Disposable | undefined;
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      cancellation?.dispose();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    timeout = setTimeout(() => finish(), milliseconds);
+    cancellation = token.onCancellationRequested(() =>
+      finish(new Error("Qwen semantik isteği kullanıcı tarafından iptal edildi."))
+    );
+  });
+}
+
+function boundedPositiveInteger(value: number, label: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new Qwen3PageSemanticBoundaryError(`${label} must be a positive integer no greater than ${maximum}.`);
+  }
+  return value;
+}
+
+function boundedNonNegativeInteger(value: number, label: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new Qwen3PageSemanticBoundaryError(`${label} must be a non-negative integer no greater than ${maximum}.`);
+  }
+  return value;
 }
 
 function ensureNotCancelled(token?: vscode.CancellationToken): void {

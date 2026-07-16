@@ -80,7 +80,7 @@ Authorization: not sent
 
 When the banking settings are saved or tested, the explicitly pasted host is approved only in machine-scoped VS Code settings. Banking mode validates HTTPS and the exact `/v1/chat/completions` path; ports, alternate paths, query strings, embedded credentials, and redirects are rejected. No institutional host is stored in the repository. `ONIKS` is treated as an approved Qwen3 deployment alias only inside this machine-scoped banking mode.
 
-`Qwen Bağlantısını Test Et` saves the visible settings and sends a real, short system/user probe that requests `{"ok":true}`. The result, effective model, and endpoint are displayed inside the modal. The probe does not include repository source. Full document generation keeps using the separate bounded `bankSpringDocs.qwen.generationMaxTokens` and `bankSpringDocs.qwen.contextWindowTokens` settings.
+`Qwen Bağlantısını Test Et` saves the visible settings and sends a real, short system/user probe that requests `{"ok":true}` with a fixed 64-token output cap. The result, effective model, and endpoint are displayed inside the modal. The probe does not include repository source and never inherits a very large configured generation cap. Full document generation keeps using the separate bounded `bankSpringDocs.qwen.generationMaxTokens` and `bankSpringDocs.qwen.contextWindowTokens` settings.
 
 ## Selected-Page Qwen3-Only Mode
 
@@ -98,7 +98,26 @@ copilot-draft.md                 # compatibility contract for gap/final/quality 
 .qwen3-page-draft/runs/<input-hash>/steps/*-prompt.md
 ```
 
-The advanced limits are `bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxTotalSourceCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxModelCalls`, and `bankSpringDocs.pageAnalysis.qwenMaxReduceLevels`. Input request size is derived conservatively from `bankSpringDocs.qwen.contextWindowTokens` and `bankSpringDocs.qwen.generationMaxTokens`.
+The advanced limits are `bankSpringDocs.pageAnalysis.qwenMaxSourceFileCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxTotalSourceCharacters`, `bankSpringDocs.pageAnalysis.qwenMaxModelCalls`, and `bankSpringDocs.pageAnalysis.qwenMaxReduceLevels`. Input request size is derived conservatively from `bankSpringDocs.qwen.contextWindowTokens` and the largest phase-specific output budget.
+
+Qwen-only page analysis uses separate bounded output budgets for semantic/chunk analysis, ledger reduction, and grouped final synthesis. Transient `429`, `502`, `503`, `504`, and network-timeout failures are retried with bounded exponential backoff. Size-correlated `413`, context-window, output-length, and exhausted timeout/504 failures split only the affected evidence chunk into smaller overlapping children; capacity errors such as persistent `503` are not multiplied through adaptive splitting. Final section groups also subdivide after a size-correlated failure. Completed sibling steps remain resumable, and synthesis-only tuning reuses unchanged evidence maps.
+
+Extracted findings are retained as facts only when their source reference is the supplied chunk label or a visible path in that chunk; otherwise they are demoted to uncertainties. Aggregate source references and uncertainties are projected into their final canonical sections. Qwen gap repair uses one target section per request with the full configured synthesis ceiling, and a missing repair heading is omitted so it cannot overwrite a useful existing draft section. The Copilot page-draft and repair paths do not use these Qwen-only controls.
+
+For a deployment whose real total model context is 16K, a conservative starting point is:
+
+```json
+{
+  "bankSpringDocs.qwen.contextWindowTokens": 16384,
+  "bankSpringDocs.qwen.generationMaxTokens": 4096,
+  "bankSpringDocs.qwen.maxTokens": 4096,
+  "bankSpringDocs.pageAnalysis.qwenAnalysisMaxOutputTokens": 2048,
+  "bankSpringDocs.pageAnalysis.qwenReduceMaxOutputTokens": 3072,
+  "bankSpringDocs.pageAnalysis.qwenSynthesisMaxOutputTokens": 4096
+}
+```
+
+`qwen.maxTokens` is the general/connection-test cap; the Qwen-only page pipeline uses the phase-specific values above, each capped by `qwen.generationMaxTokens`. `qwenMaxTotalSourceCharacters` is an aggregate source budget distributed over many calls, not a single-request input size.
 
 ## Full-Pipeline AI Provider
 

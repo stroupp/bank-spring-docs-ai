@@ -30,6 +30,8 @@ export interface DocumentationModelRequest {
   userPrompt: string;
   /** Exact text used by context artifacts and usage estimates. */
   combinedText?: string;
+  /** Optional per-request output budget. Qwen caps it at the configured generation maximum. */
+  maxOutputTokens?: number;
 }
 
 export interface DocumentationModelResponse {

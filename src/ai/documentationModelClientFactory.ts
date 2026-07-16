@@ -127,8 +127,9 @@ export function getQwenDocumentationModelIdentity(context: vscode.ExtensionConte
 
 /**
  * Secret-free Qwen identity for the resumable selected-page pipeline.
- * Request timeouts are operational retry controls, so changing only the
- * timeout must not discard already completed evidence-analysis steps.
+ * Request timeouts and the global output ceiling are operational controls.
+ * Per-phase output budgets are hashed into individual model steps, so changing
+ * either global control must not discard already completed evidence maps.
  */
 export function getResumableQwenPageModelIdentity(context: vscode.ExtensionContext): DocumentationModelIdentity {
   return buildQwenDocumentationModelIdentity(context, false);
@@ -161,7 +162,6 @@ function buildQwenDocumentationModelIdentity(
       endpoint,
       model,
       temperature: settings.temperature,
-      generationMaxTokens,
       contextWindowTokens
     };
   if (settings.bankingEnvironment) {
